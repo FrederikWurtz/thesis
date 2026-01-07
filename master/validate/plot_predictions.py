@@ -13,7 +13,9 @@ from master.train.checkpoints import load_checkpoint, read_file_from_ini
 from master.configs.config_utils import load_config_file
 import glob
 
-# hej!
+
+
+# Utility function to format axes
 
 def ax_format(ax,
            xlim = None, 
