@@ -1,0 +1,554 @@
+================================================================================
+CODE STRUCTURE SUMMARY FOR AI ASSISTANTS
+================================================================================
+Project: Lunar Surface DEM Reconstruction from Multi-View Images
+Location: /Users/au644271/Desktop/local_python/master/
+Last Updated: December 16, 2025
+
+This document provides an overview of the code architecture, key functions, 
+and typical execution paths for AI assistants to understand the project.
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+This is a deep learning project that:
+1. Generates synthetic lunar surface DEMs (Digital Elevation Models)
+2. Renders realistic images using Hapke reflectance model
+3. Trains a U-Net to reconstruct DEMs from multiple rendered images
+4. Validates and tests the trained models
+
+The project uses PyTorch with support for Apple Silicon MPS, CUDA, and CPU.
+
+================================================================================
+2. FOLDER STRUCTURE
+================================================================================
+
+master/
+├── configs/                 # Configuration management
+│   ├── config_utils.py     # Loads/validates defaults.ini
+│   └── defaults.ini        # All hyperparameters and settings
+│
+├── data_sim/               # Synthetic data generation
+│   ├── generator.py        # Main data generation functions
+│   └── dataset_io.py       # NPZ/HDF5 I/O utilities
+│
+├── render/                 # Physics-based rendering pipeline
+│   ├── dem_utils.py        # DEM class and terrain utilities
+│   ├── hapke_model.py      # Hapke reflectance model
+│   ├── camera.py           # Camera projection and sampling
+│   └── renderer.py         # Main rendering orchestration
+│
+├── models/                 # Neural network architectures
+│   ├── unet.py            # U-Net with FiLM conditioning
+│   └── losses.py          # Custom loss functions (MSE, gradient, reflectance)
+│
+├── train/                  # Training infrastructure
+│   ├── cli.py             # Command-line interface and orchestration
+│   ├── runner.py          # Training loop orchestration
+│   ├── trainer_core.py    # Core training/validation logic, Dataset classes
+│   ├── train_utils.py     # Helper functions (device setup, normalization)
+│   └── checkpoints.py     # Model saving/loading, INI persistence
+│
+├── scripts/               # Entry points
+│   ├── fluid_train.py    # Main training script (wraps train/cli.py)
+│   ├── gen_data.py       # Data generation script
+│   ├── plot_data.py      # Visualization utilities
+│   └── plot_comprehensive.py  # Comprehensive result plotting
+│
+├── utils/                 # Miscellaneous utilities
+│   ├── interactivity_utils.py  # Signal handling, input listeners
+│   └── load_est_utils.py      # Memory logging, timing estimation
+│
+├── validate/              # Model validation and evaluation
+│   └── plotting.py       # Validation plotting functions
+│
+└── tests/                 # Unit and integration tests
+    ├── test_config.py
+    ├── test_data_generator.py
+    ├── test_dataset.py
+    └── ...
+
+================================================================================
+3. KEY CONFIGURATION (configs/defaults.ini)
+================================================================================
+
+All hyperparameters are stored in defaults.ini, loaded via config_utils.py.
+
+Key sections:
+- DEM generation: DEM_SIZE, N_CRATERS, N_RIDGES, N_HILLS
+- Rendering: IMAGE_H, IMAGE_W, FOCAL_LENGTH, IMAGES_PER_DEM
+- Training: EPOCHS, BATCH_SIZE, LR, OPTIMIZER settings
+- Loss weights: W_MSE, W_GRAD, W_REFL
+- Dataset modes: USE_SEMIFLUID, USE_HDF5, REUSE_LIMIT
+- Fluid training: FLUID_TRAIN_DEMS, FLUID_VAL_DEMS, FLUID_TEST_DEMS
+
+Config loading flow:
+  config_utils.load_config_file() 
+    → Parses defaults.ini
+    → Validates values
+    → Returns dict with UPPERCASE keys
+
+================================================================================
+4. DATA GENERATION PIPELINE
+================================================================================
+
+Entry point: scripts/gen_data.py or data_sim/generator.py
+
+Main function chain:
+  generate_and_save_data_pooled(config, images_dir, n_dems)
+    ↓
+  generate_and_return_data(config)
+    ↓
+  _generate_synthetic_dem(size, n_craters, n_ridges, n_hills, ...)
+    ↓ Creates DEM with:
+      - Random craters (excavated bowl shapes)
+      - Ridges (linear elevation features)
+      - Hills (Gaussian bumps)
+    ↓
+  DEM object created (dem_utils.DEM)
+    ↓
+  Renderer object created (renderer.Renderer)
+    ↓
+  For each of IMAGES_PER_DEM:
+    render_shading(sun_az, sun_el, cam_az, cam_el, cam_dist)
+      ↓ Uses HapkeModel to compute reflectance
+      ↓ Stores reflectance_map (DEM resolution)
+    ↓
+    render_camera_image()
+      ↓ Projects DEM points to camera coordinates
+      ↓ Samples reflectance values
+      ↓ Returns image (IMAGE_H x IMAGE_W)
+    ↓
+  Returns: (images, reflectance_maps, dem_np, metas)
+    ↓
+  Saves to NPZ or HDF5 format
+
+Key classes:
+- DEM: Holds terrain array, computes normals, stores world coordinates
+- HapkeModel: Implements lunar reflectance physics
+- Camera: Handles projection from world to image coordinates
+- Renderer: Orchestrates rendering pipeline
+
+================================================================================
+5. TRAINING PIPELINE
+================================================================================
+
+Entry point: scripts/fluid_train.py → train/cli.py
+
+Main execution flow:
+
+A) CLI Parsing and Setup (train/cli.py):
+   _parse_args() → Parses command-line arguments
+   load_config_file() → Loads defaults.ini
+   create_folder_structure() → Creates run_dir/val/test directories
+
+B) Data Generation (if not skipped):
+   generate_and_save_data_pooled()
+     → Creates validation DEMs in val_dir/
+     → Creates test DEMs in test_dir/
+
+C) Training Orchestration (train/runner.py):
+   run_fluid_training(config, run_dir, val_dir, test_dir)
+     ↓
+   Initialize device (MPS/CUDA/CPU)
+     ↓
+   Create datasets:
+     - FluidDEMDataset: Generates data on-the-fly
+     - SemifluidDEMDataset: Generates once, reuses REUSE_LIMIT times
+     - DEMDatasetHDF5: Loads from pre-generated HDF5 files
+     ↓
+   Create DataLoaders with appropriate workers
+     ↓
+   Initialize UNet model (models/unet.py)
+     ↓
+   Load checkpoint if resuming (checkpoints.load_checkpoint)
+     ↓
+   Training loop (for each epoch):
+       train_epoch() → Forward pass, loss, backward, optimizer step
+       validate_epoch() → Validation metrics
+       save_last_and_best() → Checkpoint saving
+       Scheduler step
+     ↓
+   Final test evaluation:
+     evaluate_on_test_files() → Test set metrics
+
+D) Core Training Functions (train/trainer_core.py):
+   
+   train_epoch(model, loader, optimizer, device, config):
+     For each batch:
+       1. Normalize inputs (images, reflectance_maps, metadata)
+       2. Forward pass: predictions = model(inputs)
+       3. Calculate loss: calculate_total_loss(pred, target, config)
+       4. Backward pass: loss.backward()
+       5. Optimizer step
+       6. Log metrics
+     Returns: avg_loss, metrics_dict
+
+   validate_epoch(model, loader, device, config):
+     Similar to train_epoch but without gradients
+     Returns: avg_val_loss, metrics_dict
+
+   calculate_total_loss(pred, target, reflectance_maps, config):
+     Combines multiple loss terms:
+       - MSE loss (W_MSE)
+       - Gradient loss (W_GRAD): penalizes gradient differences
+       - Reflectance loss (W_REFL): penalizes reflectance errors
+     Returns: total_loss
+
+================================================================================
+6. DATASET CLASSES
+================================================================================
+
+Three dataset modes in trainer_core.py:
+
+1) FluidDEMDataset:
+   - Generates new synthetic data for every __getitem__ call
+   - No storage, infinite variety
+   - Slow but maximum diversity
+
+2) SemifluidDEMDataset:
+   - Generates data, saves to temporary_dir/
+   - Reuses each sample REUSE_LIMIT times
+   - Deletes and regenerates after reuse limit
+   - Balance between speed and diversity
+
+3) DEMDatasetHDF5:
+   - Loads from pre-generated HDF5 file
+   - Fastest loading, no generation overhead
+   - Used for validation and test sets
+
+All datasets return:
+  (images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor)
+  - images: [IMAGES_PER_DEM, H, W]
+  - reflectance_maps: [IMAGES_PER_DEM, H_dem, W_dem]
+  - target (DEM): [1, H_dem, W_dem]
+  - meta: [IMAGES_PER_DEM, 5] (sun_az, sun_el, cam_az, cam_el, cam_dist)
+
+================================================================================
+7. MODEL ARCHITECTURE (models/unet.py)
+================================================================================
+
+UNet with FiLM conditioning:
+
+UNet(in_channels=IMAGES_PER_DEM, out_channels=1)
+  ↓
+Input: [B, IMAGES_PER_DEM, H, W]
+  ↓
+Encoder path:
+  DoubleConv blocks with downsampling
+  FiLM layers condition on metadata
+  ↓
+Bottleneck:
+  Deepest features
+  ↓
+Decoder path:
+  Upsampling + skip connections
+  FiLM conditioning continues
+  ↓
+Output: [B, 1, H_dem, W_dem] (predicted DEM)
+
+Key components:
+- MetaEncoder: Encodes sun/camera parameters into conditioning vector
+- FiLMLayer: Applies affine transformation to features based on metadata
+- DoubleConv: Conv-BN-ReLU-Conv-BN-ReLU blocks
+
+================================================================================
+8. TYPICAL EXECUTION PATHS
+================================================================================
+
+PATH A: Generate data and train from scratch
+--------------------------------------------
+$ python scripts/fluid_train.py --new_run --run_dir runs/experiment1 --epochs 50
+
+Flow:
+1. CLI parses args → train/cli.py::main()
+2. load_config_file() → Read defaults.ini
+3. create_folder_structure() → Create runs/experiment1/{val,test}/
+4. generate_and_save_data_pooled() → Generate validation/test NPZ files
+5. run_fluid_training() → Initialize model, datasets, training loop
+6. For each epoch:
+   - train_epoch() on FluidDEMDataset (generates on-the-fly)
+   - validate_epoch() on validation files
+   - save_checkpoint() to runs/experiment1/checkpoints/
+7. Final test evaluation
+8. Save results and plots
+
+PATH B: Resume training from checkpoint
+---------------------------------------
+$ python scripts/fluid_train.py --run_dir runs/experiment1 --epochs 100
+
+Flow:
+1. CLI detects existing run_dir
+2. load_checkpoint() → Restore model, optimizer, scheduler state
+3. Continue training from last epoch
+4. Validation/test sets already exist (not regenerated)
+
+PATH C: Generate data only
+--------------------------
+$ python scripts/gen_data.py --run_dir runs/data_only --n_dems 100
+
+Flow:
+1. gen_data.py::main()
+2. generate_and_save_data_pooled() → Create 100 NPZ files
+3. No training initiated
+
+PATH D: Custom training with config overrides
+---------------------------------------------
+$ python scripts/fluid_train.py --new_run --lr 0.0001 --batch_size 16 --w_mse 0.7
+
+Flow:
+1. CLI overrides config values with command-line args
+2. Proceed with training using modified config
+
+================================================================================
+9. CHECKPOINT AND STATE MANAGEMENT
+================================================================================
+
+Checkpoints stored in: run_dir/checkpoints/
+
+Files:
+- last_checkpoint.pth: Most recent model state
+- best_checkpoint.pth: Best validation loss model
+- checkpoint_epoch_N.pth: Optional periodic saves
+
+Checkpoint contents:
+{
+  'epoch': int,
+  'model_state_dict': OrderedDict,
+  'optimizer_state_dict': dict,
+  'scheduler_state_dict': dict,
+  'train_loss_history': list,
+  'val_loss_history': list,
+  'config': dict
+}
+
+Loading/saving functions in train/checkpoints.py:
+- save_checkpoint(path, model, optimizer, scheduler, ...)
+- load_checkpoint(path, model, optimizer, scheduler, ...)
+- save_last_and_best(run_dir, ...) → Saves both last and best
+
+================================================================================
+10. RENDERING PHYSICS
+================================================================================
+
+Hapke Model (render/hapke_model.py):
+- Implements lunar surface reflectance
+- Parameters: w (albedo), B0, h (opposition surge), phase function
+- Inputs: incidence angle (i), emission angle (e), phase angle (g)
+- Output: Reflectance value [0, 1]
+
+Rendering steps (render/renderer.py):
+1. render_shading():
+   - Compute sun direction vector from (sun_az, sun_el)
+   - Compute camera position from (cam_az, cam_el, cam_dist)
+   - Calculate view vectors for each DEM point
+   - Compute incidence angles (sun-normal) and emission angles (view-normal)
+   - Apply Hapke model → reflectance_map [H_dem, W_dem]
+
+2. render_camera_image():
+   - Project DEM world points to camera coordinates
+   - Transform to image plane using focal length
+   - Sample reflectance_map at projected locations
+   - Handle occlusions and out-of-bounds pixels
+   - Return image [IMAGE_H, IMAGE_W]
+
+Key: Reflectance maps are at DEM resolution, camera images are downsampled.
+
+================================================================================
+11. LOSS FUNCTIONS (models/losses.py)
+================================================================================
+
+calculate_total_loss(pred_dem, target_dem, reflectance_maps, config):
+  
+  Components:
+  1. MSE Loss (weighted by W_MSE):
+     - L2 distance between predicted and target DEM
+  
+  2. Gradient Loss (weighted by W_GRAD):
+     - Compares spatial gradients (dx, dy) of pred vs target
+     - Helps preserve terrain features and edges
+  
+  3. Reflectance Loss (weighted by W_REFL):
+     - Renders predicted DEM with same sun/camera params
+     - Compares rendered reflectance to ground truth reflectance
+     - Encourages physically consistent reconstructions
+  
+  Total = W_MSE * mse + W_GRAD * grad + W_REFL * refl
+
+This multi-term loss ensures:
+- Overall shape accuracy (MSE)
+- Fine detail preservation (gradient)
+- Physical plausibility (reflectance consistency)
+
+================================================================================
+12. DEVICE AND PERFORMANCE
+================================================================================
+
+Device selection (train/train_utils.py::get_device()):
+1. Check for CUDA → Use if available
+2. Check for MPS (Apple Silicon) → Use if available
+3. Fallback to CPU
+
+Mixed precision:
+- CUDA: Uses torch.amp with GradScaler (FP16)
+- MPS: Uses torch.amp without GradScaler (no FP16 support yet)
+- CPU: No mixed precision
+
+Memory optimization:
+- pin_memory=True for CUDA (faster CPU→GPU transfer)
+- non_blocking=True for CUDA (asynchronous transfers)
+- Gradient accumulation for large effective batch sizes
+- Periodic garbage collection in training loop
+
+macOS-specific:
+- Scripts wrap execution with 'caffeinate' to prevent sleep
+- Checks for CAFFEINATED env var to avoid re-wrapping
+
+================================================================================
+13. PARALLEL DATA GENERATION
+================================================================================
+
+generate_and_save_data_pooled() uses multiprocessing.Pool:
+
+Flow:
+1. Create worker pool (size = NUM_WORKERS)
+2. Each worker calls generate_and_return_data() independently
+3. Results collected and saved to NPZ files
+4. Progress tracked with tqdm
+
+Worker isolation:
+- Each worker has separate torch random seed
+- Ensures reproducibility and diversity
+- No shared state between workers
+
+================================================================================
+14. VALIDATION AND TESTING
+================================================================================
+
+Validation (during training):
+- Run every epoch on validation set
+- Metrics: MSE, MAE, gradient loss, reflectance loss
+- Used for learning rate scheduling and early stopping
+
+Testing (after training):
+- evaluate_on_test_files() in trainer_core.py
+- Loads each test NPZ file
+- Generates predictions
+- Computes comprehensive metrics
+- Saves visualizations (DEM overlays, error maps)
+
+Metrics computed:
+- Per-pixel MSE, MAE, RMSE
+- Gradient similarity
+- Reflectance consistency
+- Peak error analysis
+- Histogram comparisons
+
+================================================================================
+15. KEY FUNCTIONS REFERENCE
+================================================================================
+
+Data Generation:
+- data_sim.generator.generate_and_return_data()
+- data_sim.generator.generate_and_save_data_pooled()
+- data_sim.generator._generate_synthetic_dem()
+
+Rendering:
+- render.renderer.Renderer.render_shading()
+- render.renderer.Renderer.render_camera_image()
+- render.hapke_model.HapkeModel.evaluate()
+
+Training:
+- train.runner.run_fluid_training()
+- train.trainer_core.train_epoch()
+- train.trainer_core.validate_epoch()
+- train.trainer_core.evaluate_on_test_files()
+
+Model:
+- models.unet.UNet.forward()
+- models.losses.calculate_total_loss()
+
+Configuration:
+- configs.config_utils.load_config_file()
+- configs.config_utils.create_folder_structure()
+
+Checkpointing:
+- train.checkpoints.save_checkpoint()
+- train.checkpoints.load_checkpoint()
+- train.checkpoints.save_last_and_best()
+
+================================================================================
+16. IMPORTANT CONVENTIONS
+================================================================================
+
+Coordinate systems:
+- DEM: (row, col) indexing, origin at top-left
+- World: (x, y, z) with z=elevation
+- Camera: Right-handed coordinate system
+- Azimuth: 0° = North, increases clockwise
+- Elevation: 0° = horizon, 90° = zenith
+
+Tensor shapes:
+- DEM: [H, W] or [B, 1, H, W]
+- Images: [B, N_images, H, W]
+- Reflectance maps: [B, N_images, H_dem, W_dem]
+- Metadata: [B, N_images, 5]
+
+Normalization:
+- DEMs: Standardized to zero mean, unit variance per sample
+- Images: Standardized similarly
+- Metadata: MinMax scaled to [0, 1] per parameter
+
+File formats:
+- Training data: NPZ or HDF5
+- Checkpoints: PTH (PyTorch)
+- Config: INI
+- Logs: TXT
+
+================================================================================
+17. TROUBLESHOOTING HINTS
+================================================================================
+
+Common issues:
+1. Out of memory → Reduce BATCH_SIZE or DEM_SIZE
+2. Slow training → Check NUM_WORKERS, consider HDF5 format
+3. NaN losses → Reduce learning rate, check loss weights
+4. Poor convergence → Increase EPOCHS, adjust loss weights
+5. Overfitting → Increase FLUID_TRAIN_DEMS or use augmentation
+
+Performance tips:
+- Use HDF5 for validation/test (faster loading)
+- Use SemifluidDEMDataset for balance of speed/diversity
+- Enable mixed precision on CUDA
+- Use multiple workers (NUM_WORKERS = "best" for auto-detection)
+- Profile with PyTorch profiler if needed
+
+================================================================================
+18. EXTENSIBILITY POINTS
+================================================================================
+
+Easy to extend:
+- Add new loss terms in models/losses.py
+- Add new terrain features in data_sim/generator.py
+- Change model architecture in models/unet.py
+- Add custom metrics in train/trainer_core.py
+- Add validation plots in validate/plotting.py
+
+Recommended workflow for changes:
+1. Add config parameters to defaults.ini
+2. Update config_utils.py validation if needed
+3. Implement feature in appropriate module
+4. Add unit tests in tests/
+5. Update this documentation
+
+================================================================================
+END OF CODE STRUCTURE SUMMARY
+================================================================================
+
+This document should provide sufficient context for AI assistants to understand
+the codebase, navigate between modules, and make informed suggestions about
+code changes or extensions.
+
+For questions about specific functions or implementation details, refer to
+the source code docstrings and comments.
