@@ -30,6 +30,7 @@ MANIFEST
 /LRO_data_sandbox/
 /LRO_data/
 /Jobs/
+/.ssh/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
