@@ -49,6 +49,7 @@ class DEM:
         else:
             self.dem = dem.float()
         self.cellsize = cellsize
+        self.device = self.dem.device
         self.x0 = x0
         self.y0 = y0
         self.height, self.width = self.dem.shape
@@ -70,8 +71,8 @@ class DEM:
         
         # Sobel-like gradients for y and x
         # Create gradient kernels
-        ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0) / (8 * self.cellsize)
-        kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0) / (8 * self.cellsize)
+        ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0) / (8 * self.cellsize)
+        kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0) / (8 * self.cellsize)
         
         # Apply convolution for gradients
         dz_dy_raw = torch.nn.functional.conv2d(dem_4d, ky, padding=1).squeeze()
@@ -82,7 +83,7 @@ class DEM:
         # Surface normal components
         nx = -dz_dx
         ny = -dz_dy
-        nz = torch.ones_like(self.dem)
+        nz = torch.ones_like(self.dem, device=self.device)
         # Normalize the normal vectors
         norm = torch.sqrt(nx*nx + ny*ny + nz*nz) + 1e-12
         self.nx = nx / norm
@@ -94,8 +95,8 @@ class DEM:
         Constructs a (height*width, 3) array of 3D world coordinates (x, y, z) for each grid cell.
         """
         # Generate x and y coordinates for each grid cell
-        xs = self.x0 + torch.arange(self.width, dtype=torch.float32) * self.cellsize
-        ys = self.y0 + torch.arange(self.height, dtype=torch.float32) * self.cellsize
+        xs = self.x0 + torch.arange(self.width, dtype=torch.float32, device=self.device) * self.cellsize
+        ys = self.y0 + torch.arange(self.height, dtype=torch.float32, device=self.device) * self.cellsize
         xx, yy = torch.meshgrid(xs, ys, indexing='xy')
         zz = self.dem
         # Stack x, y, z into a single array and reshape to (N, 3)

@@ -13,7 +13,12 @@ def list_npz_files(directory: str) -> List[str]:
         return []
     return sorted([str(x) for x in p.glob('*.npz')])
 
-
+def list_pt_files(directory: str) -> List[str]:
+    p = Path(directory)
+    if not p.exists():
+        return []
+    return sorted([str(x) for x in p.glob('*.pt')])
+    
 def read_npz_metadata(path: str) -> dict:
     data = np.load(path)
     md = {

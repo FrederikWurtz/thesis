@@ -33,7 +33,8 @@ def compute_reflectance_map_from_dem(dem_tensor, meta, device, camera_params, ha
         camera = Camera(
             image_width=camera_params['image_width'],
             image_height=camera_params['image_height'],
-            focal_length=camera_params['focal_length']
+            focal_length=camera_params['focal_length'],
+            device=device
         )
         hapke_model = HapkeModel(w=hapke_params['w'], B0=hapke_params['B0'],
                                  h=hapke_params['h'], phase_fun=hapke_params['phase_fun'],

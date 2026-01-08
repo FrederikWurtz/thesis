@@ -23,6 +23,7 @@ master/train/runner_multi_gpu.py
 master/train/train_utils.py
 master/train/trainer_core.py
 master/train/trainer_core_multi_gpu.py
+master/train/trainer_new.py
 master/utils/__init__.py
 master/utils/interactivity_utils.py
 master/utils/load_est_utils.py

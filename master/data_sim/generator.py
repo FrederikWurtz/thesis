@@ -9,7 +9,144 @@ from master.render.hapke_model import HapkeModel
 from master.render.camera import Camera
 from master.render.renderer import Renderer
 
+import cProfile
+import pstats
+import io
+import time
+
 def generate_and_return_data(config: dict = None):
+    """
+    Generate a synthetic DEM and render five camera images + reflectance maps.
+
+    This is the top-level data generator used by the project. It creates a
+    synthetic DEM (via ``_generate_synthetic_dem``), constructs the rendering
+    pipeline (``DEM``, ``HapkeModel``, ``Camera``, ``Renderer``) and produces
+    five image / reflectance-map pairs using the project's suncam sampling
+    helper.
+
+    Parameters
+    ----------
+    config : dict-like
+        Configuration dictionary. Required keys used by this function include
+        (names are the ones expected in the project defaults):
+        - ``DEM_SIZE`` (int or (H, W))
+        - ``IMAGE_HEIGHT``, ``IMAGE_WIDTH`` (int)
+        - ``FOCAL_LENGTH`` (float)
+        - ``MANUAL_SUNCAM_PARS`` (bool)
+        - manual suncam parameter ranges: ``MANUAL_SUN_AZ_PM``, ``MANUAL_SUN_EL_PM``,
+          ``MANUAL_CAM_AZ_PM``, ``MANUAL_CAM_EL_PM``, ``MANUAL_CAM_DIST_PM``
+        - feature placement ranges / counts: ``N_CRATERS``, ``N_RIDGES``, ``N_HILLS``,
+          ``CRATER_DEPTH_RANGE``, ``CRATER_RADIUS_RANGE``, ``RIDGE_HEIGHT_RANGE``,
+          ``RIDGE_LENGTH_RANGE``, ``RIDGE_WIDTH_RANGE``, ``HILL_HEIGHT_RANGE``,
+          ``HILL_SIGMA_RANGE``
+
+    Returns
+    -------
+    images, reflectance_maps, dem_np, metas
+        images : list of numpy.ndarray
+            Five camera-sampled images, each shaped (IMAGE_HEIGHT, IMAGE_WIDTH).
+        reflectance_maps : list of numpy.ndarray
+            Five reflectance maps at DEM resolution (H_dem, W_dem).
+        dem_np : numpy.ndarray
+            Generated DEM as a 2D array (H_dem, W_dem), dtype float32.
+        metas : list
+            A list of five metadata tuples/lists describing sun/camera params
+            used for each render.
+
+    Raises
+    ------
+    ValueError
+        If ``config`` is None.
+
+    Notes
+    -----
+    - The function runs the generation and rendering inside ``torch.no_grad()``
+      to avoid tracking gradients.
+    - This docstring focuses on the API; implementation details are in the
+      helper functions (see ``_generate_synthetic_dem`` and
+      ``_get_5_sets_of_suncam_values``).
+    """
+
+    if config is None:
+        raise ValueError("config must be provided")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # unpack once to avoid repeated dict lookups and make locals explicit
+    dem_size = config['DEM_SIZE']
+    images_per_dem = config['IMAGES_PER_DEM']
+    image_h = config['IMAGE_H']
+    image_w = config['IMAGE_W']
+    focal_length = config['FOCAL_LENGTH']
+    manual_suncam_pars = config['MANUAL_SUNCAM_PARS']
+    n_craters = config['N_CRATERS']
+    n_ridges = config['N_RIDGES']
+    n_hills = config['N_HILLS']
+    crater_depth_range = config['CRATER_DEPTH_RANGE']
+    crater_radius_range = config['CRATER_RADIUS_RANGE']
+    ridge_height_range = config['RIDGE_HEIGHT_RANGE']
+    ridge_length_range = config['RIDGE_LENGTH_RANGE']
+    ridge_width_range = config['RIDGE_WIDTH_RANGE']
+    hill_height_range = config['HILL_HEIGHT_RANGE']
+    hill_sigma_range = config['HILL_SIGMA_RANGE']
+    manual_sun_az_pm = config['MANUAL_SUN_AZ_PM']
+    manual_sun_el_pm = config['MANUAL_SUN_EL_PM']
+    manual_cam_az_pm = config['MANUAL_CAM_AZ_PM']
+    manual_cam_el_pm = config['MANUAL_CAM_EL_PM']
+    manual_cam_dist_pm = config['MANUAL_CAM_DIST_PM']
+
+
+    n_craters, n_ridges, n_hills = _get_random_n_features(n_craters_max=n_craters, 
+                                                            n_ridges_max=n_ridges, 
+                                                            n_hills_max=n_hills)
+
+    dem_np = _generate_synthetic_dem(size=dem_size, 
+                                    n_craters=n_craters, 
+                                    n_ridges=n_ridges, 
+                                    n_hills=n_hills,
+                                    crater_depth_range=crater_depth_range,
+                                    crater_radius_range=crater_radius_range,
+                                    ridge_height_range=ridge_height_range,
+                                    ridge_length_range=ridge_length_range,
+                                    ridge_width_range=ridge_width_range,
+                                    hill_height_range=hill_height_range,
+                                    hill_sigma_range=hill_sigma_range)
+        
+    with torch.no_grad():
+        # Convert DEM to torch tensor on GPU in a single operation
+        dem_tensor = torch.from_numpy(dem_np).to(device=device, dtype=torch.float32)
+
+        dem_obj = DEM(dem_tensor, cellsize=1, x0=0, y0=0)
+        hapke = HapkeModel(w=0.6, B0=0.4, h=0.1, phase_fun="hg", xi=0.1)
+        camera = Camera(image_width=image_w,
+                        image_height=image_h,
+                        focal_length=focal_length,
+                        device=device)
+        renderer = Renderer(dem_obj, hapke, camera)
+
+        reflectance_maps = []
+        images = []
+        metas = []
+
+        # Use the project's standard suncam variation function
+        sets_of_params = _get_sets_of_suncam_values(manual_suncam_pars=manual_suncam_pars,
+                                                          manual_sun_az_pm=manual_sun_az_pm,
+                                                          manual_sun_el_pm=manual_sun_el_pm,
+                                                          manual_cam_az_pm=manual_cam_az_pm,
+                                                          manual_cam_el_pm=manual_cam_el_pm,
+                                                          manual_cam_dist_pm=manual_cam_dist_pm,
+                                                          images_per_dem=images_per_dem)
+        # Render images + reflectance maps
+        for i in range(images_per_dem):
+            params = sets_of_params[i]
+            img, reflectance_map = _render_single_image(renderer=renderer, params=params, image_w=image_w, image_h=image_h)
+            reflectance_maps.append(reflectance_map)
+            images.append(img)
+            metas.append(list(params))
+            
+    return images, reflectance_maps, dem_np, metas
+
+def generate_and_return_data_CPU(config: dict = None):
     """
     Generate a synthetic DEM and render five camera images + reflectance maps.
 
@@ -106,11 +243,16 @@ def generate_and_return_data(config: dict = None):
                                     hill_sigma_range=hill_sigma_range)
         
     with torch.no_grad():
-        dem_obj = DEM(dem_np, cellsize=1, x0=0, y0=0)
+        # Convert DEM to torch tensor on CPU, not GPU
+        dem_tensor = torch.from_numpy(dem_np).to(dtype=torch.float32)
+        device = torch.device('cpu')
+
+        dem_obj = DEM(dem_tensor, cellsize=1, x0=0, y0=0)
         hapke = HapkeModel(w=0.6, B0=0.4, h=0.1, phase_fun="hg", xi=0.1)
         camera = Camera(image_width=image_w,
                         image_height=image_h,
-                        focal_length=focal_length)
+                        focal_length=focal_length,
+                        device=device)
         renderer = Renderer(dem_obj, hapke, camera)
 
         reflectance_maps = []
@@ -132,7 +274,9 @@ def generate_and_return_data(config: dict = None):
             reflectance_maps.append(reflectance_map)
             images.append(img)
             metas.append(list(params))
+            
     return images, reflectance_maps, dem_np, metas
+
 
 def generate_and_save_data(path: str = None, config: dict = None):
     """
@@ -164,16 +308,23 @@ def generate_and_save_data(path: str = None, config: dict = None):
 
     images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
 
-    np.savez_compressed(path,
-                        dem=dem_np,
-                        data=np.stack(images, axis=0),
-                        reflectance_maps=np.stack(reflectance_maps, axis=0),
-                        meta=np.array(metas, dtype=np.float32))
+    # Convert to PyTorch tensors and save
+    data_dict = {
+        'dem': torch.from_numpy(dem_np),
+        'data': torch.stack(images),
+        'reflectance_maps': torch.stack(reflectance_maps),
+        'meta': torch.tensor(metas, dtype=torch.float32)
+    }
+
+    torch.save(data_dict, path)
     
 def generate_and_return_worker_friendly(config):
     # args is a (path, config) tuple so this worker remains picklable and simple
     try:
         images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
+        # Explicit cleanup
+        import gc
+        gc.collect()
     except Exception:
         import traceback
         traceback.print_exc()
@@ -244,6 +395,221 @@ def generate_and_save_data_pooled(config: dict = None,
 
     tqdm.write(f"Finished generating dataset. Successfully created {n_success_total}/{len(all_args)} DEMs.\n")
 
+
+def _multiprocessing_worker(args):
+    """Worker function for multiprocessing - must be at module level to be picklable."""
+    dem_idx, gpu_id, images_dir, config = args
+    
+    # Set GPU for this process
+    torch.cuda.set_device(gpu_id)
+    
+    filename = os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
+    try:
+        generate_and_save_data(path=filename, config=config)
+        return True
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def _generate_with_multiprocessing(n_dems, n_gpus, max_workers, images_dir, config):
+    """Multiprocessing approach - better for larger DEMs where compute dominates."""
+    
+    import torch.multiprocessing as mp
+    
+    # Force spawn method for CUDA compatibility
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+
+
+    # Create work items
+    tasks = [
+        (i, i % n_gpus, images_dir, config)
+        for i in range(n_dems)
+    ]
+    
+    # Use process pool
+    with Pool(processes=max_workers) as pool:
+        results = list(tqdm(
+            pool.imap_unordered(_multiprocessing_worker, tasks, chunksize=1),
+            total=n_dems,
+            desc="Generating DEMs"
+        ))
+    
+    return results
+
+
+def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, config):
+    """Optimized threading with minimal overhead."""
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue
+    import threading
+    
+    save_queue = Queue(maxsize=16)
+    
+    def gpu_worker(args):
+        dem_idx, gpu_id = args
+        filename = os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
+        torch.cuda.set_device(gpu_id)
+        
+        try:
+            images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
+            
+            data_dict = {
+                'dem': torch.from_numpy(dem_np),
+                'data': torch.stack(images).cpu(),
+                'reflectance_maps': torch.stack(reflectance_maps).cpu(),
+                'meta': torch.tensor(metas, dtype=torch.float32)
+            }
+            
+            save_queue.put((filename, data_dict))
+            return True
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def saver_worker():
+        while True:
+            item = save_queue.get()
+            if item is None:
+                break
+            filename, data_dict = item
+            try:
+                torch.save(data_dict, filename)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                save_queue.task_done()
+    
+    n_saver_threads = 4
+    saver_threads = []
+    for _ in range(n_saver_threads):
+        t = threading.Thread(target=saver_worker, daemon=True)
+        t.start()
+        saver_threads.append(t)
+    
+    tasks = [(i, i % n_gpus) for i in range(n_dems)]
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(tqdm(
+            executor.map(gpu_worker, tasks),
+            total=n_dems,
+            desc="Generating DEMs"
+        ))
+    
+    save_queue.join()
+    
+    for _ in range(n_saver_threads):
+        save_queue.put(None)
+    for t in saver_threads:
+        t.join()
+    
+    return results
+
+
+def generate_and_save_data_pooled_multi_gpu(config: dict = None,
+                                  images_dir: str = None,
+                                  n_dems: int = None):
+    """
+    Optimized multi-GPU data generation with automatic tuning.
+    """
+    import time
+    
+    if config is None:
+        raise ValueError("config must be provided")
+    if images_dir is None:
+        raise ValueError("images_dir must be provided")
+    if n_dems is None:
+        raise ValueError("n_dems must be provided")
+
+    dem_size = config.get('DEM_SIZE', 512)
+    
+    if torch.cuda.is_available():
+        n_gpus = torch.cuda.device_count()
+        
+        # Optimal configuration based on DEM size
+        if dem_size < 512:
+            workers_per_gpu = 8
+            use_multiprocessing = False
+        elif dem_size < 1024:
+            workers_per_gpu = 4
+            use_multiprocessing = False
+        else:
+            workers_per_gpu = 8
+            use_multiprocessing = True
+        
+        max_workers = n_gpus * workers_per_gpu
+        
+        print(f"\n{'='*60}")
+        print(f"Creating {n_dems} DEMs (size: {dem_size}x{dem_size})")
+        print(f"Using {max_workers} workers across {n_gpus} GPU(s)")
+        print(f"Workers per GPU: {workers_per_gpu}")
+        print(f"Mode: {'Multiprocessing' if use_multiprocessing else 'Threading'}")
+        print(f"Images per DEM: {config['IMAGES_PER_DEM']}")
+        print(f"{'='*60}\n")
+        
+        t_start = time.perf_counter()
+        
+        if use_multiprocessing:
+            results = _generate_with_multiprocessing(
+                n_dems, n_gpus, max_workers, images_dir, config
+            )
+        else:
+            results = _generate_with_threading_optimized(
+                n_dems, n_gpus, max_workers, images_dir, config
+            )
+        
+        t_end = time.perf_counter()
+        elapsed = t_end - t_start
+        
+        n_success = sum(results)
+        
+        print(f"\n{'='*60}")
+        print(f"Generation Complete")
+        print(f"{'='*60}")
+        print(f"Successfully created: {n_success}/{n_dems} DEMs")
+        print(f"Total time: {elapsed:.2f} seconds")
+        print(f"Time per DEM: {elapsed/n_dems:.2f} seconds")
+        print(f"Throughput: {n_dems/elapsed:.2f} DEMs/second")
+        print(f"{'='*60}\n")
+        
+    else:
+        # CPU fallback
+        print(f"\n{'='*60}")
+        print(f"Creating {n_dems} DEMs using CPU")
+        print(f"Using {config['NUM_WORKERS']} workers")
+        print(f"{'='*60}\n")
+        
+        t_start = time.perf_counter()
+        
+        all_args = []
+        for dem_idx in range(n_dems):
+            filename = os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
+            all_args.append((filename, config))
+        
+        with Pool(processes=config["NUM_WORKERS"]) as pool:
+            results = list(tqdm(
+                pool.imap_unordered(generate_and_save_worker_friendly, all_args, chunksize=1),
+                total=n_dems,
+                desc="Generating DEMs"
+            ))
+        
+        t_end = time.perf_counter()
+        elapsed = t_end - t_start
+        
+        n_success = sum(1 for r in results if r)
+        
+        print(f"\n{'='*60}")
+        print(f"Successfully created: {n_success}/{n_dems} DEMs")
+        print(f"Total time: {elapsed:.2f} seconds")
+        print(f"Time per DEM: {elapsed/n_dems:.2f} seconds")
+        print(f"Throughput: {n_dems/elapsed:.2f} DEMs/second")
+        print(f"{'='*60}\n")
 
 
 def _get_sets_of_suncam_values(manual_suncam_pars=None, manual_sun_az_pm=None, manual_sun_el_pm=None,

@@ -15,7 +15,7 @@ from tqdm import tqdm
 import tempfile
 import os
 
-from master.data_sim.generator import generate_and_return_data
+from master.data_sim.generator import generate_and_return_data_CPU
 from master.models.losses import calculate_total_loss
 from master.train.train_utils import normalize_inputs
 
@@ -107,15 +107,15 @@ class DEMDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        loaded = np.load(self.files[idx])
-        dem = loaded['dem'].astype(np.float32)
-        data = loaded['data'].astype(np.float32)
-        reflectance_maps = loaded.get('reflectance_maps', np.zeros((data.shape[0], dem.shape[0], dem.shape[1]), dtype=np.float32)).astype(np.float32)
-        meta = loaded['meta'].astype(np.float32)
-        target_tensor = torch.from_numpy(dem).unsqueeze(0)
-        images_tensor = torch.from_numpy(data)
-        reflectance_maps_tensor = torch.from_numpy(reflectance_maps)
-        meta_tensor = torch.from_numpy(meta)
+        # Load PyTorch tensors directly
+        loaded = torch.load(self.files[idx])
+        
+        # Extract tensors using the correct keys from generator.py
+        target_tensor = loaded['dem'].unsqueeze(0)  # Add channel dim
+        images_tensor = loaded['data']
+        reflectance_maps_tensor = loaded['reflectance_maps']
+        meta_tensor = loaded['meta']
+        
         return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
 
 class FluidDEMDataset(Dataset):
@@ -132,7 +132,7 @@ class FluidDEMDataset(Dataset):
         return self.config["FLUID_TRAIN_DEMS"]
 
     def __getitem__(self, idx):
-        images, reflectance_maps, dem_np, metas = generate_and_return_data(config=self.config)
+        images, reflectance_maps, dem_np, metas = generate_and_return_data_CPU(config=self.config)
 
         images_np = np.stack(images, axis=0)  # (5, H_img, W_img)
         refl_np = np.stack(reflectance_maps, axis=0)  # (5, H_dem, W_dem)

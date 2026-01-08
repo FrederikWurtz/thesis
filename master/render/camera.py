@@ -3,7 +3,7 @@ import torch
 
 class Camera:
 
-    def __init__(self, image_width, image_height, focal_length, up=None):
+    def __init__(self, image_width, image_height, focal_length, device, up=None):
         """
         Initialize the Camera with intrinsic parameters.
 
@@ -13,15 +13,16 @@ class Camera:
             cx (float): Principal point x-coordinate (pixels).
             cy (float): Principal point y-coordinate (pixels).
         """
+        self.device = device
         self.image_width = image_width
         self.image_height = image_height
-        self.up = up if up is not None else torch.tensor([0., 0., 1.])  # Default up vector
+        self.up = up if up is not None else torch.tensor([0., 0., 1.], device=device)  # Default up vector
         self.focal_length = focal_length  # Assuming square pixels: fx = fy
         self.cx = image_width / 2
         self.cy = image_height / 2
 
     @staticmethod
-    def unit_vec_from_az_el(az_deg, el_deg):
+    def unit_vec_from_az_el(az_deg, el_deg, device):
         """
         Computes a unit vector from azimuth and elevation angles (in degrees).
 
@@ -35,9 +36,9 @@ class Camera:
         """
         # Convert to tensors if needed
         if not isinstance(az_deg, torch.Tensor):
-            az_deg = torch.tensor(az_deg, dtype=torch.float32)
+            az_deg = torch.tensor(az_deg, dtype=torch.float32, device=device)
         if not isinstance(el_deg, torch.Tensor):
-            el_deg = torch.tensor(el_deg, dtype=torch.float32)
+            el_deg = torch.tensor(el_deg, dtype=torch.float32, device=device)
             
         az = torch.deg2rad(az_deg)  # Convert azimuth to radians
         el = torch.deg2rad(el_deg)  # Convert elevation to radians

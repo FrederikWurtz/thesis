@@ -16,6 +16,7 @@ class Renderer:
             model (HapkeModel): The reflectance model (e.g., Hapke or Lambertian).
         """
         self.dem = dem
+        self.device = dem.device
         self.model = model
         self.rendered_shading = None
         self.reflectance_map = None  # Store reflectance map for gradient tracking
@@ -42,7 +43,7 @@ class Renderer:
             model (str): Reflectance model to use ("hapke" or "lambertian").
         """
         # Compute sun direction unit vector from azimuth and elevation
-        sun_vec = Camera.unit_vec_from_az_el(sun_az_deg, sun_el_deg)
+        sun_vec = Camera.unit_vec_from_az_el(sun_az_deg, sun_el_deg, device=self.device)
         sx, sy, sz = sun_vec[0], sun_vec[1], sun_vec[2]
 
         # Calculate the center coordinates of the DEM in world space
@@ -50,8 +51,8 @@ class Renderer:
         center_y = self.dem.y0 + (self.dem.height * self.dem.cellsize) / 2
 
         # Compute camera position in world coordinates based on azimuth, elevation, and distance
-        camera_az_rad = torch.deg2rad(torch.tensor(camera_az_deg, dtype=torch.float32))
-        camera_el_rad = torch.deg2rad(torch.tensor(camera_el_deg, dtype=torch.float32))
+        camera_az_rad = torch.deg2rad(torch.tensor(camera_az_deg, dtype=torch.float32, device=self.device))
+        camera_el_rad = torch.deg2rad(torch.tensor(camera_el_deg, dtype=torch.float32, device=self.device))
         cx = center_x + camera_distance_from_center * torch.sin(camera_az_rad) * torch.cos(camera_el_rad)
         cy = center_y + camera_distance_from_center * torch.cos(camera_az_rad) * torch.cos(camera_el_rad)
         cz = camera_distance_from_center * torch.sin(camera_el_rad)
@@ -101,11 +102,11 @@ class Renderer:
         R = self.model.radiance_factor(mu0, mu, g_rad)
 
         # Calculate shadow map (1=lit, 0=shadow) using the DEM and sun angles
-        shadow_map = Renderer.compute_shadow_map(self.dem.dem, sun_az_deg, sun_el_deg, cellsize=self.dem.cellsize)
+        shadow_map = Renderer.compute_shadow_map(self.dem.dem, sun_az_deg, sun_el_deg, cellsize=self.dem.cellsize, device=self.device)
 
-        # Move and cast shadow map to the same dtype/device as R for safe arithmetic
-        if shadow_map.device != R.device or shadow_map.dtype != R.dtype:
-            shadow_map = shadow_map.to(device=R.device, dtype=R.dtype)
+        # Ensure shadow_map has the same dtype as R for proper multiplication
+        if shadow_map.dtype != R.dtype:
+            shadow_map = shadow_map.type_as(R)  # Cast to same dtype without device transfer
 
         # Sanity-check shape before applying mask
         if shadow_map.shape != R.shape:
@@ -175,7 +176,7 @@ class Renderer:
         center_x = self.dem.x0 + (self.dem.width * self.dem.cellsize) / 2
         center_y = self.dem.y0 + (self.dem.height * self.dem.cellsize) / 2
         center_z = torch.mean(self.dem.dem)
-        target = torch.tensor([center_x, center_y, center_z], dtype=torch.float32)
+        target = torch.tensor([center_x, center_y, center_z], dtype=torch.float32, device=self.device)
         self.target = target
 
         # Use defaults from camera
@@ -299,8 +300,8 @@ class Renderer:
         # Return both the camera image and the full reflectance map
         return img, self.reflectance_map
 
-    
-    def compute_shadow_map(dem_array, sun_az_deg, sun_el_deg, cellsize=1):
+    @staticmethod
+    def compute_shadow_map(dem_array, sun_az_deg, sun_el_deg, device=None, cellsize=1):
         """
         Torch-based scan-line shadow map (sun at infinity) returning the
         backward (bottom->top) scan result as the final lit map (1=lit, 0=shadow).
@@ -326,14 +327,17 @@ class Renderer:
 
         if torch.is_tensor(dem_array):
             dem_t = dem_array
+            if device is None:
+                device = dem_array.device
         else:
-            dem_t = torch.from_numpy(np.array(dem_array)).to(dtype=torch.float32)
+            if device is None:
+                device = torch.device('cpu')
+            dem_t = torch.from_numpy(np.array(dem_array)).to(dtype=torch.float32, device=device)
 
-        if dem_t.dim() != 2:
-            raise ValueError('dem_array must be 2D')
 
-        device = dem_t.device
-        dem_t = dem_t.to(dtype=torch.float32, device=device)
+        # device = dem_t.device
+        # dem_t = dem_t.to(dtype=torch.float32, device=device)
+
         H, W = dem_t.shape
 
         # pad to larger square (diagonal) to avoid clipping on rotation
@@ -403,7 +407,7 @@ class Renderer:
         # remove padding-origin pixels
         shadow_cropped = shadow_cropped * (mask_cropped > 0.5).float()
 
-        shadow_map_t = shadow_cropped.squeeze(0).squeeze(0).to(dtype=torch.uint8)
+        shadow_map_t = shadow_cropped.squeeze(0).squeeze(0)
 
         if shadow_map_t.shape != dem_t.shape:
             raise ValueError(f"Shadow map shape {tuple(shadow_map_t.shape)} does not match DEM shape {tuple(dem_t.shape)}")

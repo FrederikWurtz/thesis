@@ -1,10 +1,15 @@
 from master.configs.config_utils import load_config_file, create_folder_structure
-from master.data_sim.generator import generate_and_save_data_pooled
+from master.data_sim.generator import generate_and_save_data_pooled_multi_gpu
+from master.train.trainer_core import DEMDataset
+from master.data_sim.dataset_io import list_pt_files
+from master.train.train_utils import compute_input_stats, round_list
+from master.train.checkpoints import save_file_as_ini
+
+from torch.utils.data import DataLoader
 import os
 import shutil
 import argparse
 
-from master.train.checkpoints import save_file_as_ini
 
 
 def _parse_args(argv=None):
@@ -33,7 +38,13 @@ def main(argv=None):
     # Determine run directory, and parse new/skip_data_gen flags
     run_path = os.path.join(config["SUP_DIR"], args.run_dir)
 
+    if os.path.exists(run_path) and not os.path.exists(os.path.join(run_path, 'stats')):
+        # Existing run directory found, but no stats subdir
+        shutil.rmtree(run_path)  # remove incomplete run directory
+        print(f"Removed incomplete run directory at {run_path}.")
+
     if os.path.exists(run_path):
+        print("Existing run directory detected.")
         # Existing run directory found
         if args.new_run is True:
             # User requested new run
@@ -119,16 +130,28 @@ def main(argv=None):
         if not args.skip_data_gen: # unless user requests to skip data generation
             print("\n=== Generating New Dataset ===")
             # create validation files
-            generate_and_save_data_pooled(config, images_dir=val_path, n_dems=config["FLUID_VAL_DEMS"])
+            generate_and_save_data_pooled_multi_gpu(config, images_dir=val_path, n_dems=config["FLUID_VAL_DEMS"])
+            # also calculate and save mean reflectance map over validation set
+            val_files = list_pt_files(val_path)
+            val_ds = DEMDataset(val_files)
+            val_loader = DataLoader(val_ds, batch_size=config["BATCH_SIZE"], shuffle=False, num_workers=4, pin_memory=True)
+            print("\n=== Computing Input Statistics ===")
+            train_mean, train_std = compute_input_stats(val_loader, images_per_dem=config["IMAGES_PER_DEM"])
+            print(f"Mean: {round_list(train_mean.tolist(), 10)}")
+            print(f"Std: {round_list(train_std.tolist(), 10)}")
+
             # create test files
-            generate_and_save_data_pooled(config, images_dir=test_path, n_dems=config["FLUID_TEST_DEMS"])
+            generate_and_save_data_pooled_multi_gpu(config, images_dir=test_path, n_dems=config["FLUID_TEST_DEMS"])
             print("Dataset generation complete.\n")
+
         elif args.skip_data_gen:
             pass  # skip data generation as per user request
     
     config_path = os.path.join(run_path, 'stats', 'config.ini')
-
     save_file_as_ini(config, config_path) # save final config to run directory
+
+    mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
+    save_file_as_ini({'MEAN': train_mean.tolist(), 'STD': train_std.tolist()}, mean_std_path)
 
     # also create dirs for stats, figures and checkpoints if not existing
     stats_path = os.path.join(run_path, 'stats')
