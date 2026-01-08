@@ -1,0 +1,146 @@
+from master.configs.config_utils import load_config_file, create_folder_structure
+from master.data_sim.generator import generate_and_save_data_pooled
+import os
+import shutil
+import argparse
+
+from master.train.checkpoints import save_file_as_ini
+
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument('--run_dir', type=str, required=True)
+    p.add_argument('--new_run', action='store_true', default=False)
+    p.add_argument('--skip_data_gen', action='store_true', default=False)
+    p.add_argument('--epochs', type=int, default=None)
+    p.add_argument('--num_workers', type=int, default=None)
+    p.add_argument('--lr_patience', type=int, default=None)
+    p.add_argument('--lr', type=float, default=None)
+    p.add_argument('--batch_size', type=int, default=None)
+    p.add_argument('--w_mse', type=float, default=None)
+    p.add_argument('--w_grad', type=float, default=None)
+    p.add_argument('--w_refl', type=float, default=None)
+    p.add_argument('--fluid_train_dems', type=int, default=None)
+    p.add_argument('--fluid_val_dems', type=int, default=None)
+    p.add_argument('--fluid_test_dems', type=int, default=None)
+    p.add_argument('--images_per_dem', type=int, default=None)
+    return p.parse_args(argv)
+
+def main(argv=None):
+    args = _parse_args(argv)
+    config = load_config_file() # load default config
+    config["RUN_DIR"] = args.run_dir
+    # Determine run directory, and parse new/skip_data_gen flags
+    run_path = os.path.join(config["SUP_DIR"], args.run_dir)
+
+    if os.path.exists(run_path):
+        # Existing run directory found
+        if args.new_run is True:
+            # User requested new run
+            if not args.skip_data_gen:
+                # Remove existing run directory entirely
+                print(60*"=")
+                print("New run flag set. Removing existing run directory...")
+                try:
+                    if os.path.isdir(run_path):
+                        shutil.rmtree(run_path)
+                        print(f"Removed existing run directory: {run_path}")
+                except Exception as e:
+                    print(f"Failed to remove run_path {run_path}: {e}")
+                print(60*"=")
+                run_path, val_path, test_path = create_folder_structure(config)
+            elif args.skip_data_gen:
+                # User requested to skip data generation, so keep existing val/test files but remove old training data
+                print(60*"=")
+                print("New run flag set but skipping data generation. Continuing with existing run directory, but removing old training data...")
+                print(f"Using run directory: {run_path}")
+                print(60*"=")
+                val_path = os.path.join(run_path, 'val')
+                test_path = os.path.join(run_path, 'test')
+                # Remove old training data if present
+                checkpoint_path = os.path.join(run_path, 'checkpoints')
+                stats_path = os.path.join(run_path, 'stats')
+                if os.path.exists(stats_path):
+                    try:
+                        shutil.rmtree(stats_path)
+                    except Exception as e:
+                        print(f"Could not remove stats directory {stats_path}: {e}")
+                if os.path.exists(checkpoint_path):
+                    try:
+                        shutil.rmtree(checkpoint_path)
+                    except Exception as e:
+                        print(f"Could not remove checkpoint directory {checkpoint_path}: {e}")
+
+                # also 
+
+        elif args.new_run is False:
+            # Continuing existing run
+            print(60*"=")
+            print("Existing directory found. Continuing training for existing run...")
+            print(f"Using run directory: {run_path}")
+            print(60*"=")
+
+            stats_path = os.path.join(run_path, 'stats')
+            os.makedirs(stats_path, exist_ok=True)
+            # reload config from existing run directory
+            config_path = os.path.join(stats_path, 'config.ini')
+            config = load_config_file(config_path) # reload config from existing run
+
+            val_path = os.path.join(run_path, 'val')
+            test_path = os.path.join(run_path, 'test')
+    else:
+        # No existing run directory found; create new run
+        print(60*"=")
+        print(f"No existing run directory found.")
+        print(f"Creating new run at: {run_path}")
+        print(60*"=")
+        run_path, val_path, test_path = create_folder_structure(config)
+        args.new_run = True
+
+
+    # apply CLI overrides to config by uppercasing arg names (only if key exists in config)
+    allowed_cli_only = {"NEW_RUN", "SKIP_DATA_GEN"}
+    for arg_name, val in vars(args).items():
+        if val is None:
+            continue
+        cfg_key = arg_name.upper()
+        if cfg_key not in config and cfg_key not in allowed_cli_only:
+            print(f"⚠ Warning: Unknown config key '{cfg_key}' from CLI arguments; ignoring.")
+            continue
+        if isinstance(val, bool):
+            # print(f"Overriding config key '{cfg_key}' from CLI with new bool: {val}")
+            config[cfg_key] = val
+        else:
+            # print(f"Overriding config key '{cfg_key}' from CLI with value: {val}")
+            config[cfg_key] = val
+    
+    # If run is found to be new, generate data
+    if args.new_run:
+        if not args.skip_data_gen: # unless user requests to skip data generation
+            print("\n=== Generating New Dataset ===")
+            # create validation files
+            generate_and_save_data_pooled(config, images_dir=val_path, n_dems=config["FLUID_VAL_DEMS"])
+            # create test files
+            generate_and_save_data_pooled(config, images_dir=test_path, n_dems=config["FLUID_TEST_DEMS"])
+            print("Dataset generation complete.\n")
+        elif args.skip_data_gen:
+            pass  # skip data generation as per user request
+    
+    config_path = os.path.join(run_path, 'stats', 'config.ini')
+
+    save_file_as_ini(config, config_path) # save final config to run directory
+
+    # also create dirs for stats, figures and checkpoints if not existing
+    stats_path = os.path.join(run_path, 'stats')
+    os.makedirs(stats_path, exist_ok=True)
+    figs_path = os.path.join(run_path, 'figures')
+    os.makedirs(figs_path, exist_ok=True)
+    checkpoint_path = os.path.join(run_path, 'checkpoints')
+    os.makedirs(checkpoint_path, exist_ok=True)
+
+    print(f"Initialization complete. You can now run the training script using run directory \"{args.run_dir}\".")
+
+
+if __name__ == '__main__':
+    main(argv=None)
+
