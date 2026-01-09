@@ -49,7 +49,8 @@ class Trainer:
         self.optimizer = optimizer
         self.save_every = config["SAVE_EVERY"]
         self.epochs_run = 0
-        self.loss_history = []  # Track losses
+        self.train_loss_history = []  # Track losses
+        self.val_loss_history = []    # Track validation losses
         self.snapshot_path = snapshot_path
         if os.path.exists(snapshot_path):
             if is_main():
@@ -65,7 +66,7 @@ class Trainer:
         snapshot = torch.load(snapshot_path, map_location=loc)
         self.model.load_state_dict(snapshot["MODEL_STATE"])
         self.epochs_run = snapshot["EPOCHS_RUN"]
-        self.loss_history = snapshot.get("LOSS_HISTORY", [])
+        self.train_loss_history = snapshot.get("LOSS_HISTORY", [])
         self.val_loss_history = snapshot.get("VAL_LOSS_HISTORY", [])
         if is_main():
             print(f"Resuming training from snapshot at Epoch {self.epochs_run}")
@@ -111,7 +112,7 @@ class Trainer:
     
         # Store loss on main process
         if is_main():
-            self.loss_history.append(global_avg_loss)
+            self.train_loss_history.append(global_avg_loss)
             total_time = time.time() - t0
             print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {global_avg_loss:.6f} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s")
 
@@ -131,18 +132,27 @@ class Trainer:
         snapshot = {
             "MODEL_STATE": self.model.module.state_dict(),
             "EPOCHS_RUN": epoch,
-            "LOSS_HISTORY": self.loss_history,  # Save loss history
+            "TRAIN_LOSS_HISTORY": self.train_loss_history,  # Save loss history
+            "VAL_LOSS_HISTORY": self.val_loss_history,  # Save validation loss history
         }
         torch.save(snapshot, self.snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
         
         # Also save loss history separately as CSV for easy plotting
-        loss_file = self.snapshot_path.replace('.pt', '_losses.csv')
-        with open(loss_file, 'w') as f:
+        train_loss_file = self.snapshot_path.replace('.pt', '_train_losses.csv')
+        with open(train_loss_file, 'w') as f:
             f.write("epoch,loss\n")
-            for i, loss in enumerate(self.loss_history, start=1):
+            for i, loss in enumerate(self.train_loss_history, start=1):
                 f.write(f"{i},{loss}\n")
+        # Also save validation loss history
+        val_loss_file = self.snapshot_path.replace('.pt', '_val_losses.csv')
+        with open(val_loss_file, 'w') as f:
+            f.write("epoch,loss\n")
+            for i, loss in enumerate(self.val_loss_history):
+                actual_epoch = (i + 1) * self.save_every
+                f.write(f"{actual_epoch},{loss}\n")
 
+                
     def train(self, max_epochs: int):
         for epoch in range(self.epochs_run, max_epochs):
             self._run_epoch(epoch)

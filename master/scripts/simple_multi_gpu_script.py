@@ -1,3 +1,5 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "2"
 
 import torch
 import torch.nn.functional as F
@@ -16,11 +18,9 @@ from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 from master.data_sim.dataset_io import list_pt_files
 
 
-import os
 from master.configs.config_utils import load_config_file
 from master.models.losses import calculate_total_loss
 from master.models.unet import UNet
-
 torch.multiprocessing.set_start_method('spawn', force=True)
 
 def main(run_dir: str):
