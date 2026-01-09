@@ -77,53 +77,81 @@ plt.rcParams.update({
 })
 
 
-def plot_comprehensive(
+def plot_comprehensive_pt(
     run_dir=None,
     n_test_sets=5, figsize=(24, 18), return_fig=False, 
     save_fig=True, output_name='comprehensive_validation.pdf',
     same_scale=False, variant='random'
 ):
 
-
     # Load config to find paths
-    config = load_config_file(os.path.join(run_dir, 'stats', 'config.ini'))
-    checkpoint_path = os.path.join(run_dir, 'checkpoints', 'best.pth')
-    train_losses_path = os.path.join(run_dir, 'stats', 'train_losses.ini')
-    val_losses_path = os.path.join(run_dir, 'stats', 'val_losses.ini')
-    run_stats_path = os.path.join(run_dir, 'stats', 'run_stats.ini')
-    timing_info = os.path.join(run_dir, 'stats', 'timing_info.ini')
-    lr_changes_path = os.path.join(run_dir, 'stats', 'lr_changes.ini')
+    sup_dir = "runs/"
+    config = load_config_file(os.path.join(sup_dir, run_dir, 'stats', 'config.ini'))
+    snapshot_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'snapshot.pt')
+    train_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'train_losses.csv')
+    val_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'val_losses.csv')
+    input_stats_path = os.path.join(sup_dir, run_dir, 'stats', 'input_stats.ini')
+    train_timings_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'train_timings.csv')
+    val_timings_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'val_timings.csv')
+    test_results_path = os.path.join(sup_dir, run_dir, 'stats', 'test_results.ini')
+    equipment_info_path = os.path.join(sup_dir, run_dir, 'stats', 'equipment_info.ini')
     
     # Load model, history, and test dataset
-    checkpoint = load_checkpoint(checkpoint_path, map_location='cpu')
-    train_losses = read_file_from_ini(train_losses_path, ftype=list)
-    val_losses = read_file_from_ini(val_losses_path, ftype=list)
-    run_stats = read_file_from_ini(run_stats_path, ftype=dict)
-    timing_info = read_file_from_ini(timing_info, ftype=dict)
-    lr_changes = read_file_from_ini(lr_changes_path, ftype=dict)
-    test_dems_dir = os.path.join(run_dir, 'test')
+    checkpoint = load_checkpoint(snapshot_path, map_location='cpu')
+    train_data = np.genfromtxt(train_losses_path, delimiter=',', skip_header=1)
+    val_data = np.genfromtxt(val_losses_path, delimiter=',', skip_header=1)
+    train_epochs = train_data[:, 0].astype(int).tolist()
+    train_losses = train_data[:, 1].tolist()
+    val_epochs = val_data[:, 0].astype(int).tolist()
+    val_losses = val_data[:, 1].tolist()
+    input_stats = read_file_from_ini(input_stats_path, ftype=dict)
+    if os.path.exists(train_timings_path):
+        train_timings_data = np.genfromtxt(train_timings_path, delimiter=',', skip_header=1)
+        val_timings_data = np.genfromtxt(val_timings_path, delimiter=',', skip_header=1)
+        avg_train_time_per_epoch = np.mean(train_timings_data[:, 1])
+        avg_val_time_per_epoch = np.mean(val_timings_data[:, 1])
+        test_results = read_file_from_ini(test_results_path, ftype=dict)
+        equipment_info = read_file_from_ini(equipment_info_path, ftype=dict)
+        n_gpus = int(equipment_info.get('NUM_GPUS', ['1'])[0])
+
+    total_time_logged = False
+    total_time_path = os.path.join(sup_dir, run_dir, 'stats', 'total_time.ini')
+    if os.path.exists(total_time_path):
+        total_time_logged = True
+        timing_info = read_file_from_ini(total_time_path, ftype=dict)
+        total_time_seconds = timing_info["TOTAL_TIME_SECONDS"]
+        total_time_hrs = timing_info["TOTAL_TIME_HRS"]
+        total_time_minutes = timing_info["TOTAL_TIME_MINUTES"]
+
+    # run_stats = read_file_from_ini(run_stats_path, ftype=dict)
+    # timing_info = read_file_from_ini(timing_info, ftype=dict)
+    # lr_changes = read_file_from_ini(lr_changes_path, ftype=dict)
+    test_dems_dir = os.path.join(sup_dir, run_dir, 'test')
     test_files = None
     if os.path.isdir(test_dems_dir):
-        # Look for .npz files in the test_dems folder
-        candidate_files = sorted(glob.glob(os.path.join(test_dems_dir, '*.npz')))
+        # Look for .pt files in the test_dems folder
+        candidate_files = sorted(glob.glob(os.path.join(test_dems_dir, '*.pt')))
         if len(candidate_files) > 0:
             test_files = candidate_files
             print(f"Using {len(test_files)} test files from: {test_dems_dir}")
         else:
-            print(f"Found '{test_dems_dir}' but no .npz files were present. Falling back to history['test_files'].")
+            print(f"Found '{test_dems_dir}' but no .pt files were present. Falling back to history['test_files'].")
+    else:
+        raise FileNotFoundError(f"No test directory found at '{test_dems_dir}'")
 
     model = UNet(in_channels=config["IMAGES_PER_DEM"], out_channels=1)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['MODEL_STATE'])
     model.eval()
 
-    train_mean = checkpoint['train_mean']
-    train_std = checkpoint['train_std']
+    train_mean = torch.tensor(input_stats['MEAN'], dtype=torch.float32)
+    train_std = torch.tensor(input_stats['STD'], dtype=torch.float32)
 
     test_dataset = DEMDataset(test_files)
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
     model.to(device)
     
     # Select test sets based on variant
+    print(f"Selecting {n_test_sets} test sets using variant: {variant}")
     available_indices = list(range(len(test_dataset)))
     
     if variant == 'first':
@@ -181,17 +209,15 @@ def plot_comprehensive(
     # Top row: Loss plot (left) + 4 info boxes (right)
     # ========================================================================
     # Loss plot on the left (50% of the width)
-    loss_start_x = 0.1
+    loss_start_x = 0.13
     loss_width = 0.45  # 50% of usable space
     loss_height = 0.10
     loss_start_y = 0.88
     
     ax_loss = fig.add_axes([loss_start_x, loss_start_y, loss_width, loss_height])
-    
-    epochs = list(range(1, len(train_losses) + 1))
 
-    ax_loss.plot(epochs, train_losses, label='Training Loss', linewidth=2)
-    ax_loss.plot(epochs, val_losses, label='Validation Loss', linewidth=2)
+    ax_loss.plot(train_epochs, train_losses, label='Training Loss', linewidth=2)
+    ax_loss.plot(val_epochs, val_losses, label='Validation Loss', linewidth=2)
     ax_loss.set_yscale('log')
     ax_loss.set_xlabel('Epoch', fontsize=12)
     ax_loss.set_ylabel('Loss', fontsize=12)
@@ -203,20 +229,23 @@ def plot_comprehensive(
     from matplotlib.ticker import MaxNLocator
     ax_loss.xaxis.set_major_locator(MaxNLocator(integer=True))
     
-    # Position for 4 text boxes in a row on the right (remaining 50%)
-    info_width = 0.1125  # (0.45 / 4) - split remaining 50% into 4 equal boxes
-    info_height = 0.10   # Height of each text box (taller to fit 10 lines)
-    info_gap_h = -0.007  # Slight overlap to eliminate visual gaps from rounded corners
-    info_start_x = loss_start_x + loss_width + 0.02  # Start after loss plot with small gap
+    # Position for 2 text boxes in a row on the right (remaining 50%)
+    info_width = 0.215  # Wider boxes with minimal gap
+    info_height = 0.1   # Height of each text box (taller to fit 10 lines)
+    info_gap_h = -0.09  # Minimal/overlapping gap between boxes
+    info_start_x = loss_start_x + loss_width + 0.01  # Start after loss plot with small gap
     info_start_y = 0.88  # Starting y position (top row)
     
     fontsize_textbox = 13
 
+    if not os.path.exists(train_timings_path):
+        test_results = {"TEST_LOSS": 0.0, "TEST_AME": 0.0}
+
     infobox_1_text = ("Unet DL Network \n"
-                        f"Best epoch: {int(run_stats.get('best_epoch', 'N/A'))}\n"
-                        f"Test Loss: {float(run_stats.get('test_loss', 'N/A')):.3f}\n"
-                        f"Test AME: {float(run_stats.get('test_ame', 'N/A')):.3f}\n"
-                        f"Final LR: {float(checkpoint['learning_rate']):.3e}\n"
+                        f"Epochs trained: {int(checkpoint.get('EPOCHS_RUN', 'N/A'))}\n"
+                        f"Test Loss: {float(test_results.get('TEST_LOSS', 'N/A')):.3f}\n"
+                        f"Test AME: {float(test_results.get('TEST_AME', 'N/A')):.3f}\n"
+                        f"LR: {float(config['LR']):.3e}"
 
                         )
     
@@ -230,65 +259,49 @@ def plot_comprehensive(
                   family='monospace',
                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
     
-    # # Info box 2: Loss Function
-    # ax_loss_info = fig.add_axes([info_start_x + 1*info_width + 1*info_gap_h, info_start_y, info_width, info_height])
-    # ax_loss_info.axis('off')
-    # ax_loss_info.text(0.05, 0.95, loss_summary,
-    #                   transform=ax_loss_info.transAxes,
-    #                   fontsize=fontsize_textbox,
-    #                   verticalalignment='top',
-    #                   family='monospace',
-    #                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-    
-    total_epochs = int(timing_info['epochs'])
-    wall_hours = float(timing_info['wall_hours'])
-    gpu_seconds_per_epoch = float(timing_info['gpu_seconds_per_epoch'])
-    cpu_seconds_per_epoch = float(timing_info['cpu_seconds_per_epoch'])
-    infobox_3_text = (  
-                        f"Total Epochs: {total_epochs}\n"
-                        f"Total Time: {wall_hours:.2f} hrs\n"
-                        f"GPU: {gpu_seconds_per_epoch:.2f} seconds/epoch\n"
-                        f"CPU: {cpu_seconds_per_epoch:.2f} seconds/epoch\n")
 
-    # Info box 3: 
-    ax_training = fig.add_axes([info_start_x + 2*info_width + 2*info_gap_h, info_start_y, info_width, info_height])
+    if not os.path.exists(train_timings_path):
+        avg_train_time_per_epoch = 0.0
+        avg_val_time_per_epoch = 0.0
+        n_gpus = 1
+
+    infobox_2_text = (  
+                        f"Total Epochs: {checkpoint.get('EPOCHS_RUN', 'N/A')}\n"
+                        f"Avg. Train Time Per Epoch: {avg_train_time_per_epoch:.2f} hrs\n"
+                        f"Avg. Val Time Per Epoch: {avg_val_time_per_epoch:.2f} s\n"
+                        f"Number GPUs: {n_gpus}\n")
+
+    # Info box 2: 
+    ax_training = fig.add_axes([info_start_x + info_width + info_gap_h, info_start_y, info_width, info_height])
     ax_training.axis('off')
-    ax_training.text(0.05, 0.95, infobox_3_text,
+    ax_training.text(0.05, 0.95, infobox_2_text,
                      transform=ax_training.transAxes,
                      fontsize=fontsize_textbox,
                      verticalalignment='top',
                      family='monospace',
                      bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
     
-    # # Info box 4: Training Data
-    # ax_data = fig.add_axes([info_start_x + 3*info_width + 3*info_gap_h - 0.014, info_start_y, info_width, info_height])
-    # ax_data.axis('off')
-    # ax_data.text(0.05, 0.95, data_summary,
-    #              transform=ax_data.transAxes,
-    #              fontsize=fontsize_textbox,
-    #              verticalalignment='top',
-    #              family='monospace',
-    #              bbox=dict(boxstyle='round', facecolor='lavender', alpha=0.3))
+
     
     # ========================================================================
     # Rows 2-6: Test set predictions with manual positioning for tight spacing
     # ========================================================================
-    row_height = 0.13
-    row_spacing = 0.01
-    start_y = 0.84  # Top of first row
+    row_height = 0.16  # Increased from 0.13
+    row_spacing = 0.013
+    start_y = 0.80  # Top of first row
     
     # Column widths and positions (extended to use more horizontal space)
     diff_width = 0.13  # Wider to account for colorbar
-    dem_width = 0.105
+    dem_width = 0.11
     pred_width = 0.125  # Wider to account for colorbar
-    img_width = 0.105
+    img_width = 0.11
     
     # Horizontal positions (centered better with equal margins)
-    diff_x = 0.075  # Shifted right slightly for better balance
-    gt_x = diff_x + diff_width + 0.015  # Small gap after diff
-    pred_x = gt_x + dem_width - 0.01   # Tiny gap between DEMs
-    img_x_start = pred_x + pred_width + 0.015  # Small gap before images
-    img_gap = 0.002  # Tiny gap between images
+    diff_x = 0.07  # Shifted right slightly for better balance
+    gt_x = diff_x + diff_width + 0.029  # Small gap after diff
+    pred_x = gt_x + dem_width - 0.007   # Small gap between DEMs
+    img_x_start = pred_x + pred_width + 0.037  # Small gap before images
+    img_gap = 0.0005  # Reduced gap between images
     
     # Store the last image objects for colorbars
     last_diff_im = None
@@ -366,14 +379,14 @@ def plot_comprehensive(
     
     # Add shared colorbar for differences (positioned at right edge of diff column)
     cbar_diff_width = 0.007
-    cbar_diff_x = diff_x + diff_width - 0.013  # Positioned further left
+    cbar_diff_x = diff_x + diff_width - 0.008  # Positioned with space from figure
     cbar_diff_ax = fig.add_axes([cbar_diff_x, bottom_y, cbar_diff_width, total_height])
     cbar_diff = plt.colorbar(last_diff_im, cax=cbar_diff_ax)
     cbar_diff.ax.tick_params(labelsize=10)
     
     # Add shared colorbar for DEMs (predicted) (positioned at right edge of pred column)
     cbar_dem_width = 0.007
-    cbar_dem_x = pred_x + pred_width - 0.01  # Positioned further left
+    cbar_dem_x = pred_x + pred_width - 0.0055  # Positioned with space from figure
     cbar_dem_ax = fig.add_axes([cbar_dem_x, bottom_y, cbar_dem_width, total_height])
     cbar_dem = plt.colorbar(last_pred_im, cax=cbar_dem_ax)
     cbar_dem.ax.tick_params(labelsize=10)
@@ -381,7 +394,7 @@ def plot_comprehensive(
     
     # Save?
     if save_fig:
-        figures_dir = os.path.join(run_dir, 'figures')
+        figures_dir = os.path.join(sup_dir, run_dir, 'figures')
         os.makedirs(figures_dir, exist_ok=True)
         output_path = os.path.join(figures_dir, output_name)
         fig.savefig(output_path, format='pdf', bbox_inches='tight', dpi=150)
@@ -546,3 +559,23 @@ def extract_dataset_number(filename):
     """Extract dataset number from filename."""
     match = re.search(r'dataset_(\d+)', filename)
     return int(match.group(1)) if match else None
+
+
+import argparse
+
+if __name__ == "__main__":
+    args = argparse.ArgumentParser(description="Plot comprehensive test set predictions for a trained UNet model.")
+    args.add_argument('--run_dir', type=str, required=True,
+                      help='Directory of the trained model run containing stats and checkpoints.')
+    args = args.parse_args()
+
+    print("Plotting test set predictions...")
+
+    plot_comprehensive_pt(run_dir=args.run_dir,
+                        n_test_sets=5,
+                        variant='first',  # 'first' or 'random'
+                        same_scale=False,  # False, 'row', or 'all'
+                        figsize=(15, 10),
+                        save_fig=True,
+                        output_name='predictions_summary.pdf',
+                        return_fig=False)

@@ -2,7 +2,7 @@ import os
 import matplotlib.pyplot as plt
 import argparse
 
-from master.validate.plotting import plot_data
+from master.validate.plotting_new import plot_data
 
 def _parse_args(argv=None):
     p = argparse.ArgumentParser()
