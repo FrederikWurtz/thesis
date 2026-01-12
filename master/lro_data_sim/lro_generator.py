@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 import cv2
 
-from LRO_data.functions import detrend_2d, extract_local_dem_subset
+from master.lro_data_sim.lro_data_utils import detrend_2d, extract_local_dem_subset
 from master.render.dem_utils import DEM
 from master.render.hapke_model import HapkeModel
 from master.render.camera import Camera
@@ -77,7 +77,7 @@ def generate_and_return_lro_data(config: dict = None, device: str = "cpu"):
 
 def generate_and_return_lro_dem(config: dict = None):
 
-    dem_path = "/Users/au644271/Desktop/local_python/LRO_data_sandbox/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
+    dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
 
     lat, lon, box_radius = get_lat_lon_radius(config)    
     dem_array, metadata = extract_local_dem_subset(
@@ -152,7 +152,7 @@ def get_lat_lon_radius(config: dict):
 # Alternative version of generate_and_return_lro_dem with resampling
 def generate_and_return_lro_dem_alt(config: dict = None):
 
-    dem_path = "/Users/au644271/Desktop/local_python/LRO_data_sandbox/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
+    dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
 
     lat, lon, box_radius = get_lat_lon_radius(config)
 
