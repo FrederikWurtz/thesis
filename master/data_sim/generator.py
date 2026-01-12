@@ -9,6 +9,8 @@ from master.render.hapke_model import HapkeModel
 from master.render.camera import Camera
 from master.render.renderer import Renderer
 
+from master.lro_data_sim.lro_generator import generate_and_return_lro_data, generate_and_save_lro_data
+
 import cProfile
 import pstats
 import io
@@ -321,7 +323,10 @@ def generate_and_save_data(path: str = None, config: dict = None):
 def generate_and_return_worker_friendly(config):
     # args is a (path, config) tuple so this worker remains picklable and simple
     try:
-        images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
+        if config["USE_LRO_DEMS"]:
+            images, reflectance_maps, dem_np, metas = generate_and_return_lro_data(config=config)
+        else:
+            images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
         # Explicit cleanup
         import gc
         gc.collect()
@@ -339,7 +344,10 @@ def generate_and_save_worker_friendly(args):
     # args is a (path, config) tuple so this worker remains picklable and simple
     path, config = args
     try:
-        generate_and_save_data(path=path, config=config)
+        if config["USE_LRO_DEMS"]:
+            generate_and_save_lro_data(config=config, save_path=path)
+        else:
+            generate_and_save_data(path=path, config=config)
     except Exception:
         import traceback
         traceback.print_exc()
@@ -405,7 +413,10 @@ def _multiprocessing_worker(args):
     
     filename = os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
     try:
-        generate_and_save_data(path=filename, config=config)
+        if config["USE_LRO_DEMS"]:
+            generate_and_save_lro_data(config=config, save_path=filename)
+        else:
+            generate_and_save_data(path=filename, config=config)
         return True
     except Exception:
         import traceback
@@ -456,7 +467,10 @@ def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, 
         torch.cuda.set_device(gpu_id)
         
         try:
-            images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
+            if config["USE_LRO_DEMS"]:
+                images, reflectance_maps, dem_np, metas = generate_and_return_lro_data(config=config, device=f"cuda:{gpu_id}")
+            else:
+                images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
             
             data_dict = {
                 'dem': torch.from_numpy(dem_np),

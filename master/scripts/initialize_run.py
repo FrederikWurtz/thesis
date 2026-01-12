@@ -18,6 +18,7 @@ def _parse_args(argv=None):
     p.add_argument('--run_dir', type=str, required=True)
     p.add_argument('--new_run', action='store_true', default=False)
     p.add_argument('--skip_data_gen', action='store_true', default=False)
+    p.add_argument('--use_LRO_dems', type=bool, default=None)
     p.add_argument('--epochs', type=int, default=None)
     p.add_argument('--num_workers', type=int, default=None)
     p.add_argument('--lr_patience', type=int, default=None)
@@ -111,7 +112,7 @@ def main(argv=None):
 
 
     # apply CLI overrides to config by uppercasing arg names (only if key exists in config)
-    allowed_cli_only = {"NEW_RUN", "SKIP_DATA_GEN"}
+    allowed_cli_only = {"NEW_RUN", "SKIP_DATA_GEN", "USE_LRO_DEMS"}
     for arg_name, val in vars(args).items():
         if val is None:
             continue
@@ -126,6 +127,9 @@ def main(argv=None):
             # print(f"Overriding config key '{cfg_key}' from CLI with value: {val}")
             config[cfg_key] = val
     
+    print("LRO DEM usage set to:", end=" ")
+    print(config["USE_LRO_DEMS"])
+
     # If run is found to be new, generate data
     if args.new_run:
         if not args.skip_data_gen: # unless user requests to skip data generation
@@ -145,14 +149,14 @@ def main(argv=None):
             generate_and_save_data_pooled_multi_gpu(config, images_dir=test_path, n_dems=config["FLUID_TEST_DEMS"])
             print("Dataset generation complete.\n")
 
+            mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
+            save_file_as_ini({'MEAN': train_mean.tolist(), 'STD': train_std.tolist()}, mean_std_path)
+
         elif args.skip_data_gen:
             pass  # skip data generation as per user request
     
     config_path = os.path.join(run_path, 'stats', 'config.ini')
     save_file_as_ini(config, config_path) # save final config to run directory
-
-    mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
-    save_file_as_ini({'MEAN': train_mean.tolist(), 'STD': train_std.tolist()}, mean_std_path)
 
     # also create dirs for stats, figures and checkpoints if not existing
     stats_path = os.path.join(run_path, 'stats')

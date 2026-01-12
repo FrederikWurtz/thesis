@@ -77,6 +77,7 @@ plt.rcParams.update({
 })
 
 
+
 def plot_comprehensive_pt(
     run_dir=None,
     n_test_sets=5, figsize=(24, 18), return_fig=False, 
@@ -555,6 +556,165 @@ def plot_data(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
     if return_fig:
         return fig
 
+def plot_data_pt(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
+                   fig_path='data_grid.pdf', variant='random', 
+                   same_scale=False, output_name='data_grid.pdf'):
+    """
+    Plot DEMs and images from .pt files (PyTorch format).
+    Similar to plot_data but works with .pt files instead of .npz files.
+    """
+
+    #ensure figures directory exists
+    figures_dir = os.path.join(run_dir, 'figures')
+    os.makedirs(figures_dir, exist_ok=True)
+
+    test_dems_dir = os.path.join(run_dir, 'test')
+    test_files = None
+    if os.path.isdir(test_dems_dir):
+        # Look for .pt files in the test_dems folder
+        candidate_files = sorted(glob.glob(os.path.join(test_dems_dir, '*.pt')))
+        if len(candidate_files) > 0:
+            test_files = candidate_files
+            print(f"Using {len(test_files)} test files from: {test_dems_dir}")
+        else:
+            raise ValueError(f"Found '{test_dems_dir}' but no .pt files were present.")
+    
+    if len(test_files) < n_sets:
+        raise ValueError(f"Not enough .pt files in provided folder to plot {n_sets} sets. Found only {len(test_files)}.") 
+    
+    # Select files based on variant.
+    files = []
+    if variant in ('first'):
+        files = test_files[:n_sets]
+    elif variant in ('random'):
+        files = random.sample(test_files, n_sets)
+    else:
+        raise ValueError(f"Unknown variant: {variant}")
+    
+    # find dataset number from and use to sort files
+    for i in range(len(files)):
+        files[i] = (extract_dataset_number(os.path.basename(files[i])), files[i])
+    files = sorted(files, key=lambda x: x[0])
+    files = [f[1] for f in files]
+
+    # Find global min/max for all DEMs and images
+    all_dems = []
+    all_images = []
+    for f in files:
+        d = torch.load(f, map_location='cpu')
+        # Convert tensors to numpy arrays
+        dem = d['dem'].numpy() if torch.is_tensor(d['dem']) else d['dem']
+        data = d['data'].numpy() if torch.is_tensor(d['data']) else d['data']
+        all_dems.append(dem)
+        all_images.append(data)
+    all_dems = np.stack(all_dems, axis=0)
+    all_images = np.concatenate(all_images, axis=0)
+    dem_vmin = np.min(all_dems)
+    dem_vmax = np.max(all_dems)
+    img_vmin = np.min(all_images)
+    img_vmax = np.max(all_images)
+
+    # Create figure with manual positioning for precise control
+    fig = plt.figure(figsize=(3.2*(n_images+1), 2.5*n_sets))
+    
+    # Layout parameters
+    row_height = 0.85 / n_sets  # Total height available divided by rows
+    row_spacing = 0.005  # Small gap between rows
+    
+    # Column widths and positions
+    dem_width = 0.13  # Width for DEM column
+    dem_x = 0.08  # Left position for DEM
+    
+    img_width = 0.11  # Width for each image
+    img_x_start = dem_x + dem_width + 0.03  # Start after DEM with larger gap
+    img_gap = 0.002  # Tiny gap between images
+    
+    # Starting y position (from top)
+    start_y = 0.92
+    
+    # Store the last DEM image object for colorbar
+    last_dem_im = None
+    
+    for i, f in enumerate(files):
+        d = torch.load(f, map_location='cpu')
+        # Convert tensors to numpy arrays
+        dem = d['dem'].numpy() if torch.is_tensor(d['dem']) else d['dem']
+        images = d['data'].numpy() if torch.is_tensor(d['data']) else d['data']
+        dem_num = extract_dataset_number(os.path.basename(f))
+        
+        # Calculate per-row min/max if same_scale='row'
+        if same_scale == 'row':
+            row_img_min = images.min()
+            row_img_max = images.max()
+        
+        # Calculate y position for this row
+        y_pos = start_y - i * (row_height + row_spacing)
+        
+        # Column 0: DEM (without individual colorbar)
+        ax_dem = fig.add_axes([dem_x, y_pos - row_height, dem_width, row_height])
+        im_dem = ax_dem.imshow(dem, cmap='terrain', vmin=dem_vmin, vmax=dem_vmax, origin='lower')
+        
+        # Store the image object for the colorbar
+        last_dem_im = im_dem
+        
+        # Remove ticks and tick labels
+        ax_dem.set_xticks([])
+        ax_dem.set_yticks([])
+        
+        # Title only on first row
+        if i == 0:
+            title_str = 'DEM'
+            ax_dem.set_title(title_str, fontsize=13, pad=5)
+        
+        # Y-label showing DEM number
+        if dem_num is not None:
+            ax_dem.set_ylabel(f'DEM {dem_num}', fontsize=12, rotation=90, labelpad=5)
+        
+        # Columns 1-5: Images with different scaling options
+        for j in range(n_images):
+            img_x = img_x_start + j * (img_width + img_gap)
+            ax_img = fig.add_axes([img_x, y_pos - row_height, img_width, row_height])
+            
+            if same_scale == 'all':
+                # Use same scale for all images across all rows
+                ax_img.imshow(images[j], cmap='gray', vmin=img_vmin, vmax=img_vmax, origin='lower')
+            elif same_scale == 'row':
+                # Use same scale for all images in this row
+                ax_img.imshow(images[j], cmap='gray', vmin=row_img_min, vmax=row_img_max, origin='lower')
+            else:  # same_scale=False
+                # Use individual scale for each image
+                ax_img.imshow(images[j], cmap='gray', origin='lower')
+            
+            # Remove ticks and tick labels
+            ax_img.set_xticks([])
+            ax_img.set_yticks([])
+            
+            # Title only on first row
+            if i == 0:
+                ax_img.set_title(f'Image {j+1}', fontsize=13, pad=5)
+    
+    # Add one tall colorbar spanning all rows, close to the DEMs
+    # Calculate the total height of all DEM plots
+    total_height = n_sets * row_height + (n_sets - 1) * row_spacing
+    bottom_y = start_y - total_height
+    
+    # Create a dummy axis for the colorbar (reduced width from 0.015 to 0.01)
+    cbar_ax = fig.add_axes([dem_x + dem_width - 0.006, bottom_y, 0.008, total_height])
+    cbar = plt.colorbar(last_dem_im, cax=cbar_ax)
+    cbar.ax.tick_params(labelsize=8)
+    
+    # Save or show
+    if save_fig:
+        figures_dir = os.path.join(run_dir, 'figures')
+        os.makedirs(figures_dir, exist_ok=True)
+        output_path = os.path.join(figures_dir, output_name)
+        fig.savefig(output_path, format='pdf', bbox_inches='tight', dpi=150)
+        print(f"Figure saved to: {output_path}")
+
+    if return_fig:
+        return fig
+
+
 def extract_dataset_number(filename):
     """Extract dataset number from filename."""
     match = re.search(r'dataset_(\d+)', filename)
@@ -571,11 +731,23 @@ if __name__ == "__main__":
 
     print("Plotting test set predictions...")
 
-    plot_comprehensive_pt(run_dir=args.run_dir,
-                        n_test_sets=5,
+    if not os.path.exists(os.path.join("runs", args.run_dir, 'checkpoints', 'snapshot.pt')):
+        #no training exists, only plot data
+        print("No training snapshot found, plotting data only...")
+        plot_data_pt(run_dir=os.path.join("runs", args.run_dir),
+                        n_sets=5,
                         variant='first',  # 'first' or 'random'
                         same_scale=False,  # False, 'row', or 'all'
-                        figsize=(15, 10),
                         save_fig=True,
-                        output_name='predictions_summary.pdf',
+                        output_name='data_summary.pdf',
                         return_fig=False)
+    else:
+        print("Training snapshot found, plotting predictions...")
+        plot_comprehensive_pt(run_dir=args.run_dir,
+                            n_test_sets=5,
+                            variant='first',  # 'first' or 'random'
+                            same_scale=False,  # False, 'row', or 'all'
+                            figsize=(15, 10),
+                            save_fig=True,
+                            output_name='predictions_summary.pdf',
+                            return_fig=False)
