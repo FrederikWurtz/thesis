@@ -5,6 +5,8 @@ import re
 import torch
 import random
 import numpy as np
+import subprocess
+import shutil
 
 from master.models.unet import UNet
 from master.train.trainer_core import DEMDataset
@@ -58,10 +60,23 @@ def ax_format(ax,
     if ylabel is not None:
         ax.set_ylabel(ylabel)
 
+# Check if LaTeX is available
+def is_latex_available():
+    """Check if LaTeX is installed and accessible."""
+    # Check for common LaTeX executables
+    latex_commands = ['pdflatex', 'latex', 'xelatex']
+    for cmd in latex_commands:
+        if shutil.which(cmd) is not None:
+            return True
+    return False
+
+# Set matplotlib parameters based on LaTeX availability
+use_latex = is_latex_available()
+
 plt.rcParams.update({
-    'text.usetex': True,
+    'text.usetex': use_latex,
     'font.size': 12,
-    'font.family': 'serif',
+    'font.family': 'serif' if use_latex else 'DejaVu Serif',
     'axes.labelsize': 12,
     'xtick.labelsize': 12,
     'xtick.top': True,
@@ -75,6 +90,9 @@ plt.rcParams.update({
     'ytick.major.size': 10,
     'ytick.minor.size': 5
 })
+
+if not use_latex:
+    print("Warning: LaTeX not found. Using default matplotlib fonts.")
 
 
 

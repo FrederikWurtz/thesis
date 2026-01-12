@@ -430,11 +430,7 @@ def _generate_with_multiprocessing(n_dems, n_gpus, max_workers, images_dir, conf
     import torch.multiprocessing as mp
     
     # Force spawn method for CUDA compatibility
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass  # Already set
-
+    mp.set_start_method('spawn', force=True)
 
     # Create work items
     tasks = [
@@ -442,8 +438,9 @@ def _generate_with_multiprocessing(n_dems, n_gpus, max_workers, images_dir, conf
         for i in range(n_dems)
     ]
     
-    # Use process pool
-    with Pool(processes=max_workers) as pool:
+    # Use process pool with spawn context
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(processes=max_workers) as pool:
         results = list(tqdm(
             pool.imap_unordered(_multiprocessing_worker, tasks, chunksize=1),
             total=n_dems,
@@ -468,16 +465,23 @@ def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, 
         
         try:
             if config["USE_LRO_DEMS"]:
-                images, reflectance_maps, dem_np, metas = generate_and_return_lro_data(config=config, device=f"cuda:{gpu_id}")
+                images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=config, device=f"cuda:{gpu_id}")
+                data_dict = {
+                    'dem': dem_tensor,
+                    'data': torch.stack(images),
+                    'reflectance_maps': torch.stack(reflectance_maps),
+                    'meta': torch.tensor(metas, dtype=torch.float32)
+                }
+
             else:
                 images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
+                data_dict = {
+                    'dem': torch.from_numpy(dem_np),
+                    'data': torch.stack(images).cpu(),
+                    'reflectance_maps': torch.stack(reflectance_maps).cpu(),
+                    'meta': torch.tensor(metas, dtype=torch.float32)
+                }
             
-            data_dict = {
-                'dem': torch.from_numpy(dem_np),
-                'data': torch.stack(images).cpu(),
-                'reflectance_maps': torch.stack(reflectance_maps).cpu(),
-                'meta': torch.tensor(metas, dtype=torch.float32)
-            }
             
             save_queue.put((filename, data_dict))
             return True
@@ -606,7 +610,10 @@ def generate_and_save_data_pooled_multi_gpu(config: dict = None,
             filename = os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
             all_args.append((filename, config))
         
-        with Pool(processes=config["NUM_WORKERS"]) as pool:
+        # Use spawn method for consistency
+        import multiprocessing as mp
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(processes=config["NUM_WORKERS"]) as pool:
             results = list(tqdm(
                 pool.imap_unordered(generate_and_save_worker_friendly, all_args, chunksize=1),
                 total=n_dems,

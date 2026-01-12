@@ -108,7 +108,7 @@ class DEMDataset(Dataset):
 
     def __getitem__(self, idx):
         # Load PyTorch tensors directly
-        loaded = torch.load(self.files[idx])
+        loaded = torch.load(self.files[idx], map_location='cpu')
         
         # Extract tensors using the correct keys from generator.py
         target_tensor = loaded['dem'].unsqueeze(0)  # Add channel dim
