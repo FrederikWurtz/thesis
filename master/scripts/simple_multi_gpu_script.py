@@ -40,7 +40,7 @@ def main(run_dir: str):
     train_mean = torch.tensor([float(input_stats['MEAN'][i]) for i in range(len(input_stats['MEAN']))])
     train_std = torch.tensor([float(input_stats['STD'][i]) for i in range(len(input_stats['STD']))])
 
-    train_set, val_set, model, optimizer = load_train_objs(config, run_path)
+    train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path)
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
                                       num_workers=config["NUM_WORKERS_DATALOADER"], 
                                       prefetch_factor=config["PREFETCH_FACTOR"])
@@ -52,7 +52,7 @@ def main(run_dir: str):
         number_of_gpus = torch.cuda.device_count()
         print(f"Number of GPUs detected: {number_of_gpus}")
         equipment_info_path = os.path.join(run_path, 'stats', 'equipment_info.ini')
-        save_file_as_ini(equipment_info_path, {'NUM_GPUS': [str(number_of_gpus)]})
+        save_file_as_ini({'NUM_GPUS': [str(number_of_gpus)]}, equipment_info_path)
         print("Everything set up")
     trainer.train(config["EPOCHS"])
 
@@ -61,7 +61,7 @@ def main(run_dir: str):
     global_test_loss, global_ame = trainer.test()
     
     test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
-    save_file_as_ini(test_loss_dir, {'TEST_LOSS': [str(global_test_loss)], 'TEST_AME': [str(global_ame)]})
+    save_file_as_ini({'TEST_LOSS': [str(global_test_loss)], 'TEST_AME': [str(global_ame)]}, test_loss_dir)
     print(f"Test Loss: {global_test_loss:.6f}, Test AME: {global_ame:.6f}")
     print("Test results saved.")
 
@@ -69,9 +69,9 @@ def main(run_dir: str):
     total_time = t1_main - t0_main
     print(f"Total time taken (including training and testing): {total_time/60:.2f} minutes")
     total_time_path = os.path.join(run_path, 'stats', 'total_time.ini')
-    save_file_as_ini(total_time_path, {'TOTAL_TIME_MINUTES': [str(total_time/60)], 
+    save_file_as_ini({'TOTAL_TIME_MINUTES': [str(total_time/60)], 
                                        'TOTAL_TIME_SECONDS': [str(total_time)], 
-                                       'TOTAL_TIME_HRS': [str(total_time/3600)]})
+                                       'TOTAL_TIME_HRS': [str(total_time/3600)]}, total_time_path)
 
 
     print("Cleaning up...")

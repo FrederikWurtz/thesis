@@ -75,7 +75,7 @@ class Trainer:
         self.train_timings = snapshot.get("TRAIN_TIMINGS", [])
         self.val_timings = snapshot.get("VAL_TIMINGS", [])
         if is_main():
-            print(f"Resuming training from snapshot at Epoch {self.epochs_run}")
+            print(f"Resuming model from snapshot at Epoch {self.epochs_run}")
 
     def _run_epoch(self, epoch):
         t0 = time.time()
@@ -254,7 +254,7 @@ class Trainer:
         return global_val_loss
 
     @torch.no_grad()
-    def test(self, epoch):
+    def test(self):
         """Run testing and return average loss and AME"""
         if self.test_data is None:
             if is_main():
@@ -262,8 +262,9 @@ class Trainer:
             return None, None
             
         t0 = time.time()
+        epoch = self.epochs_run
         if is_main():
-            print(f"Running testing for epoch {epoch}")
+            print(f"Evaluating on test dataset, after epoch {epoch}")
         
         self.model.eval()  # Set to evaluation mode
         test_loss = 0.0

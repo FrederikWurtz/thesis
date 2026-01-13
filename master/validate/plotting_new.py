@@ -129,7 +129,10 @@ def plot_comprehensive_pt(
         val_timings_data = np.genfromtxt(val_timings_path, delimiter=',', skip_header=1)
         avg_train_time_per_epoch = np.mean(train_timings_data[:, 1])
         avg_val_time_per_epoch = np.mean(val_timings_data[:, 1])
-        test_results = read_file_from_ini(test_results_path, ftype=dict)
+        if os.path.exists(test_results_path):
+            test_results = read_file_from_ini(test_results_path, ftype=dict)
+        else:
+            raise FileNotFoundError(f"Found training snapshot, but no test results file found at '{test_results_path}'. Please run testing first.")
         equipment_info = read_file_from_ini(equipment_info_path, ftype=dict)
         n_gpus = int(equipment_info.get('NUM_GPUS', ['1'])[0])
 
@@ -179,6 +182,7 @@ def plot_comprehensive_pt(
     elif variant == 'random':
         # Randomly sample n_test_sets and sort them by index
         selected_indices = sorted(random.sample(available_indices, min(n_test_sets, len(test_dataset))))
+        print("Selected test set indices:", selected_indices)
     else:
         raise ValueError(f"Unknown variant: {variant}. Use 'first' or 'random'.")
     
@@ -241,7 +245,7 @@ def plot_comprehensive_pt(
     ax_loss.set_xlabel('Epoch', fontsize=12)
     ax_loss.set_ylabel('Loss', fontsize=12)
     ax_loss.set_title('Training and Validation Loss', fontsize=14, pad=14)
-    ax_loss.legend(fontsize=10, loc='best')
+    ax_loss.legend(fontsize=10, loc='lower left')
     ax_loss.grid(True, alpha=0.3)
     
     # Set x-axis to show only integer ticks
@@ -251,7 +255,10 @@ def plot_comprehensive_pt(
     # Position for 2 text boxes in a row on the right (remaining 50%)
     info_width = 0.215  # Wider boxes with minimal gap
     info_height = 0.1   # Height of each text box (taller to fit 10 lines)
-    info_gap_h = -0.09  # Minimal/overlapping gap between boxes
+    if use_latex:
+        info_gap_h = -0.08  # Minimal/overlapping gap between boxes
+    else:
+        info_gap_h = 0.0  # Minimal/overlapping gap between boxes
     info_start_x = loss_start_x + loss_width + 0.01  # Start after loss plot with small gap
     info_start_y = 0.88  # Starting y position (top row)
     
@@ -262,9 +269,9 @@ def plot_comprehensive_pt(
 
     infobox_1_text = ("Unet DL Network \n"
                         f"Epochs trained: {int(checkpoint.get('EPOCHS_RUN', 'N/A'))}\n"
-                        f"Test Loss: {float(test_results.get('TEST_LOSS', 'N/A')):.3f}\n"
-                        f"Test AME: {float(test_results.get('TEST_AME', 'N/A')):.3f}\n"
-                        f"LR: {float(config['LR']):.3e}"
+                        f"Test Loss: {float(test_results['TEST_LOSS']):.3f}\n"
+                        f"Test AME: {float(test_results['TEST_AME']):.3f}\n"
+                        f"LR: {float(config['LR']):.2e}"
 
                         )
     
@@ -286,8 +293,8 @@ def plot_comprehensive_pt(
 
     infobox_2_text = (  
                         f"Total Epochs: {checkpoint.get('EPOCHS_RUN', 'N/A')}\n"
-                        f"Avg. Train Time Per Epoch: {avg_train_time_per_epoch:.2f} hrs\n"
-                        f"Avg. Val Time Per Epoch: {avg_val_time_per_epoch:.2f} s\n"
+                        f"Train Time Avg.: {avg_train_time_per_epoch:.2f} s/epoch\n"
+                        f"Val Time Avg.: {avg_val_time_per_epoch:.2f} s/epoch\n"
                         f"Number GPUs: {n_gpus}\n")
 
     # Info box 2: 
@@ -745,7 +752,11 @@ if __name__ == "__main__":
     args = argparse.ArgumentParser(description="Plot comprehensive test set predictions for a trained UNet model.")
     args.add_argument('--run_dir', type=str, required=True,
                       help='Directory of the trained model run containing stats and checkpoints.')
+    args.add_argument('--variant', type=str, default='first',
+                      help="Variant for selecting test sets: 'first' or 'random'.")
     args = args.parse_args()
+
+
 
     print("Plotting test set predictions...")
 
@@ -754,7 +765,7 @@ if __name__ == "__main__":
         print("No training snapshot found, plotting data only...")
         plot_data_pt(run_dir=os.path.join("runs", args.run_dir),
                         n_sets=5,
-                        variant='first',  # 'first' or 'random'
+                        variant=args.variant,  # 'first' or 'random'
                         same_scale=False,  # False, 'row', or 'all'
                         save_fig=True,
                         output_name='data_summary.pdf',
@@ -763,7 +774,7 @@ if __name__ == "__main__":
         print("Training snapshot found, plotting predictions...")
         plot_comprehensive_pt(run_dir=args.run_dir,
                             n_test_sets=5,
-                            variant='first',  # 'first' or 'random'
+                            variant=args.variant,  # 'first' or 'random'
                             same_scale=False,  # False, 'row', or 'all'
                             figsize=(15, 10),
                             save_fig=True,
