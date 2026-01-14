@@ -95,7 +95,7 @@ def calculate_total_loss(outputs, targets, target_reflectance_maps, meta, hapke_
         total_loss: Weighted sum of all loss components
     """
     # 1. MSE Loss - basic elevation accuracy
-    loss_mse = F.mse_loss(outputs, targets)
+    loss_mse = F.mse_loss(outputs, targets, reduction='mean') # MSE loss, returns mean by default, but made explicit here
     
     # 2. Gradient Loss - captures steep slopes and terrain features
     def compute_gradients(tensor):
@@ -111,12 +111,12 @@ def calculate_total_loss(outputs, targets, target_reflectance_maps, meta, hapke_
     
     out_grad_mag = compute_gradients(outputs)
     tgt_grad_mag = compute_gradients(targets)
-    loss_grad = F.mse_loss(out_grad_mag, tgt_grad_mag)
+    loss_grad = F.mse_loss(out_grad_mag, tgt_grad_mag, reduction='mean') # Gradient loss, returns mean by default
     
     # 3. Reflectance Map Loss - physics-based constraint
     # Compute reflectance maps from predicted DEM (WITH GRADIENTS for backprop)
     predicted_reflectance_maps = compute_reflectance_map_from_dem(outputs, meta, device, camera_params, hapke_params)
-    loss_refl = F.mse_loss(predicted_reflectance_maps, target_reflectance_maps)
+    loss_refl = F.mse_loss(predicted_reflectance_maps, target_reflectance_maps, reduction='mean') # Reflectance map loss, returns mean by default
     
     # Combine losses
     total_loss = w_mse * loss_mse + w_grad * loss_grad + w_refl * loss_refl

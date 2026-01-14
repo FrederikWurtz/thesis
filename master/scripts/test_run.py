@@ -52,14 +52,16 @@ def main(run_dir: str):
     
     trainer = Trainer(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader, test_loader)
 
-    print("Testing on test dataset...")
+    if is_main():
+        print("Starting testing...")
     global_test_loss, global_ame = trainer.test()
     
-    test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
-    save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_AME': float(global_ame)}, test_loss_dir)
-    print(f"Test Loss: {global_test_loss:.6f}, Test AME: {global_ame:.6f}")
-    print("Test results saved.")
-    print("Cleaning up...")
+    if is_main():
+        test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
+        save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_AME': float(global_ame)}, test_loss_dir)
+        print(f"Test Loss: {global_test_loss:.6f}, Test AME: {global_ame:.6f}")
+        print("Test results saved.")
+        print("Cleaning up...")
 
     destroy_process_group()
 

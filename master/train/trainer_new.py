@@ -55,89 +55,20 @@ class Trainer:
         self.val_loss_history = []    # Track validation losses
         self.train_timings = []
         self.val_timings = []
-        self.snapshot_path = snapshot_path
-        if os.path.exists(snapshot_path):
-            if is_main():
-                print("Loading snapshot")
-            self._load_snapshot(snapshot_path)
         self.config = config
         self.train_mean = train_mean
         self.train_std = train_std
-        self.model = DDP(self.model, device_ids=[self.gpu_id])
-
-    def _load_snapshot(self, snapshot_path):
-        loc = f"cuda:{self.gpu_id}"
-        snapshot = torch.load(snapshot_path, map_location=loc)
-        self.model.load_state_dict(snapshot["MODEL_STATE"])
-        self.epochs_run = snapshot["EPOCHS_RUN"]
-        self.train_loss_history = snapshot.get("LOSS_HISTORY", [])
-        self.val_loss_history = snapshot.get("VAL_LOSS_HISTORY", [])
-        self.train_timings = snapshot.get("TRAIN_TIMINGS", [])
-        self.val_timings = snapshot.get("VAL_TIMINGS", [])
-        if is_main():
-            print(f"Resuming model from snapshot at Epoch {self.epochs_run}")
-
-    def _run_epoch(self, epoch):
-        t0 = time.time()
-        if is_main():
-            print("Running epoch {}".format(epoch))
-
-        epoch_loss = 0.0
-        total_samples = 0
-
-        self.train_data.sampler.set_epoch(epoch)
-        for images, reflectance_maps, targets, metas in self.train_data:
-            images = images.to(self.gpu_id)
-            metas = metas.to(self.gpu_id)
-            reflectance_maps = reflectance_maps.to(self.gpu_id)
-            images = normalize_inputs(images, self.train_mean, self.train_std)
-
-            source = images, metas, reflectance_maps
-            targets = targets.to(self.gpu_id)
-
-            batch_size = images.size(0)  # Get actual batch size
-            batch_loss = self._run_batch(source, targets)
-
-            # Weight by batch size
-            epoch_loss += batch_loss * batch_size
-            total_samples += batch_size
-
-        
-        # Weighted average loss
-        avg_loss = epoch_loss / total_samples
-        
-        # Gather losses and sample counts from all GPUs
-        avg_loss_tensor = torch.tensor([avg_loss], device=self.gpu_id)
-        total_samples_tensor = torch.tensor([total_samples], device=self.gpu_id)
-        
-        torch.distributed.all_reduce(avg_loss_tensor, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(total_samples_tensor, op=torch.distributed.ReduceOp.SUM)
-        
-        # Compute global weighted average
-        global_avg_loss = avg_loss_tensor.item() / torch.distributed.get_world_size()
-    
-        # Store loss on main process
-        if is_main():
-            self.train_loss_history.append(global_avg_loss)
-            total_time = time.time() - t0
-            self.train_timings.append(total_time)
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {global_avg_loss:.6f} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s")
-
-    def _run_batch(self, source, targets):
-        self.optimizer.zero_grad()
-        images, metas, reflectance_maps = source
-        device = images.device
-        outputs = self.model(images, metas, target_size=targets.shape[-2:])
-        loss = calculate_total_loss(outputs, targets, reflectance_maps, metas, device=device,
-                                        camera_params=self.config["CAMERA_PARAMS"], hapke_params=self.config["HAPKE_KWARGS"],
-                                        w_grad=self.config["W_GRAD"], w_refl=self.config["W_REFL"], w_mse=self.config["W_MSE"])
-        loss.backward()
-        self.optimizer.step()
-        return loss.item()  # Return loss value
+        self.model = DDP(self.model, device_ids=[self.gpu_id]) # First wrap model in DDP
+        self.snapshot_path = snapshot_path # Path to save/load snapshots
+        if os.path.exists(snapshot_path): 
+            if is_main():
+                print("Loading snapshot")
+            self._load_snapshot(snapshot_path) # Then, after DDP wrapping, load snapshot if it exists
 
     def _save_snapshot(self, epoch):
         snapshot = {
             "MODEL_STATE": self.model.module.state_dict(),
+            "OPTIMIZER_STATE": self.optimizer.state_dict(),  # Save optimizer state
             "EPOCHS_RUN": epoch,
             "TRAIN_LOSS_HISTORY": self.train_loss_history,  # Save loss history
             "VAL_LOSS_HISTORY": self.val_loss_history,  # Save validation loss history
@@ -151,29 +82,117 @@ class Trainer:
         train_loss_file = self.snapshot_path.replace('snapshot.pt', 'train_losses.csv')
         with open(train_loss_file, 'w') as f:
             f.write("epoch,loss\n")
-            for i, loss in enumerate(self.train_loss_history, start=1):
+            for i, loss in enumerate(self.train_loss_history, start=0):
                 f.write(f"{i},{loss}\n")
         # Also save validation loss history
         val_loss_file = self.snapshot_path.replace('snapshot.pt', 'val_losses.csv')
         with open(val_loss_file, 'w') as f:
             f.write("epoch,loss\n")
-            for i, loss in enumerate(self.val_loss_history):
-                actual_epoch = (i + 1) * self.save_every
+            for i, loss in enumerate(self.val_loss_history, start=0):
+                actual_epoch = i * self.save_every
                 f.write(f"{actual_epoch},{loss}\n")
         # Also save timings
         train_timing_file = self.snapshot_path.replace('snapshot.pt', 'train_timings.csv')
         with open(train_timing_file, 'w') as f:
             f.write("epoch,time_seconds\n")
-            for i, timing in enumerate(self.train_timings, start=1):
+            for i, timing in enumerate(self.train_timings, start=0):
                 f.write(f"{i},{timing}\n")
         val_timing_file = self.snapshot_path.replace('snapshot.pt', 'val_timings.csv')
         with open(val_timing_file, 'w') as f:
             f.write("epoch,time_seconds\n")
-            for i, timing in enumerate(self.val_timings):
-                actual_epoch = (i + 1) * self.save_every
+            for i, timing in enumerate(self.val_timings, start=0):
+                actual_epoch = i * self.save_every
                 f.write(f"{actual_epoch},{timing}\n")
 
                 
+    def _load_snapshot(self, snapshot_path):
+        loc = f"cuda:{self.gpu_id}"
+        snapshot = torch.load(snapshot_path, map_location=loc)
+
+        self.model.module.load_state_dict(snapshot["MODEL_STATE"])
+
+        # Load optimizer state and ensure all tensors are on correct device
+        optimizer_state = snapshot["OPTIMIZER_STATE"]
+        
+        # Move optimizer state tensors to correct device
+        for state in optimizer_state['state'].values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(self.gpu_id)
+
+        self.optimizer.load_state_dict(optimizer_state)  # Load optimizer state
+
+        self.epochs_run = snapshot["EPOCHS_RUN"] + 1  # Resume from NEXT epoch
+        self.train_loss_history = snapshot["TRAIN_LOSS_HISTORY"]
+        self.val_loss_history = snapshot["VAL_LOSS_HISTORY"]
+        self.train_timings = snapshot["TRAIN_TIMINGS"]
+        self.val_timings = snapshot["VAL_TIMINGS"]
+        if is_main():
+            print(f"Resuming model from snapshot at Epoch {self.epochs_run}")
+        self.model.train()  # Set back to training mode
+
+    def _run_epoch(self, epoch):
+        t0 = time.time()
+        if is_main():
+            print("Running epoch {}".format(epoch))
+
+        epoch_loss = 0.0
+        total_samples = 0
+
+        # Set epoch for distributed sampler and dataset randomness, for reproducibility
+        self.train_data.sampler.set_epoch(epoch)
+
+            # If your dataset has on-the-fly generation, set its random seed based on epoch
+        if hasattr(self.train_data.dataset, 'set_epoch'):
+            self.train_data.dataset.set_epoch(epoch)
+
+        for images, reflectance_maps, targets, metas in self.train_data:
+            images = images.to(self.gpu_id)
+            metas = metas.to(self.gpu_id)
+            reflectance_maps = reflectance_maps.to(self.gpu_id)
+            images = normalize_inputs(images, self.train_mean, self.train_std)
+
+            source = images, metas, reflectance_maps
+            targets = targets.to(self.gpu_id)
+
+            batch_size = images.size(0)  # Get actual batch size
+            mean_batch_loss = self._run_batch(source, targets) # Returns mean loss over the batch
+
+            # Weight by batch size
+            epoch_loss += mean_batch_loss * batch_size
+            total_samples += batch_size
+
+        
+        # Gather total loss sums (not averages) from all GPUs
+        epoch_loss_tensor = torch.tensor([epoch_loss], device=self.gpu_id)
+        total_samples_tensor = torch.tensor([total_samples], device=self.gpu_id)
+        
+        torch.distributed.all_reduce(epoch_loss_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of losses across GPUs
+        torch.distributed.all_reduce(total_samples_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of samples across GPUs
+        
+        # Compute true weighted average: total_loss / total_samples
+        global_avg_loss = epoch_loss_tensor.item() / total_samples_tensor.item()
+    
+        # Store loss on main process
+        if is_main():
+            self.train_loss_history.append(global_avg_loss)
+            total_time = time.time() - t0
+            self.train_timings.append(total_time)
+            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {global_avg_loss:.6f} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s")
+
+    def _run_batch(self, source, targets):
+        self.optimizer.zero_grad()
+        images, metas, reflectance_maps = source
+        device = images.device
+        outputs = self.model(images, metas, target_size=targets.shape[-2:])
+        # Calculate loss, which is returned as a mean over the batch
+        loss = calculate_total_loss(outputs, targets, reflectance_maps, metas, device=device,
+                                        camera_params=self.config["CAMERA_PARAMS"], hapke_params=self.config["HAPKE_KWARGS"],
+                                        w_grad=self.config["W_GRAD"], w_refl=self.config["W_REFL"], w_mse=self.config["W_MSE"])
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()  # Return loss value
+
     def train(self, max_epochs: int):
         for epoch in range(self.epochs_run, max_epochs):
             self._run_epoch(epoch)
@@ -222,18 +241,13 @@ class Trainer:
             val_loss += loss.item() * batch_size
             total_samples += batch_size
         
-        # Check if this GPU has no validation samples
-        if total_samples == 0:
-            avg_val_loss = 0.0
-        else:
-            avg_val_loss = val_loss / total_samples
         
         # Gather losses and sample counts from all GPUs
-        avg_val_loss_tensor = torch.tensor([avg_val_loss], device=self.gpu_id)
+        val_loss_tensor = torch.tensor([val_loss], device=self.gpu_id)
         total_samples_tensor = torch.tensor([total_samples], device=self.gpu_id)
         
-        torch.distributed.all_reduce(avg_val_loss_tensor, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(total_samples_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(val_loss_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of validation losses across GPUs
+        torch.distributed.all_reduce(total_samples_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of validation samples across GPUs
         
         # Check if no GPU has validation samples
         global_total_samples = total_samples_tensor.item()
@@ -241,17 +255,19 @@ class Trainer:
             if is_main():
                 print(f"Warning: No validation samples found. Skipping validation.")
             return None
-        
-        # Compute global weighted average
-        global_val_loss = avg_val_loss_tensor.item() / torch.distributed.get_world_size()
+
+        # Compute the true weighted average: total_val_loss / total_samples
+        global_avg_val_loss = val_loss_tensor.item() / total_samples_tensor.item()
+
         
         if is_main():
-            self.val_loss_history.append(global_val_loss)
+            self.val_loss_history.append(global_avg_val_loss)
             val_time = time.time() - t0
             self.val_timings.append(val_time)
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Val Loss: {global_val_loss:.6f} | Samples: {global_total_samples} | Time: {val_time:.2f}s")
+            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Val Loss: {global_avg_val_loss:.6f} | Samples: {global_total_samples} | Time: {val_time:.2f}s")
         
-        return global_val_loss
+        self.model.train()  # Set back to training mode
+        return global_avg_val_loss
 
     @torch.no_grad()
     def test(self):
@@ -299,21 +315,14 @@ class Trainer:
             total_ame += ame.item() * batch_size
             total_samples += batch_size
         
-        # Check if this GPU has no test samples
-        if total_samples == 0:
-            avg_test_loss = 0.0
-            avg_ame = 0.0
-        else:
-            avg_test_loss = test_loss / total_samples
-            avg_ame = total_ame / total_samples
         
         # Gather losses, AMEs, and sample counts from all GPUs
-        avg_test_loss_tensor = torch.tensor([avg_test_loss], device=self.gpu_id)
-        avg_ame_tensor = torch.tensor([avg_ame], device=self.gpu_id)
+        test_loss_tensor = torch.tensor([test_loss], device=self.gpu_id)
+        ame_tensor = torch.tensor([total_ame], device=self.gpu_id)
         total_samples_tensor = torch.tensor([total_samples], device=self.gpu_id)
         
-        torch.distributed.all_reduce(avg_test_loss_tensor, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(avg_ame_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(test_loss_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(ame_tensor, op=torch.distributed.ReduceOp.SUM)
         torch.distributed.all_reduce(total_samples_tensor, op=torch.distributed.ReduceOp.SUM)
         
         # Check if no GPU has test samples
@@ -324,8 +333,8 @@ class Trainer:
             return None, None
         
         # Compute global weighted averages
-        global_test_loss = avg_test_loss_tensor.item() / torch.distributed.get_world_size()
-        global_ame = avg_ame_tensor.item() / torch.distributed.get_world_size()
+        global_test_loss = test_loss_tensor.item() / total_samples_tensor.item()
+        global_ame = ame_tensor.item() / total_samples_tensor.item()
         
         if is_main():
             test_time = time.time() - t0

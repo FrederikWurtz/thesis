@@ -48,6 +48,7 @@ def main(run_dir: str):
                                     num_workers=config["NUM_WORKERS_DATALOADER"], 
                                     prefetch_factor=config["PREFETCH_FACTOR"])
     trainer = Trainer(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader)
+    
     if is_main():
         number_of_gpus = torch.cuda.device_count()
         print(f"Number of GPUs detected: {number_of_gpus}")

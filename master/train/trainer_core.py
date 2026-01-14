@@ -15,6 +15,7 @@ from tqdm import tqdm
 import tempfile
 import os
 
+from master.lro_data_sim.lro_generator import generate_and_return_lro_data
 from master.data_sim.generator import generate_and_return_data_CPU
 from master.models.losses import calculate_total_loss
 from master.train.train_utils import normalize_inputs
@@ -127,23 +128,43 @@ class FluidDEMDataset(Dataset):
     def __init__(self, config=None):
         # NOTE: store simple kwargs/dicts only so the Dataset is picklable by DataLoader workers
         self.config = config
+        self.epoch = 0
+        self.base_seed = config["BASE_SEED"] if "BASE_SEED" in config else 42
+
+    def set_epoch(self, epoch):
+        """Set epoch for deterministic data generation."""
+        self.epoch = epoch
 
     def __len__(self):
         return self.config["FLUID_TRAIN_DEMS"]
 
     def __getitem__(self, idx):
-        images, reflectance_maps, dem_np, metas = generate_and_return_data_CPU(config=self.config)
+        # Set seed for reproducibility
+        epoch_seed = self.base_seed + self.epoch * len(self) + idx
+        torch.manual_seed(epoch_seed)
+        np.random.seed(epoch_seed % (2**32 - 1))
 
-        images_np = np.stack(images, axis=0)  # (5, H_img, W_img)
-        refl_np = np.stack(reflectance_maps, axis=0)  # (5, H_dem, W_dem)
-        meta_np = np.array(metas, dtype=np.float32)  # (5,5)
+        if self.config["USE_LRO_DEMS"]:
+            images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=self.config, device='cpu')
 
-        target_tensor = torch.from_numpy(dem_np).unsqueeze(0)
-        images_tensor = torch.from_numpy(images_np)
-        reflectance_maps_tensor = torch.from_numpy(refl_np)
-        meta_tensor = torch.from_numpy(meta_np)
+            if not torch.is_tensor(dem_tensor):
+                dem_tensor = torch.from_numpy(dem_tensor)
+   
+            return torch.stack(images), torch.stack(reflectance_maps), dem_tensor.unsqueeze(0), torch.tensor(metas, dtype=torch.float32)
 
-        return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
+        else:
+            images, reflectance_maps, dem_np, metas = generate_and_return_data_CPU(config=self.config)
+
+            images_np = np.stack(images, axis=0)  # (5, H_img, W_img)
+            refl_np = np.stack(reflectance_maps, axis=0)  # (5, H_dem, W_dem)
+            meta_np = np.array(metas, dtype=np.float32)  # (5,5)
+
+            target_tensor = torch.from_numpy(dem_np).unsqueeze(0)
+            images_tensor = torch.from_numpy(images_np)
+            reflectance_maps_tensor = torch.from_numpy(refl_np)
+            meta_tensor = torch.from_numpy(meta_np)
+
+            return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
 
 
 def train_epoch(model, train_loader, optimizer, scaler, device, train_mean, train_std, current_epoch=None, total_epochs=None, non_blocking=None,

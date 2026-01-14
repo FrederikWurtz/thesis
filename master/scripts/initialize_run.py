@@ -10,6 +10,8 @@ import os
 import shutil
 import argparse
 import time
+import numpy as np
+import torch
 
 
 
@@ -134,6 +136,10 @@ def main(argv=None):
     if args.new_run:
         if not args.skip_data_gen: # unless user requests to skip data generation
             print("\n=== Generating New Dataset ===")
+            # Set seed for reproducibility
+            base_seed = config["BASE_SEED"] if "BASE_SEED" in config else 42
+            torch.manual_seed(base_seed - 1) # -1 to differ from training seed
+            np.random.seed((base_seed - 1) % (2**32 - 1)) # -1 to differ from training seed
             # create validation files
             generate_and_save_data_pooled_multi_gpu(config, images_dir=val_path, n_dems=config["FLUID_VAL_DEMS"])
             # also calculate and save mean reflectance map over validation set
@@ -146,6 +152,9 @@ def main(argv=None):
             print(f"Std: {round_list(train_std.tolist(), 10)}")
 
             # create test files
+            # also set different seed for test set generation
+            torch.manual_seed(base_seed - 10) # -10 to differ from training seed
+            np.random.seed((base_seed - 10) % (2**32 - 1)) # -10 to differ from training seed
             generate_and_save_data_pooled_multi_gpu(config, images_dir=test_path, n_dems=config["FLUID_TEST_DEMS"])
             print("Dataset generation complete.\n")
 

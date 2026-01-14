@@ -8,11 +8,14 @@ import numpy as np
 import subprocess
 import shutil
 
+from torch.utils.data import Dataset, DataLoader
+
 from master.models.unet import UNet
-from master.train.trainer_core import DEMDataset
+from master.train.trainer_core import DEMDataset, FluidDEMDataset
 from master.train.train_utils import normalize_inputs
 from master.train.checkpoints import load_checkpoint, read_file_from_ini
 from master.configs.config_utils import load_config_file
+from master.train.trainer_new import load_train_objs, prepare_dataloader
 import glob
 
 
@@ -100,7 +103,7 @@ def plot_comprehensive_pt(
     run_dir=None,
     n_test_sets=5, figsize=(24, 18), return_fig=False, 
     save_fig=True, output_name='comprehensive_validation.pdf',
-    same_scale=False, variant='random'
+    same_scale=False, variant='random', use_train_set = False
 ):
 
     # Load config to find paths
@@ -149,17 +152,36 @@ def plot_comprehensive_pt(
     # timing_info = read_file_from_ini(timing_info, ftype=dict)
     # lr_changes = read_file_from_ini(lr_changes_path, ftype=dict)
     test_dems_dir = os.path.join(sup_dir, run_dir, 'test')
-    test_files = None
-    if os.path.isdir(test_dems_dir):
-        # Look for .pt files in the test_dems folder
-        candidate_files = sorted(glob.glob(os.path.join(test_dems_dir, '*.pt')))
-        if len(candidate_files) > 0:
-            test_files = candidate_files
-            print(f"Using {len(test_files)} test files from: {test_dems_dir}")
+    print(f"Use train set: {use_train_set}")
+    if not use_train_set:
+        test_files = None
+        if os.path.isdir(test_dems_dir):
+            # Look for .pt files in the test_dems folder
+            candidate_files = sorted(glob.glob(os.path.join(test_dems_dir, '*.pt')))
+            if len(candidate_files) > 0:
+                test_files = candidate_files
+                print(f"Using {len(test_files)} test files from: {test_dems_dir}")
+            else:
+                print(f"Found '{test_dems_dir}' but no .pt files were present. Falling back to history['test_files'].")
         else:
-            print(f"Found '{test_dems_dir}' but no .pt files were present. Falling back to history['test_files'].")
-    else:
-        raise FileNotFoundError(f"No test directory found at '{test_dems_dir}'")
+            raise FileNotFoundError(f"No test directory found at '{test_dems_dir}'")
+
+        test_dataset = DEMDataset(test_files)
+    
+    if use_train_set:
+        print("Using training set for plotting instead of test set.")
+        run_path = os.path.join(sup_dir, run_dir)
+
+        train_set = FluidDEMDataset(config)
+        train_loader = DataLoader(
+            train_set,
+            batch_size=config["BATCH_SIZE"],
+            shuffle=False,
+            num_workers=config["NUM_WORKERS_DATALOADER"],
+            pin_memory=True,
+            prefetch_factor=config["PREFETCH_FACTOR"]
+        )
+        test_dataset = train_set
 
     model = UNet(in_channels=config["IMAGES_PER_DEM"], out_channels=1)
     model.load_state_dict(checkpoint['MODEL_STATE'])
@@ -167,8 +189,6 @@ def plot_comprehensive_pt(
 
     train_mean = torch.tensor(input_stats['MEAN'], dtype=torch.float32)
     train_std = torch.tensor(input_stats['STD'], dtype=torch.float32)
-
-    test_dataset = DEMDataset(test_files)
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
     model.to(device)
     
@@ -583,7 +603,7 @@ def plot_data(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
 
 def plot_data_pt(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
                    fig_path='data_grid.pdf', variant='random', 
-                   same_scale=False, output_name='data_grid.pdf'):
+                   same_scale=False, output_name='data_grid.pdf', use_train_set=False):
     """
     Plot DEMs and images from .pt files (PyTorch format).
     Similar to plot_data but works with .pt files instead of .npz files.
@@ -595,26 +615,52 @@ def plot_data_pt(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
 
     test_dems_dir = os.path.join(run_dir, 'test')
     test_files = None
-    if os.path.isdir(test_dems_dir):
-        # Look for .pt files in the test_dems folder
-        candidate_files = sorted(glob.glob(os.path.join(test_dems_dir, '*.pt')))
-        if len(candidate_files) > 0:
-            test_files = candidate_files
-            print(f"Using {len(test_files)} test files from: {test_dems_dir}")
+    test_dems_dir = os.path.join(sup_dir, run_dir, 'test')
+
+    print(f"Use train set: {use_train_set}")
+    if not use_train_set:
+        test_files = None
+        if os.path.isdir(test_dems_dir):
+            # Look for .pt files in the test_dems folder
+            candidate_files = sorted(glob.glob(os.path.join(test_dems_dir, '*.pt')))
+            if len(candidate_files) > 0:
+                test_files = candidate_files
+                print(f"Using {len(test_files)} test files from: {test_dems_dir}")
+            else:
+                print(f"Found '{test_dems_dir}' but no .pt files were present. Falling back to history['test_files'].")
         else:
-            raise ValueError(f"Found '{test_dems_dir}' but no .pt files were present.")
+            raise FileNotFoundError(f"No test directory found at '{test_dems_dir}'")
+
+        test_dataset = DEMDataset(test_files)
     
-    if len(test_files) < n_sets:
-        raise ValueError(f"Not enough .pt files in provided folder to plot {n_sets} sets. Found only {len(test_files)}.") 
+    if use_train_set:
+        print("Using training set for plotting instead of test set.")
+        run_path = os.path.join(sup_dir, run_dir)
+
+        train_set = FluidDEMDataset(config)
+        train_loader = DataLoader(
+            train_set,
+            batch_size=config["BATCH_SIZE"],
+            shuffle=False,
+            num_workers=config["NUM_WORKERS_DATALOADER"],
+            pin_memory=True,
+            prefetch_factor=config["PREFETCH_FACTOR"]
+        )
+        test_dataset = train_set
     
-    # Select files based on variant.
-    files = []
-    if variant in ('first'):
-        files = test_files[:n_sets]
-    elif variant in ('random'):
-        files = random.sample(test_files, n_sets)
+    # Select test sets based on variant
+    print(f"Selecting {n_test_sets} test sets using variant: {variant}")
+    available_indices = list(range(len(test_dataset)))
+    
+    if variant == 'first':
+        # Use the first n_test_sets from the test pool
+        selected_indices = list(range(min(n_test_sets, len(test_dataset))))
+    elif variant == 'random':
+        # Randomly sample n_test_sets and sort them by index
+        selected_indices = sorted(random.sample(available_indices, min(n_test_sets, len(test_dataset))))
+        print("Selected test set indices:", selected_indices)
     else:
-        raise ValueError(f"Unknown variant: {variant}")
+        raise ValueError(f"Unknown variant: {variant}. Use 'first' or 'random'.")
     
     # find dataset number from and use to sort files
     for i in range(len(files)):
@@ -754,6 +800,8 @@ if __name__ == "__main__":
                       help='Directory of the trained model run containing stats and checkpoints.')
     args.add_argument('--variant', type=str, default='first',
                       help="Variant for selecting test sets: 'first' or 'random'.")
+    args.add_argument('--use_train_set', action='store_true',
+                      help="Use the training set for plotting instead of the test set.")
     args = args.parse_args()
 
 
@@ -769,7 +817,8 @@ if __name__ == "__main__":
                         same_scale=False,  # False, 'row', or 'all'
                         save_fig=True,
                         output_name='data_summary.pdf',
-                        return_fig=False)
+                        return_fig=False,
+                        use_train_set = args.use_train_set)
     else:
         print("Training snapshot found, plotting predictions...")
         plot_comprehensive_pt(run_dir=args.run_dir,
@@ -779,4 +828,6 @@ if __name__ == "__main__":
                             figsize=(15, 10),
                             save_fig=True,
                             output_name='predictions_summary.pdf',
-                            return_fig=False)
+                            return_fig=False,
+                            use_train_set = args.use_train_set
+                            )
