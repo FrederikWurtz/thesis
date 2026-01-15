@@ -57,47 +57,47 @@ class DEMDatasetHDF5(Dataset):
         return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
 
 
-class SemifluidDEMDataset(Dataset):
-    def __init__(self, config=None, temporary_dir=None, reuse_limit=10):
-        self.config = config
-        self.reuse_limit = reuse_limit
-        self.cache = {}  # idx -> reuse_count
-        self.temp_dir = temporary_dir
+# class SemifluidDEMDataset(Dataset):
+#     def __init__(self, config=None, temporary_dir=None, reuse_limit=10):
+#         self.config = config
+#         self.reuse_limit = reuse_limit
+#         self.cache = {}  # idx -> reuse_count
+#         self.temp_dir = temporary_dir
 
-    def __len__(self):
-        return int(self.config["FLUID_TRAIN_DEMS"])
+#     def __len__(self):
+#         return int(self.config["FLUID_TRAIN_DEMS"])
 
-    def _generate_and_save(self, idx):
-        # Generer syntetisk data
-        images, reflectance_maps, dem_np, metas = generate_and_return_data(config=self.config)
-        images_np = np.stack(images, axis=0)
-        refl_np = np.stack(reflectance_maps, axis=0)
-        meta_np = np.array(metas, dtype=np.float32)
+#     def _generate_and_save(self, idx):
+#         # Generer syntetisk data
+#         images, reflectance_maps, dem_np, metas = generate_and_return_data(config=self.config)
+#         images_np = np.stack(images, axis=0)
+#         refl_np = np.stack(reflectance_maps, axis=0)
+#         meta_np = np.array(metas, dtype=np.float32)
 
-        # Gem til disk
-        path = os.path.join(self.temp_dir, f"dataset_{idx}.npz")
-        np.savez(path, images=images_np, refl=refl_np, dem=dem_np, meta=meta_np)
+#         # Gem til disk
+#         path = os.path.join(self.temp_dir, f"dataset_{idx}.npz")
+#         np.savez(path, images=images_np, refl=refl_np, dem=dem_np, meta=meta_np)
 
-    def _load_from_disk(self, idx):
-        path = os.path.join(self.temp_dir, f"dataset_{idx}.npz")
-        arr = np.load(path)
-        # Konverter til tensors
-        images_tensor = torch.from_numpy(arr["images"])
-        reflectance_maps_tensor = torch.from_numpy(arr["refl"])
-        target_tensor = torch.from_numpy(arr["dem"]).unsqueeze(0)
-        meta_tensor = torch.from_numpy(arr["meta"])
-        return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
+#     def _load_from_disk(self, idx):
+#         path = os.path.join(self.temp_dir, f"dataset_{idx}.npz")
+#         arr = np.load(path)
+#         # Konverter til tensors
+#         images_tensor = torch.from_numpy(arr["images"])
+#         reflectance_maps_tensor = torch.from_numpy(arr["refl"])
+#         target_tensor = torch.from_numpy(arr["dem"]).unsqueeze(0)
+#         meta_tensor = torch.from_numpy(arr["meta"])
+#         return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
 
-    def __getitem__(self, idx):
-        # Hvis vi har genereret før og reuse_count < limit → load fra disk
-        if idx in self.cache and self.cache[idx] < self.reuse_limit:
-            self.cache[idx] += 1
-            return self._load_from_disk(idx)
+#     def __getitem__(self, idx):
+#         # Hvis vi har genereret før og reuse_count < limit → load fra disk
+#         if idx in self.cache and self.cache[idx] < self.reuse_limit:
+#             self.cache[idx] += 1
+#             return self._load_from_disk(idx)
 
-        # Ellers generer nyt og nulstil tæller
-        self._generate_and_save(idx)
-        self.cache[idx] = 1
-        return self._load_from_disk(idx)
+#         # Ellers generer nyt og nulstil tæller
+#         self._generate_and_save(idx)
+#         self.cache[idx] = 1
+#         return self._load_from_disk(idx)
 
 
 class DEMDataset(Dataset):

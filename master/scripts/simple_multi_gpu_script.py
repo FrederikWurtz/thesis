@@ -1,5 +1,6 @@
+import json
 import os
-os.environ["OMP_NUM_THREADS"] = "2"
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -21,7 +22,7 @@ from master.configs.config_utils import load_config_file
 from master.models.unet import UNet
 torch.multiprocessing.set_start_method('spawn', force=True)
 
-def main(run_dir: str):
+def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     t0_main = time.time()
 
     ddp_setup()
@@ -33,6 +34,30 @@ def main(run_dir: str):
     
     config_path = os.path.join(run_path, 'stats', 'config.ini')
     config = load_config_file(config_path) # load default config
+
+    # Apply overrides if provided
+    if config_override_file and os.path.exists(config_override_file):
+        with open(config_override_file, 'r') as f:
+            overrides = json.load(f)
+        config.update(overrides)
+        if is_main():
+            print(f"Applied config overrides: {overrides}")
+
+    if new_run:
+        if is_main():
+            print("Starting a new run, resetting relevant parameters...")
+            # Remove all files in checkpoint folder
+            checkpoint_dir = os.path.join(run_path, 'checkpoints')
+            if os.path.exists(checkpoint_dir):
+                for filename in os.listdir(checkpoint_dir):
+                    file_path = os.path.join(checkpoint_dir, filename)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                if is_main():
+                    print(f"Cleared checkpoint directory: {checkpoint_dir}")
+
+    torch.distributed.barrier()
+
     snapshot_path = os.path.join(run_path, 'checkpoints', 'snapshot.pt')
 
     mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
@@ -48,7 +73,7 @@ def main(run_dir: str):
                                     num_workers=config["NUM_WORKERS_DATALOADER"], 
                                     prefetch_factor=config["PREFETCH_FACTOR"])
     trainer = Trainer(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader)
-    
+
     if is_main():
         number_of_gpus = torch.cuda.device_count()
         print(f"Number of GPUs detected: {number_of_gpus}")
@@ -56,6 +81,13 @@ def main(run_dir: str):
         save_file_as_ini({'NUM_GPUS': [str(number_of_gpus)]}, equipment_info_path)
         print("Everything set up")
     trainer.train(config["EPOCHS"])
+
+    # Skip testing if profiling
+    if config.get("SKIP_TEST", False):
+        if is_main():
+            print("Skipping test phase (profiling mode)")
+        destroy_process_group()
+        return
 
     print("Training complete.")
     print("Testing on test dataset...")
@@ -81,8 +113,23 @@ def main(run_dir: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--run_dir', type=str, required=True)
+    # Support both old and new usage
+    parser = argparse.ArgumentParser(description="Multi-GPU training script")
+    parser.add_argument("run_dir", nargs="?", help="Run directory name")
+    parser.add_argument("--run_dir", dest="run_dir_flag", help="Run directory name (flag form)")
+    parser.add_argument("config_override_file", nargs="?", help="Config override file path")
+    parser.add_argument("--config_override_file", dest="config_override_file_flag", help="Config override file path (flag form)")
+    parser.add_argument("--new_run", action="store_true", help="Indicates a new run")
+    
     args = parser.parse_args()
-
-    main(args.run_dir)
+    
+    # Support both positional and flag-based arguments
+    run_dir = args.run_dir_flag or args.run_dir
+    config_override_file = args.config_override_file_flag or args.config_override_file
+    
+    if not run_dir:
+        print("Usage: torchrun ... simple_multi_gpu_script.py <run_dir> [config_override_file]")
+        print("   or: torchrun ... simple_multi_gpu_script.py --run_dir <run_dir> [--config_override_file <file>]")
+        sys.exit(1)
+    
+    main(run_dir, config_override_file, new_run=args.new_run)

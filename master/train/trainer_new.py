@@ -17,6 +17,9 @@ from master.configs.config_utils import load_config_file
 from master.models.losses import calculate_total_loss
 from master.models.unet import UNet
 
+from torch.amp import autocast, GradScaler
+import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 def is_main():
@@ -59,6 +62,10 @@ class Trainer:
         self.train_mean = train_mean
         self.train_std = train_std
         self.model = DDP(self.model, device_ids=[self.gpu_id]) # First wrap model in DDP
+        # self.scaler = GradScaler('cuda') if self.config["USE_AMP"] else None # Initialize GradScaler for AMP if enabled
+        self.use_amp = self.config["USE_AMP"]
+        self.dtype = torch.float16 if self.config.get("USE_AMP", False) else torch.float32
+        self.scaler = None # No scaler needed for BF16
         self.snapshot_path = snapshot_path # Path to save/load snapshots
         if os.path.exists(snapshot_path): 
             if is_main():
@@ -75,6 +82,11 @@ class Trainer:
             "TRAIN_TIMINGS": self.train_timings,
             "VAL_TIMINGS": self.val_timings,
         }
+
+        # Save scaler state if using AMP
+        if self.scaler is not None:
+            snapshot["SCALER_STATE"] = self.scaler.state_dict()
+
         torch.save(snapshot, self.snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
         
@@ -122,6 +134,12 @@ class Trainer:
 
         self.optimizer.load_state_dict(optimizer_state)  # Load optimizer state
 
+        # Load scaler state if it exists and we're using AMP
+        if self.scaler is not None and "SCALER_STATE" in snapshot:
+            self.scaler.load_state_dict(snapshot["SCALER_STATE"])
+            if is_main():
+                print("Loaded GradScaler state")
+
         self.epochs_run = snapshot["EPOCHS_RUN"] + 1  # Resume from NEXT epoch
         self.train_loss_history = snapshot["TRAIN_LOSS_HISTORY"]
         self.val_loss_history = snapshot["VAL_LOSS_HISTORY"]
@@ -139,6 +157,12 @@ class Trainer:
         epoch_loss = 0.0
         total_samples = 0
 
+        # Add detailed timing if profiling
+        use_profiler = self.config.get("USE_PROFILER", False)
+        if use_profiler and is_main():
+            data_load_time = 0.0
+            compute_time = 0.0
+
         # Set epoch for distributed sampler and dataset randomness, for reproducibility
         self.train_data.sampler.set_epoch(epoch)
 
@@ -146,7 +170,10 @@ class Trainer:
         if hasattr(self.train_data.dataset, 'set_epoch'):
             self.train_data.dataset.set_epoch(epoch)
 
-        for images, reflectance_maps, targets, metas in self.train_data:
+        for batch_idx, (images, reflectance_maps, targets, metas) in enumerate(self.train_data):
+            if use_profiler and is_main():
+                batch_start = time.time()
+            
             images = images.to(self.gpu_id)
             metas = metas.to(self.gpu_id)
             reflectance_maps = reflectance_maps.to(self.gpu_id)
@@ -155,12 +182,23 @@ class Trainer:
             source = images, metas, reflectance_maps
             targets = targets.to(self.gpu_id)
 
-            batch_size = images.size(0)  # Get actual batch size
-            mean_batch_loss = self._run_batch(source, targets) # Returns mean loss over the batch
+            if use_profiler and is_main():
+                data_load_time += time.time() - batch_start
+                compute_start = time.time()
 
-            # Weight by batch size
+            batch_size = images.size(0)
+            mean_batch_loss = self._run_batch(source, targets)
+            
+            if use_profiler and is_main():
+                compute_time += time.time() - compute_start
+
             epoch_loss += mean_batch_loss * batch_size
             total_samples += batch_size
+            
+            # Print batch-level timing for first epoch
+            if use_profiler and is_main() and epoch == 0 and batch_idx < 5:
+                print(f"  Batch {batch_idx}: Data load: {(time.time()-batch_start)*1000:.2f}ms | "
+                      f"Compute: {compute_time*1000:.2f}ms")
 
         
         # Gather total loss sums (not averages) from all GPUs
@@ -181,22 +219,48 @@ class Trainer:
             print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {global_avg_loss:.6f} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s")
 
     def _run_batch(self, source, targets):
+
         self.optimizer.zero_grad()
         images, metas, reflectance_maps = source
         device = images.device
-        outputs = self.model(images, metas, target_size=targets.shape[-2:])
         # Calculate loss, which is returned as a mean over the batch
-        loss = calculate_total_loss(outputs, targets, reflectance_maps, metas, device=device,
-                                        camera_params=self.config["CAMERA_PARAMS"], hapke_params=self.config["HAPKE_KWARGS"],
-                                        w_grad=self.config["W_GRAD"], w_refl=self.config["W_REFL"], w_mse=self.config["W_MSE"])
+        with autocast('cuda', enabled=self.use_amp, dtype=self.dtype):
+            outputs = self.model(images, metas, target_size=targets.shape[-2:])
+            loss = calculate_total_loss(outputs, targets, reflectance_maps, metas, device=device,
+                                            camera_params=self.config["CAMERA_PARAMS"], hapke_params=self.config["HAPKE_KWARGS"],
+                                            w_grad=self.config["W_GRAD"], w_refl=self.config["W_REFL"], w_mse=self.config["W_MSE"])
+    
+        # Simple backward - no scaler!
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config["GRAD_CLIP"])
         self.optimizer.step()
-        return loss.item()  # Return loss value
+
+        return loss.item() # Return mean loss over the batch
 
     def train(self, max_epochs: int):
+        # Enable profiling for first few batches
+        use_profiler = self.config.get("USE_PROFILER", False)
+        
+        if use_profiler and is_main():
+            prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    os.path.join(os.path.dirname(self.snapshot_path), '../profiler')
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True
+            )
+            prof.start()
+
+
         for epoch in range(self.epochs_run, max_epochs):
             self._run_epoch(epoch)
             
+            if use_profiler and is_main() and epoch == 0:
+                prof.step()
+
             # Validate on ALL GPUs at checkpoint intervals
             if epoch % self.save_every == 0:
                 self._validate(epoch)
@@ -204,6 +268,11 @@ class Trainer:
                 # But only GPU 0 saves the snapshot
                 if self.gpu_id == 0:
                     self._save_snapshot(epoch)
+
+        if use_profiler and is_main():
+            prof.stop()
+            print(f"Profiler trace saved to: {os.path.dirname(self.snapshot_path)}/../profiler")
+
 
     @torch.no_grad()
     def _validate(self, epoch):
@@ -225,18 +294,19 @@ class Trainer:
             reflectance_maps = reflectance_maps.to(self.gpu_id)
             targets = targets.to(self.gpu_id)
             images = normalize_inputs(images, self.train_mean, self.train_std)
-            
             batch_size = images.size(0)
-            outputs = self.model(images, metas, target_size=targets.shape[-2:])
-            loss = calculate_total_loss(
-                outputs, targets, reflectance_maps, metas, 
-                device=self.gpu_id,
-                camera_params=self.config["CAMERA_PARAMS"], 
-                hapke_params=self.config["HAPKE_KWARGS"],
-                w_grad=self.config["W_GRAD"], 
-                w_refl=self.config["W_REFL"], 
-                w_mse=self.config["W_MSE"]
-            )
+            
+            with autocast('cuda', enabled=self.use_amp, dtype=self.dtype):
+                outputs = self.model(images, metas, target_size=targets.shape[-2:])
+                loss = calculate_total_loss(
+                    outputs, targets, reflectance_maps, metas, 
+                    device=self.gpu_id,
+                    camera_params=self.config["CAMERA_PARAMS"], 
+                    hapke_params=self.config["HAPKE_KWARGS"],
+                    w_grad=self.config["W_GRAD"], 
+                    w_refl=self.config["W_REFL"], 
+                    w_mse=self.config["W_MSE"]
+                )
             
             val_loss += loss.item() * batch_size
             total_samples += batch_size
@@ -295,18 +365,19 @@ class Trainer:
             images = normalize_inputs(images, self.train_mean, self.train_std)
             
             batch_size = images.size(0)
-            outputs = self.model(images, metas, target_size=targets.shape[-2:])
-            
-            # Calculate loss
-            loss = calculate_total_loss(
-                outputs, targets, reflectance_maps, metas, 
-                device=self.gpu_id,
-                camera_params=self.config["CAMERA_PARAMS"], 
-                hapke_params=self.config["HAPKE_KWARGS"],
-                w_grad=self.config["W_GRAD"], 
-                w_refl=self.config["W_REFL"], 
-                w_mse=self.config["W_MSE"]
-            )
+
+            with autocast('cuda', enabled=self.use_amp, dtype=self.dtype):
+                outputs = self.model(images, metas, target_size=targets.shape[-2:])
+                # Calculate loss
+                loss = calculate_total_loss(
+                    outputs, targets, reflectance_maps, metas, 
+                    device=self.gpu_id,
+                    camera_params=self.config["CAMERA_PARAMS"], 
+                    hapke_params=self.config["HAPKE_KWARGS"],
+                    w_grad=self.config["W_GRAD"], 
+                    w_refl=self.config["W_REFL"], 
+                    w_mse=self.config["W_MSE"]
+                )
             
             # Calculate AME (Absolute Mean Error)
             ame = torch.abs(outputs - targets).mean()
