@@ -15,13 +15,15 @@ n_GPUs = torch.cuda.device_count()
 # Test configurations
 configs = [
     # (OMP_NUM_THREADS, BATCH_SIZE, NUM_WORKERS, PREFETCH_FACTOR)
-    (2, 64, 4, 4),    # baseline
-    (2, 64, 16, 4),   # 16 workers
-    (2, 64, 32, 4),   # 32 workers
-    (2, 64, 16, 16),  # 16 workers, 16 prefetch
-    (2, 64, 32, 16),  # 32 workers, 16 prefetch
-    (2, 64, 32, 32),  # 32 workers, 32 prefetch
-    (2, 64, 64, 32),  # 64 workers, 32 prefetch
+    (2, 64, 16, 16),   # baseline optimized
+    (4, 64, 16, 16),   # higher OMP
+    (8, 64, 16, 16),   # even higher OMP
+    (2, 128, 16, 16),  # larger batch
+    (4, 128, 16, 16),  # larger batch + higher OMP
+    (2, 128, 32, 16),  # larger batch + more workers
+    (4, 128, 32, 16),  # larger batch + more workers + higher OMP
+    (2, 256, 32, 16),  # even larger batch
+    (4, 256, 32, 16),  # even larger batch + higher OMP
 ]
 
 def test_config(omp_threads, batch_size, num_workers, prefetch):
@@ -131,4 +133,3 @@ if __name__ == "__main__":
         f.write(results_text)
     print(f"\nResults saved to: {results_file}")
 
-    

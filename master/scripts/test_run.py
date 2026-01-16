@@ -59,7 +59,7 @@ def main(run_dir: str):
     if is_main():
         test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
         save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_AME': float(global_ame)}, test_loss_dir)
-        print(f"Test Loss: {global_test_loss:.6f}, Test AME: {global_ame:.6f}")
+        print(f"Test Loss: {global_test_loss:.2e}, Test AME: {global_ame:.6f}")
         print("Test results saved.")
         print("Cleaning up...")
 

@@ -1,6 +1,9 @@
 import json
 import os
+# 🔥 Must be set BEFORE importing torch
+os.environ['TORCH_LOGS'] = '-all'  # Suppress all torch logging warnings
 import sys
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +20,10 @@ from torch.distributed import destroy_process_group
 from master.train.trainer_new import Trainer, ddp_setup, load_train_objs, prepare_dataloader, is_main
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 
+# 🔥 Suppress torch.compile() warnings - MUST BE BEFORE torch.multiprocessing.set_start_method
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._logging')
+warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.*')
 
 from master.configs.config_utils import load_config_file
 from master.models.unet import UNet
@@ -26,6 +33,8 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     t0_main = time.time()
 
     ddp_setup()
+
+    os.environ['OMP_NUM_THREADS'] = '2'  # Set number of OpenMP threads
     
     sup_dir = "./runs"
     run_path = os.path.join(sup_dir, run_dir)
@@ -56,7 +65,6 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
                 if is_main():
                     print(f"Cleared checkpoint directory: {checkpoint_dir}")
 
-    torch.distributed.barrier()
 
     snapshot_path = os.path.join(run_path, 'checkpoints', 'snapshot.pt')
 
@@ -72,6 +80,7 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     val_loader = prepare_dataloader(val_set, config["BATCH_SIZE"], 
                                     num_workers=config["NUM_WORKERS_DATALOADER"], 
                                     prefetch_factor=config["PREFETCH_FACTOR"])
+    
     trainer = Trainer(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader)
 
     if is_main():

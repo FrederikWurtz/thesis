@@ -1,3 +1,6 @@
+import warnings
+
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -21,14 +24,32 @@ from torch.amp import autocast, GradScaler
 import torch
 from torch.profiler import profile, record_function, ProfilerActivity
 
+# 🔥 Suppress torch.compile() warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._logging')
+warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.*')
+
+
 
 def is_main():
     return int(os.environ["LOCAL_RANK"]) == 0
 
 def ddp_setup():
     try:
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
+        # 🔥 Enable cuDNN autotuner for convolution optimization
+        torch.backends.cudnn.benchmark = True
+        
+        # Optional: Enable TF32 for Ampere GPUs (A100, RTX 3090, etc.)
+        if torch.cuda.get_device_capability()[0] >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        
+        # 🔥 Use TensorFloat32 for faster matmul on Ampere+ GPUs
+        torch.set_float32_matmul_precision('high')  # or 'medium' for even more speed
+        
     except KeyError:
         raise RuntimeError("LOCAL_RANK not found in environment variables. Please run this script using torch.distributed.launch or torchrun for multi-GPU training.")
 
@@ -62,10 +83,14 @@ class Trainer:
         self.train_mean = train_mean
         self.train_std = train_std
         self.model = DDP(self.model, device_ids=[self.gpu_id]) # First wrap model in DDP
-        # self.scaler = GradScaler('cuda') if self.config["USE_AMP"] else None # Initialize GradScaler for AMP if enabled
+        if is_main():
+            print("🔥 About to compile model with torch.compile() - this may take 5-30 minutes on first run...")
+        self.model = torch.compile(self.model, mode='reduce-overhead')  # Then compile with torch.compile
+        if is_main():
+            print("✅ Model compilation complete!")
+        self.dtype = torch.bfloat16 if self.config["USE_BF16"] else torch.float16
         self.use_amp = self.config["USE_AMP"]
-        self.dtype = torch.float16 if self.config.get("USE_AMP", False) else torch.float32
-        self.scaler = None # No scaler needed for BF16
+        self.scaler = GradScaler('cuda') if (self.use_amp and self.dtype == torch.float16) else None
         self.snapshot_path = snapshot_path # Path to save/load snapshots
         if os.path.exists(snapshot_path): 
             if is_main():
@@ -82,10 +107,6 @@ class Trainer:
             "TRAIN_TIMINGS": self.train_timings,
             "VAL_TIMINGS": self.val_timings,
         }
-
-        # Save scaler state if using AMP
-        if self.scaler is not None:
-            snapshot["SCALER_STATE"] = self.scaler.state_dict()
 
         torch.save(snapshot, self.snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
@@ -146,6 +167,7 @@ class Trainer:
         self.train_timings = snapshot["TRAIN_TIMINGS"]
         self.val_timings = snapshot["VAL_TIMINGS"]
         if is_main():
+            print(f"Found snapshot saved at epoch {self.epochs_run - 1}.")
             print(f"Resuming model from snapshot at Epoch {self.epochs_run}")
         self.model.train()  # Set back to training mode
 
@@ -154,7 +176,8 @@ class Trainer:
         if is_main():
             print("Running epoch {}".format(epoch))
 
-        epoch_loss = 0.0
+        # 🔥 Accumulate on GPU instead of CPU
+        epoch_loss = torch.zeros(1, dtype=torch.float32, device=f'cuda:{self.gpu_id}')
         total_samples = 0
 
         # Add detailed timing if profiling
@@ -187,12 +210,13 @@ class Trainer:
                 compute_start = time.time()
 
             batch_size = images.size(0)
-            mean_batch_loss = self._run_batch(source, targets)
+            mean_batch_loss = self._run_batch(source, targets, return_tensors=True)
             
             if use_profiler and is_main():
                 compute_time += time.time() - compute_start
 
-            epoch_loss += mean_batch_loss * batch_size
+            # 🔥 Accumulate on GPU (detach to avoid building huge computation graph)
+            epoch_loss += mean_batch_loss.detach() * batch_size
             total_samples += batch_size
             
             # Print batch-level timing for first epoch
@@ -200,10 +224,12 @@ class Trainer:
                 print(f"  Batch {batch_idx}: Data load: {(time.time()-batch_start)*1000:.2f}ms | "
                       f"Compute: {compute_time*1000:.2f}ms")
 
-        
+        # 🔥 Only sync once at the end of the epoch
+        epoch_loss_value = epoch_loss.item()
+
         # Gather total loss sums (not averages) from all GPUs
-        epoch_loss_tensor = torch.tensor([epoch_loss], device=self.gpu_id)
-        total_samples_tensor = torch.tensor([total_samples], device=self.gpu_id)
+        epoch_loss_tensor = torch.tensor([epoch_loss_value], dtype=torch.float32, device=f'cuda:{self.gpu_id}')
+        total_samples_tensor = torch.tensor([total_samples], dtype=torch.int64, device=f'cuda:{self.gpu_id}')
         
         torch.distributed.all_reduce(epoch_loss_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of losses across GPUs
         torch.distributed.all_reduce(total_samples_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of samples across GPUs
@@ -216,30 +242,58 @@ class Trainer:
             self.train_loss_history.append(global_avg_loss)
             total_time = time.time() - t0
             self.train_timings.append(total_time)
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {global_avg_loss:.6f} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s")
+            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {global_avg_loss:.2e} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s")
 
-    def _run_batch(self, source, targets):
-
+    def _run_batch(self, source, targets, return_tensors: bool = False):
         self.optimizer.zero_grad()
         images, metas, reflectance_maps = source
         device = images.device
-        # Calculate loss, which is returned as a mean over the batch
+        
         with autocast('cuda', enabled=self.use_amp, dtype=self.dtype):
             outputs = self.model(images, metas, target_size=targets.shape[-2:])
-            loss = calculate_total_loss(outputs, targets, reflectance_maps, metas, device=device,
-                                            camera_params=self.config["CAMERA_PARAMS"], hapke_params=self.config["HAPKE_KWARGS"],
-                                            w_grad=self.config["W_GRAD"], w_refl=self.config["W_REFL"], w_mse=self.config["W_MSE"])
-    
-        # Simple backward - no scaler!
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config["GRAD_CLIP"])
+            total_loss = calculate_total_loss(
+                outputs, targets, reflectance_maps, metas, 
+                device=device,
+                camera_params=self.config["CAMERA_PARAMS"], 
+                hapke_params=self.config["HAPKE_KWARGS"],
+                w_grad=self.config["W_GRAD"], 
+                w_refl=self.config["W_REFL"], 
+                w_mse=self.config["W_MSE"],
+                height_norm=self.config["HEIGHT_NORMALIZATION"] + self.config["HEIGHT_NORMALIZATION_PM"], # the maximum possible height for normalization
+                return_components=False
+            )
+        
+        # # Check loss component values
+        # if is_main():
+        #     print(f"    Loss components: MSE={loss_mse.item():.6f}, Grad={loss_grad.item():.6f}, Refl={loss_refl.item():.6f}, Total={total_loss.item():.6f}")
+
+        # # 🔍 Diagnostic checks
+        # if torch.isnan(total_loss) or torch.isinf(total_loss):
+        #     print(f"⚠️ NaN/Inf detected in loss at epoch {self.epochs_run}")
+        #     print(f"Output stats: min={outputs.min():.4f}, max={outputs.max():.4f}, mean={outputs.mean():.4f}")
+        #     raise RuntimeError("NaN detected in loss!")
+        
+        total_loss.backward()
+        
+        # 🔍 Check gradients
+        total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config["GRAD_CLIP"])
+        # if torch.isnan(total_norm) or torch.isinf(total_norm):
+        #     print(f"⚠️ NaN/Inf in gradients! Norm: {total_norm:.4f}")
+        #     raise RuntimeError("NaN detected in gradients!")
+        
+        if is_main() and total_norm > self.config["GRAD_CLIP"] * 0.8:
+            print(f"⚠️ Large gradient norm: {total_norm:.4f} (clipped at {self.config['GRAD_CLIP']})")
+        
         self.optimizer.step()
 
-        return loss.item() # Return mean loss over the batch
+        if return_tensors:
+            return total_loss
+        else:
+            return total_loss.item()
 
     def train(self, max_epochs: int):
         # Enable profiling for first few batches
-        use_profiler = self.config.get("USE_PROFILER", False)
+        use_profiler = self.config["USE_PROFILER"]
         
         if use_profiler and is_main():
             prof = profile(
@@ -305,7 +359,9 @@ class Trainer:
                     hapke_params=self.config["HAPKE_KWARGS"],
                     w_grad=self.config["W_GRAD"], 
                     w_refl=self.config["W_REFL"], 
-                    w_mse=self.config["W_MSE"]
+                    w_mse=self.config["W_MSE"],
+                    height_norm=self.config["HEIGHT_NORMALIZATION"] + self.config["HEIGHT_NORMALIZATION_PM"], # the maximum possible height for normalization
+                    return_components=False
                 )
             
             val_loss += loss.item() * batch_size
@@ -334,7 +390,7 @@ class Trainer:
             self.val_loss_history.append(global_avg_val_loss)
             val_time = time.time() - t0
             self.val_timings.append(val_time)
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Val Loss: {global_avg_val_loss:.6f} | Samples: {global_total_samples} | Time: {val_time:.2f}s")
+            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Val Loss: {global_avg_val_loss:.2e} | Samples: {global_total_samples} | Time: {val_time:.2f}s")
         
         self.model.train()  # Set back to training mode
         return global_avg_val_loss
@@ -376,7 +432,9 @@ class Trainer:
                     hapke_params=self.config["HAPKE_KWARGS"],
                     w_grad=self.config["W_GRAD"], 
                     w_refl=self.config["W_REFL"], 
-                    w_mse=self.config["W_MSE"]
+                    w_mse=self.config["W_MSE"],
+                    height_norm=self.config["HEIGHT_NORMALIZATION"] + self.config["HEIGHT_NORMALIZATION_PM"], # the maximum possible height for normalization
+                    return_components=False
                 )
             
             # Calculate AME (Absolute Mean Error)
@@ -409,7 +467,7 @@ class Trainer:
         
         if is_main():
             test_time = time.time() - t0
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Test Loss: {global_test_loss:.6f} | AME: {global_ame:.6f} | Samples: {global_total_samples} | Time: {test_time:.2f}s")
+            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Test Loss: {global_test_loss:.2e} | AME: {global_ame:.6f} | Samples: {global_total_samples} | Time: {test_time:.2f}s")
         
         self.model.train()  # Set back to training mode
         return global_test_loss, global_ame
@@ -426,6 +484,7 @@ def load_train_objs(config, run_path: str):
     return train_set, val_set, test_set, model, optimizer
 
 def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, prefetch_factor: int = 4) -> DataLoader:
+    rank = int(os.environ["LOCAL_RANK"])
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -433,5 +492,7 @@ def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, 
         shuffle=False,
         sampler=DistributedSampler(dataset),
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor
+        prefetch_factor=prefetch_factor,
+        persistent_workers=True,  # 🔥 Keep workers alive between epochs
+        pin_memory_device=f'cuda:{rank}'  # 🔥 Pin directly to target GPU
     )

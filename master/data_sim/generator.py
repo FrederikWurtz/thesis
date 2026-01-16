@@ -651,6 +651,8 @@ def _get_sets_of_suncam_values(manual_suncam_pars=None, manual_sun_az_pm=None, m
         cam_az += np.random.uniform(-manual_cam_az_pm, manual_cam_az_pm)
         cam_el += np.random.uniform(-manual_cam_el_pm, manual_cam_el_pm)
         cam_dist += np.random.uniform(-manual_cam_dist_pm, manual_cam_dist_pm)
+        # Clamp sun elevation to avoid tan(90°) = inf in shadow map computation
+        sun_el = np.clip(sun_el, -89.9, 89.9)
         suncam_values.append((sun_az, sun_el, cam_az, cam_el, cam_dist))
     return suncam_values
 

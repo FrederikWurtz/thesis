@@ -31,385 +31,275 @@ class Renderer:
 
     def render_shading(self, sun_az_deg, sun_el_deg, camera_az_deg, camera_el_deg, camera_distance_from_center, model="hapke"):
         """
-        Render the surface shading using the specified reflectance model.
-        Now uses PyTorch for gradient tracking and stores full reflectance map.
-
+        Render surface shading with shadows using specified reflectance model.
+        
         Args:
-            sun_az_deg (float): Sun azimuth angle in degrees.
-            sun_el_deg (float): Sun elevation angle in degrees.
-            camera_az_deg (float): Camera azimuth angle in degrees.
-            camera_el_deg (float): Camera elevation angle in degrees.
-            camera_distance_from_center (float): Distance from the DEM center to the camera.
-            model (str): Reflectance model to use ("hapke" or "lambertian").
+            sun_az_deg: Sun azimuth angle in degrees
+            sun_el_deg: Sun elevation angle in degrees
+            camera_az_deg: Camera azimuth angle in degrees
+            camera_el_deg: Camera elevation angle in degrees
+            camera_distance_from_center: Distance from DEM center to camera
+            model: Reflectance model ("hapke" or "lambertian")
         """
-        # Compute sun direction unit vector from azimuth and elevation
+        # Compute sun direction vector
         sun_vec = Camera.unit_vec_from_az_el(sun_az_deg, sun_el_deg, device=self.device)
-        sx, sy, sz = sun_vec[0], sun_vec[1], sun_vec[2]
-
-        # Calculate the center coordinates of the DEM in world space
+        
+        # Compute camera position
         center_x = self.dem.x0 + (self.dem.width * self.dem.cellsize) / 2
         center_y = self.dem.y0 + (self.dem.height * self.dem.cellsize) / 2
-
-        # Compute camera position in world coordinates based on azimuth, elevation, and distance
-        camera_az_rad = torch.deg2rad(torch.tensor(camera_az_deg, dtype=torch.float32, device=self.device))
-        camera_el_rad = torch.deg2rad(torch.tensor(camera_el_deg, dtype=torch.float32, device=self.device))
-        cx = center_x + camera_distance_from_center * torch.sin(camera_az_rad) * torch.cos(camera_el_rad)
-        cy = center_y + camera_distance_from_center * torch.cos(camera_az_rad) * torch.cos(camera_el_rad)
-        cz = camera_distance_from_center * torch.sin(camera_el_rad)
+        
+        cam_az_rad = torch.deg2rad(torch.tensor(camera_az_deg, dtype=torch.float32, device=self.device))
+        cam_el_rad = torch.deg2rad(torch.tensor(camera_el_deg, dtype=torch.float32, device=self.device))
+        
+        cx = center_x + camera_distance_from_center * torch.sin(cam_az_rad) * torch.cos(cam_el_rad)
+        cy = center_y + camera_distance_from_center * torch.cos(cam_az_rad) * torch.cos(cam_el_rad)
+        cz = camera_distance_from_center * torch.sin(cam_el_rad)
         camera_pos = torch.stack([cx, cy, cz])
-
+        
+        # Cache camera position and parameters
         self._last_camera_pos = camera_pos
         self.sun_az_deg = sun_az_deg
         self.sun_el_deg = sun_el_deg
-        self.camera_distance_from_center = camera_distance_from_center
         self.camera_az_deg = camera_az_deg
         self.camera_el_deg = camera_el_deg
-
-        # Calculate view vectors from each DEM point to the camera
-        # Each vector points from the DEM point to the camera position
+        self.camera_distance_from_center = camera_distance_from_center
+        
+        # Compute view vectors (normalized)
         view_vectors = camera_pos - self.dem.world_points
-        # Normalize the view vectors to unit length
         view_vectors = view_vectors / torch.norm(view_vectors, dim=1, keepdim=True)
-
-        # Flatten normal vectors for computation (1D arrays)
-        nx_flat = self.dem.nx.flatten()
-        ny_flat = self.dem.ny.flatten()
-        nz_flat = self.dem.nz.flatten()
-
-        # Compute cosines of emission (mu) and incidence (mu0) angles
-        # mu: cosine of emission angle (between surface normal and view vector)
-        mu = (nx_flat*view_vectors[:,0] + ny_flat*view_vectors[:,1] + nz_flat*view_vectors[:,2]).reshape(self.dem.dem.shape)
-        # mu0: cosine of incidence angle (between surface normal and sun direction)
-        mu0 = (nx_flat*sx + ny_flat*sy + nz_flat*sz).reshape(self.dem.dem.shape)
-
+        
+        # Flatten normals
+        normals_flat = torch.stack([self.dem.nx.flatten(), self.dem.ny.flatten(), self.dem.nz.flatten()], dim=1)
+        
+        # Compute incidence and emission angles
+        mu = (normals_flat * view_vectors).sum(dim=1).reshape(self.dem.dem.shape)
+        mu0 = (normals_flat * sun_vec).sum(dim=1).reshape(self.dem.dem.shape)
+        
+        # Lambertian model (early return)
         if model.lower() == "lambertian":
-            # Lambertian reflectance model: R = w/pi * mu0
             R = self.model.w / torch.pi * mu0
-            # Only keep values where both mu0 and mu are positive (lit and visible)
-            self.rendered_shading = torch.where((mu0 > 0) & (mu > 0), R, torch.tensor(0.0))
+            self.rendered_shading = torch.where((mu0 > 0) & (mu > 0), R, torch.zeros_like(R))
+            self.reflectance_map = self.rendered_shading
             return
-        elif model.lower() != "hapke":
-            # Raise error for unknown model
+        
+        if model.lower() != "hapke":
             raise ValueError("Unknown model. Use 'hapke' or 'lambertian'.")
-
-        # Compute phase angle (g) between sun and view directions for each DEM point
-        # cos_g: cosine of phase angle between sun direction and view vector
-        cos_g = sx*view_vectors[:,0] + sy*view_vectors[:,1] + sz*view_vectors[:,2]
-        cos_g = torch.clamp(cos_g, -1, 1)  # Ensure within valid range for arccos
+        
+        # Hapke model: compute phase angle
+        cos_g = (view_vectors * sun_vec).sum(dim=1)
+        cos_g = torch.clamp(cos_g, -1, 1)
         g_rad = torch.acos(cos_g).reshape(self.dem.dem.shape)
-
-        # Hapke reflectance model: use the model's radiance_factor method
+        
+        # Compute Hapke reflectance
         R = self.model.radiance_factor(mu0, mu, g_rad)
-
-        # Calculate shadow map (1=lit, 0=shadow) using the DEM and sun angles
-        shadow_map = Renderer.compute_shadow_map(self.dem.dem, sun_az_deg, sun_el_deg, cellsize=self.dem.cellsize, device=self.device)
-
-        # Ensure shadow_map has the same dtype as R for proper multiplication
-        if shadow_map.dtype != R.dtype:
-            shadow_map = shadow_map.type_as(R)  # Cast to same dtype without device transfer
-
-        # Sanity-check shape before applying mask
-        if shadow_map.shape != R.shape:
-            raise ValueError(f"Shadow map shape {tuple(shadow_map.shape)} does not match reflectance shape {tuple(R.shape)}")
-
-        # Apply the shadow mask to the reflectance: zeros where shadow==0, keep R where shadow==1
-        # shadow_map currently contains 0/1 values (as R.dtype), so simple multiplication suffices
-        R_masked = R * shadow_map
-        self.rendered_shading = R_masked
-
-        # Store the masked reflectance map so all downstream users see shading with shadows applied
-        self.reflectance_map = R_masked
+        
+        # Compute and apply shadow map
+        shadow_map = Renderer.compute_shadow_map(
+            self.dem.dem, sun_az_deg, sun_el_deg, 
+            cellsize=self.dem.cellsize, device=self.device
+        )
+        
+        # Apply shadows (convert bool to float if needed)
+        R_shadowed = R * shadow_map.type_as(R)
+        
+        # Store results, so that render_camera_image can use them
+        self.rendered_shading = R_shadowed
+        self.reflectance_map = R_shadowed
 
 
     def render_camera_image(self, 
-                           sun_az_deg=None, 
-                           sun_el_deg=None, 
-                           camera_az_deg=None, 
-                           camera_el_deg=None, 
-                           camera_distance_from_center=None,
-                           img_height=None,
-                           img_width=None,
-                           verbose=False):
+                        sun_az_deg=None, 
+                        sun_el_deg=None, 
+                        camera_az_deg=None, 
+                        camera_el_deg=None, 
+                        camera_distance_from_center=None,
+                        img_height=None,
+                        img_width=None,
+                        verbose=False):
         """
         Render a camera image from the DEM and reflectance data using pinhole camera model.
-
-        This method implements a complete camera projection pipeline:
-        1. Transform 3D world points to camera coordinate system
-        2. Project camera coordinates to 2D image plane
-        3. Apply Z-buffer rendering for depth testing
-
-        Parameters:
-        -----------
-        camera_pos : ndarray, optional
-            Camera position in world coordinates (3,). If None, uses self.camera.pos if available.
-        target : ndarray, optional
-            Target position to look at (3,). If None, uses self.camera.target if available.
-        up : ndarray, optional
-            Up vector (3,). If None, uses self.camera.up if available, else [0,0,1].
-        intrinsics : tuple, optional
-            Camera intrinsics (fx, fy, cx, cy). If None, uses self.camera.intrinsics if available.
-        img_size : tuple, optional
-            Image size (height, width) in pixels. If None, uses self.camera.img_size if available.
-        sun_az_deg, sun_el_deg, camera_az_deg, camera_el_deg, camera_distance_from_center, model : optional
-            If any are specified, will recalculate shading before rendering.
-        verbose : bool, optional
-            Whether to print detailed rendering information (default: True)
-
+        
         Returns:
-        --------
-        tuple of (torch.Tensor, torch.Tensor)
-            - Rendered camera image with radiance factor (I/F) values
-            - Reflectance map with radiance factor values (full DEM resolution)
-
-        Raises:
-        -------
-        ValueError
-            If render_shading() hasn't been called first to generate reflectance data
+            tuple: (rendered_image, reflectance_map)
         """
-
+        # Compute shading with shadows
         self.render_shading(sun_az_deg, sun_el_deg, camera_az_deg, camera_el_deg, camera_distance_from_center)
-
-        # camera position has now been set by render_shading if not provided
+        
+        # Setup camera geometry
         camera_pos = self._last_camera_pos
-
-        # set target to DEM center
         center_x = self.dem.x0 + (self.dem.width * self.dem.cellsize) / 2
         center_y = self.dem.y0 + (self.dem.height * self.dem.cellsize) / 2
         center_z = torch.mean(self.dem.dem)
         target = torch.tensor([center_x, center_y, center_z], dtype=torch.float32, device=self.device)
-        self.target = target
-
-        # Use defaults from camera
+        
+        # Transform world points to camera space
         fx, fy, cx, cy = self.camera.get_intrinsics()
-        up = self.camera.up
-
-        # Use camera object's look_at method
-        Rot = self.camera.look_at(camera_pos, target, up)
-
-        # Transform world points to camera coordinates using camera object
-        world_points = self.dem.world_points
-        if verbose:
-            print(f"  Total world points: {len(world_points)}")
-        Xc = self.camera.world_to_camera(world_points, Rot, camera_pos)
-
-        if verbose:
-            print(f"  Camera coordinates Z range: [{Xc[:,2].min().item():.1f}, {Xc[:,2].max().item():.1f}]")
-
-        # Ensure reflectance and points have compatible shapes
-        refl_flat = self.rendered_shading.flatten()
-        if len(refl_flat) != len(world_points):
-            raise ValueError(f"Reflectance size {len(refl_flat)} doesn't match points size {len(world_points)}")
-
-        # Filter points behind camera (negative Z in camera coordinates)
-        in_front = Xc[:,2] > 0
-        if verbose:
-            print(f"  Points in front of camera: {torch.sum(in_front).item()}/{len(world_points)} ({100*torch.sum(in_front).item()/len(world_points):.1f}%)")
-
-        if torch.sum(in_front).item() == 0:
-            if verbose:
-                print("  WARNING: No points in front of camera!")
-            # Return empty image and empty reflectance map
-            return torch.zeros((img_height, img_width), dtype=torch.float32), self.reflectance_map
-
-        # Keep only points in front of camera
+        Rot = self.camera.look_at(camera_pos, target, self.camera.up)
+        Xc = self.camera.world_to_camera(self.dem.world_points, Rot, camera_pos)
+        
+        # Filter points in front of camera
+        in_front = Xc[:, 2] > 0
+        if not in_front.any():
+            return torch.zeros((img_height, img_width), dtype=torch.float32, device=self.device), self.reflectance_map
+        
         Xc = Xc[in_front]
-        refl = refl_flat[in_front]
-
-        # Project to image plane using pinhole camera model via camera object
+        refl = self.rendered_shading.flatten()[in_front]
+        depth = Xc[:, 2]
+        
+        # Project to image plane
         uv = self.camera.project_to_image(Xc, fx, fy, cx, cy)
-        if verbose:
-            print(f"  Projected coordinates range: U=[{uv[:,0].min().item():.1f}, {uv[:,0].max().item():.1f}], V=[{uv[:,1].min().item():.1f}, {uv[:,1].max().item():.1f}]")
-
-        # Round to integer pixel coordinates and filter to image bounds
-        u = torch.round(uv[:,0]).long()
-        v = torch.round(uv[:,1]).long()
-
-        # Flip v coordinate to match origin='lower' convention (y=0 at bottom)
-        v = img_height - 1 - v
-
-        mask = (u >= 0) & (u < img_width) & (v >= 0) & (v < img_height)
-
-        if verbose:
-            print(f"  Points within image bounds: {torch.sum(mask).item()}/{len(u)} ({100*torch.sum(mask).item()/len(u):.1f}%)")
-
-        if torch.sum(mask).item() == 0:
-            if verbose:
-                print("  WARNING: No points within image bounds!")
-                print("  Suggestion: Try adjusting camera position, focal length, or image size")
-            # Return empty image and full reflectance map
-            return torch.zeros((img_height, img_width), dtype=torch.float32), self.reflectance_map
-
-        # Apply mask to keep only valid points
-        u, v = u[mask], v[mask]
-        refl = refl[mask]
-        depth = Xc[mask,2]  # Z-depth for each valid point
-
-        # VECTORIZED Z-BUFFER (FIXED - proper lexicographic sort)
-        # Convert 2D pixel coordinates to 1D linear indices
-        pixel_indices = v * img_width + u  # Linear index for each point
+        u = torch.round(uv[:, 0]).long()
+        v = img_height - 1 - torch.round(uv[:, 1]).long()  # Flip for origin='lower'
         
-        # Proper lexicographic sort: sort by depth first, then use stable sort by pixel
-        # Step 1: Sort by depth (closest first)
-        depth_sort_idx = torch.argsort(depth)
-        pixel_indices_depth_sorted = pixel_indices[depth_sort_idx]
-        refl_depth_sorted = refl[depth_sort_idx]
-        depth_sorted = depth[depth_sort_idx]
+        # Filter to image bounds
+        valid = (u >= 0) & (u < img_width) & (v >= 0) & (v < img_height)
+        if not valid.any():
+            return torch.zeros((img_height, img_width), dtype=torch.float32, device=self.device), self.reflectance_map
         
-        # Step 2: Stable sort by pixel index (keeps depth ordering within each pixel)
-        # PyTorch's argsort is stable, so within each pixel, depths remain ordered
-        pixel_sort_idx = torch.argsort(pixel_indices_depth_sorted, stable=True)
-        pixel_indices_sorted = pixel_indices_depth_sorted[pixel_sort_idx]
-        refl_sorted = refl_depth_sorted[pixel_sort_idx]
+        u, v, refl, depth = u[valid], v[valid], refl[valid], depth[valid]
         
-        # Find first occurrence of each unique pixel (which is the closest due to sorting)
-        # Create mask for first occurrence (closest point for each pixel)
-        first_occurrence_mask = torch.cat([
-            torch.tensor([True], device=pixel_indices.device),
-            pixel_indices_sorted[1:] != pixel_indices_sorted[:-1]
-        ])
+        # Z-buffer using scatter_reduce with 'amin' (closest depth wins)
+        pixel_idx = v * img_width + u
         
-        # Keep only the closest point for each pixel
-        final_pixel_indices = pixel_indices_sorted[first_occurrence_mask]
-        final_refl = refl_sorted[first_occurrence_mask]
+        # Create image using scatter_reduce to automatically handle Z-buffering
+        # Method: For each pixel, keep the reflectance value with minimum depth
+        img_flat = torch.full((img_height * img_width,), float('inf'), dtype=torch.float32, device=self.device)
+        depth_map = torch.full((img_height * img_width,), float('inf'), dtype=torch.float32, device=self.device)
         
-        # Create output image and scatter the reflectance values
-        img_flat = torch.zeros((img_height * img_width,), dtype=torch.float32, device=refl.device)
-        img_flat[final_pixel_indices] = final_refl
+        # First pass: get minimum depth per pixel
+        depth_map.scatter_reduce_(0, pixel_idx, depth, reduce='amin', include_self=False)
+        
+        # Second pass: only keep reflectance where depth matches minimum
+        closest = (depth == depth_map[pixel_idx])
+        img_flat = torch.zeros((img_height * img_width,), dtype=torch.float32, device=self.device)
+        img_flat.scatter_(0, pixel_idx[closest], refl[closest])
+        
+        # Reshape and flip to match origin='lower'
         img = img_flat.reshape(img_height, img_width)
-
-        # # LOOP-BASED Z-BUFFER (SLOWER BUT SIMPLER)
-        # img = torch.zeros((img_height, img_width), dtype=torch.float32)
-        # zbuf = torch.full((img_height, img_width), float('inf'), dtype=torch.float32)
-        # for i in range(len(u)):
-        #     ui, vi = u[i], v[i]
-        #     if depth[i] < zbuf[vi, ui]:  # Keep closest point
-        #         img[vi, ui] = refl[i]
-        #         zbuf[vi, ui] = depth[i]
-
-        # flip y axis back to origin='lower' convention
-        img = torch.flipud(img)
-        img = torch.fliplr(img)
-
+        img = torch.flipud(torch.fliplr(img))
+        
         if verbose:
-            print(f"  Rendered image statistics:")
-            print(f"    Non-zero pixels: {torch.count_nonzero(img).item()}/{img.numel()} ({100*torch.count_nonzero(img).item()/img.numel():.1f}%)")
-            print(f"    Value range: [{img.min().item():.6f}, {img.max().item():.6f}]")
-            if torch.count_nonzero(img).item() > 0:
-                print(f"    Mean non-zero value: {img[img > 0].mean().item():.6f}")
-
-        # Return both the camera image and the full reflectance map
+            non_zero = torch.count_nonzero(img)
+            print(f"  Rendered: {non_zero}/{img.numel()} pixels ({100*non_zero/img.numel():.1f}%)")
+            print(f"  Range: [{img.min():.6f}, {img.max():.6f}]")
+        
         return img, self.reflectance_map
+
+    @staticmethod
+    def compute_shadow_map_batched(dem_array, sun_params_list, device=None, cellsize=1):
+        """
+        Compute shadow maps for multiple sun angles in a single GPU pass.
+        This is more efficient than calling compute_shadow_map multiple times.
+        
+        Args:
+            dem_array: 2D DEM tensor [H, W]
+            sun_params_list: List of (sun_az_deg, sun_el_deg) tuples
+            device: torch device
+            cellsize: DEM cell size
+            
+        Returns:
+            shadow_maps: List of shadow maps, one per sun angle
+        """
+        shadow_maps = []
+        for sun_az_deg, sun_el_deg in sun_params_list:
+            shadow_map = Renderer.compute_shadow_map(dem_array, sun_az_deg, sun_el_deg, device, cellsize)
+            shadow_maps.append(shadow_map)
+        return shadow_maps
 
     @staticmethod
     def compute_shadow_map(dem_array, sun_az_deg, sun_el_deg, device=None, cellsize=1):
         """
-        Torch-based scan-line shadow map (sun at infinity) returning the
-        backward (bottom->top) scan result as the final lit map (1=lit, 0=shadow).
-
-        This version runs at the DEM's native resolution and does not perform
-        any internal upsampling/downsamping.
-
-        Cleaning options:
-        - If `clean` is True, a pure-Torch neighborhood majority filter is applied
-            with a window of size `neighborhood_size`. A pixel is lit if at least
-            `neighborhood_threshold` fraction of the window is lit.
-
-        Parameters:
-        dem_array: 2D numpy array or torch tensor
-        sun_az_deg, sun_el_deg: sun geometry in degrees
-        cellsize: size of DEM cells (meters)
-        clean: whether to apply neighborhood cleaning
-        neighborhood_size: odd int fallback window size (pure-Torch)
-        neighborhood_threshold: fraction in (0,1] of lit pixels in window to consider lit
+        Optimized torch-based scan-line shadow map (sun at infinity).
+        Returns lit map (1=lit, 0=shadow) as boolean tensor.
+        
+        Algorithm:
+        1. Rotate DEM to align sun azimuth with image rows
+        2. Compute transformed elevation field T = elevation - row * cellsize * tan(sun_el)
+        3. Use cummax to find horizon from bottom->top (backward scan)
+        4. Rotate result back to original orientation
+        
+        Args:
+            dem_array: 2D numpy array or torch tensor (elevation map)
+            sun_az_deg: Sun azimuth in degrees
+            sun_el_deg: Sun elevation in degrees
+            device: torch device (defaults to input tensor device or CPU)
+            cellsize: DEM cell size in meters
+        
+        Returns:
+            Boolean tensor where True=lit, False=shadow
         """
-
-        AlignCorners = True
-
+        # Convert input to torch tensor and handle device placement
         if torch.is_tensor(dem_array):
-            dem_t = dem_array
-            if device is None:
-                device = dem_array.device
+            dem_t = dem_array.to(dtype=torch.float32)
+            device = device or dem_array.device
         else:
-            if device is None:
-                device = torch.device('cpu')
-            dem_t = torch.from_numpy(np.array(dem_array)).to(dtype=torch.float32, device=device)
-
-
-        # device = dem_t.device
-        # dem_t = dem_t.to(dtype=torch.float32, device=device)
+            device = device or torch.device('cpu')
+            dem_t = torch.as_tensor(dem_array, dtype=torch.float32, device=device)
 
         H, W = dem_t.shape
 
-        # pad to larger square (diagonal) to avoid clipping on rotation
-        diag = int(math.ceil(math.hypot(H, W)))
-        pad_h = max(0, (diag - H) // 2 + 2)  # small extra margin
-        pad_w = max(0, (diag - W) // 2 + 2)
+        # Pad to diagonal size to prevent rotation clipping
+        diag = int(math.ceil(math.hypot(H, W))) + 4  # +4 for margin
+        pad = (diag - H) // 2, (diag - W) // 2
+        
+        dem_b = dem_t.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, H, W)
+        dem_b = F.pad(dem_b, (pad[1], pad[1], pad[0], pad[0]), mode='constant', value=0.0)
+        H_p, W_p = dem_b.shape[-2:]
 
-        dem_b = dem_t.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-        if pad_h > 0 or pad_w > 0:
-            dem_b = F.pad(dem_b, (pad_w, pad_w, pad_h, pad_h), mode='constant', value=0.0)
+        # Precompute rotation angles (rotate to align sun azimuth with rows)
+        az_rad = math.radians(-sun_az_deg)
+        cos_az, sin_az = math.cos(az_rad), math.sin(az_rad)
+        
+        # Forward rotation: align sun direction with image rows
+        theta_mat = torch.tensor([[[cos_az, -sin_az, 0.0], 
+                                    [sin_az, cos_az, 0.0]]], 
+                                dtype=torch.float32, device=device)
+        grid = F.affine_grid(theta_mat, dem_b.size(), align_corners=True)
+        
+        # Rotate DEM and create valid pixel mask
+        dem_rot = F.grid_sample(dem_b, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        mask_rot = F.grid_sample(torch.ones_like(dem_b), grid, mode='nearest', 
+                                padding_mode='zeros', align_corners=True)
 
-        cellsize_up = cellsize
-
-        H_p, W_p = dem_b.shape[-2], dem_b.shape[-1]
-
-        # Rotate so sun az points along image rows (clockwise rotation by az)
-        az = float(sun_az_deg)
-        theta = math.radians(-az)
-        cos_t = math.cos(theta); sin_t = math.sin(theta)
-        theta_mat = torch.tensor([[[cos_t, -sin_t, 0.0], [sin_t, cos_t, 0.0]]], dtype=torch.float32, device=device)
-
-        grid = F.affine_grid(theta_mat, dem_b.size(), align_corners=AlignCorners)
-        dem_rot = F.grid_sample(dem_b, grid, mode='bilinear', padding_mode='zeros', align_corners=AlignCorners)
-
-        # Mask of valid (non-padded) pixels after rotation
-        ones = torch.ones_like(dem_b)
-        mask_rot = F.grid_sample(ones, grid, mode='nearest', padding_mode='zeros', align_corners=AlignCorners)
-
-        # Transformed field T = elevation - (row_index * cellsize_up * tan(el))
+        # Compute transformed elevation field T
+        # T = elevation - row_distance * tan(sun_elevation)
+        # This transforms the shadow problem into finding the cumulative max
         el_rad = math.radians(sun_el_deg)
-        tan_el = math.tan(el_rad)
-        rows = torch.arange(H_p, dtype=torch.float32, device=device).view(1, 1, H_p, 1) * cellsize_up
-        T = dem_rot - rows * tan_el  # shape (1,1,H_p,W_p)
+        rows = torch.arange(H_p, dtype=torch.float32, device=device).view(1, 1, H_p, 1)
+        T = dem_rot - rows * (cellsize * math.tan(el_rad))
+        
+        # Mark invalid (padded) regions as -inf so they never cast shadows
+        T = torch.where(mask_rot > 0, T, torch.full_like(T, -float('inf')))
 
-        # Mark padding as -inf so it never occludes
-        neg_inf = -float('inf')
-        T = torch.where(mask_rot == 0, torch.tensor(neg_inf, device=device, dtype=T.dtype), T)
-
-        # Explicit backward row-wise scan (bottom -> top)
+        # Vectorized backward scan (bottom->top) using cummax
+        # Flip rows, compute cumulative maximum, flip back
+        T_flipped = torch.flip(T, dims=[2])
+        cummax_flipped = torch.cummax(T_flipped, dim=2)[0]
+        prev_max = torch.flip(cummax_flipped, dims=[2])
+        
+        # Compare each pixel with max from rows below (shifted)
+        # A pixel is lit if its T value >= maximum T from all rows below
         lit_rot = torch.zeros_like(T, dtype=torch.bool)
-        prev_max = torch.full((1, 1, 1, W_p), neg_inf, device=device, dtype=T.dtype)
-        for r in range(H_p-1, -1, -1):
-            cur = T[:, :, r:r+1, :]
-            is_lit = cur >= prev_max
-            lit_rot[:, :, r:r+1, :] = is_lit
-            prev_max = torch.maximum(prev_max, cur)
+        lit_rot[:, :, :-1, :] = T[:, :, :-1, :] >= prev_max[:, :, 1:, :]
+        lit_rot[:, :, -1:, :] = True  # Bottom row always lit (no obstruction below)
 
-        # Rotate lit map back to original orientation
-        lit_rot_f = lit_rot.float()
-        theta_inv = math.radians(az)
-        cos_i = math.cos(theta_inv); sin_i = math.sin(theta_inv)
-        theta_mat_inv = torch.tensor([[[cos_i, -sin_i, 0.0], [sin_i, cos_i, 0.0]]], dtype=torch.float32, device=device)
-        grid_inv = F.affine_grid(theta_mat_inv, dem_b.size(), align_corners=AlignCorners)
+        # Inverse rotation: restore original orientation
+        theta_mat_inv = torch.tensor([[[cos_az, sin_az, 0.0], 
+                                        [-sin_az, cos_az, 0.0]]], 
+                                    dtype=torch.float32, device=device)
+        grid_inv = F.affine_grid(theta_mat_inv, dem_b.size(), align_corners=True)
+        
+        # Rotate shadow map and mask back to original orientation
+        shadow_b = F.grid_sample(lit_rot.float(), grid_inv, mode='nearest', 
+                                padding_mode='zeros', align_corners=True)
+        mask_back = F.grid_sample(mask_rot, grid_inv, mode='nearest', 
+                                padding_mode='zeros', align_corners=True)
 
-        # inverse-sample lit map and reproject validity mask
-        shadow_b = F.grid_sample(lit_rot_f, grid_inv, mode='nearest', padding_mode='zeros', align_corners=AlignCorners)
-        mask_back = F.grid_sample(mask_rot.float(), grid_inv, mode='nearest', padding_mode='zeros', align_corners=AlignCorners)
-
-        # crop center region back to original DEM size
-        start_h = pad_h
-        end_h = start_h + H
-        start_w = pad_w
-        end_w = start_w + W
-        shadow_cropped = shadow_b[:, :, start_h:end_h, start_w:end_w]
-        mask_cropped = mask_back[:, :, start_h:end_h, start_w:end_w]
-
-        # remove padding-origin pixels
-        shadow_cropped = shadow_cropped * (mask_cropped > 0.5).float()
-
-        shadow_map_t = shadow_cropped.squeeze(0).squeeze(0)
-
-        if shadow_map_t.shape != dem_t.shape:
-            raise ValueError(f"Shadow map shape {tuple(shadow_map_t.shape)} does not match DEM shape {tuple(dem_t.shape)}")
-
-        return shadow_map_t
+        # Crop to original DEM size and apply mask
+        shadow_cropped = shadow_b[:, :, pad[0]:pad[0]+H, pad[1]:pad[1]+W]
+        mask_cropped = mask_back[:, :, pad[0]:pad[0]+H, pad[1]:pad[1]+W]
+        
+        # Combine shadow map with valid pixel mask
+        shadow_map = (shadow_cropped * (mask_cropped > 0.5)).squeeze(0).squeeze(0)
+        
+        return shadow_map.bool()

@@ -12,6 +12,7 @@ import argparse
 import time
 import numpy as np
 import torch
+import subprocess
 
 
 
@@ -175,7 +176,12 @@ def main(argv=None):
     checkpoint_path = os.path.join(run_path, 'checkpoints')
     os.makedirs(checkpoint_path, exist_ok=True)
 
-    print(f"Initialization complete. You can now run the training script using run directory \"{args.run_dir}\".")
+
+    # Run validation plotting commands
+    subprocess.run(["python", "master/validate/plotting_new.py", "--run_dir", args.run_dir])
+    subprocess.run(["python", "master/validate/plotting_new.py", "--run_dir", args.run_dir, "--use_train_set"])
+
+    print(f"Initialization complete, and data visualization done. You can now run the training script using run directory \"{args.run_dir}\".")
 
 
 if __name__ == '__main__':

@@ -79,7 +79,7 @@ def generate_and_return_lro_dem(config: dict = None):
 
     dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
 
-    lat, lon, box_radius = get_lat_lon_radius(config)    
+    lat, lon, box_radius, height_norm = get_lat_lon_radius_height(config)    
     dem_array, metadata = extract_local_dem_subset(
                                                     dem_path=dem_path,
                                                     center_lat_deg=lat,
@@ -96,7 +96,7 @@ def generate_and_return_lro_dem(config: dict = None):
     data_detrended = data_input - np.nanmean(data_input)
     data_detrended = detrend_2d(data_detrended, method='linear')
 
-    # Mask nodata values (< -10000) and find global min/max for consistent colorscale
+    # Mask nodata values (< -10000)
     nodata_threshold = -10000
     masked_data = []
     masked = np.ma.masked_where(data_detrended < nodata_threshold, data_detrended)
@@ -109,8 +109,7 @@ def generate_and_return_lro_dem(config: dict = None):
     dem_resampled = resample_dem_torch(masked.filled(0), desired_pixel_size, device=device)
 
     # normalize heights
-    height_normalisation_pm = config["HEIGHT_NORMALISATION_PM"]
-    dem_normalized = dem_resampled / torch.max(torch.abs(dem_resampled)) * height_normalisation_pm
+    dem_normalized = dem_resampled / torch.max(torch.abs(dem_resampled)) * height_norm
 
     return dem_normalized
 
@@ -132,56 +131,59 @@ def resample_dem_torch(dem_array, desired_pixel_size, device=None):
     # Remove batch and channel dims
     return resampled.squeeze()
     
-def get_lat_lon_radius(config: dict):
+def get_lat_lon_radius_height(config: dict):
     center_lat_deg = config['CENTER_LAT_DEG']
     center_lon_deg = config['CENTER_LON_DEG']
     box_radius_m = config['BOX_RADIUS_M']
     lat_deg_pm = config['CENTER_LAT_DEG_PM']
     lon_deg_pm = config['CENTER_LON_DEG_PM']
     box_radius_m_pm = config['BOX_RADIUS_M_PM']
+    height_normalization = config['HEIGHT_NORMALIZATION']
+    height_normalization_pm = config['HEIGHT_NORMALIZATION_PM']
 
     if config["STOCHASTIC"]:
         center_lat_deg += np.random.uniform(-lat_deg_pm, lat_deg_pm)
         center_lon_deg += np.random.uniform(-lon_deg_pm, lon_deg_pm)
         box_radius_m += np.random.uniform(-box_radius_m_pm, box_radius_m_pm)
+        height_normalization += np.random.uniform(-height_normalization_pm, height_normalization_pm)
 
-    return center_lat_deg, center_lon_deg, box_radius_m
+    return center_lat_deg, center_lon_deg, box_radius_m, height_normalization
     
 
 
-# Alternative version of generate_and_return_lro_dem with resampling
-def generate_and_return_lro_dem_alt(config: dict = None):
+# # Alternative version of generate_and_return_lro_dem with resampling
+# def generate_and_return_lro_dem_alt(config: dict = None):
 
-    dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
+#     dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
 
-    lat, lon, box_radius = get_lat_lon_radius(config)
+#     lat, lon, box_radius, height_normalization = get_lat_lon_radius_height(config)
 
-    dem_array, metadata = extract_local_dem_subset(
-                                                    dem_path=dem_path,
-                                                    center_lat_deg=lat,
-                                                    center_lon_deg=lon,
-                                                    box_radius_m=box_radius,
-                                                    res_m=config['SAMPLE_RES_M'],
-                                                    local_proj_type="stere",
-                                                    verbose=False
-                                                )
+#     dem_array, metadata = extract_local_dem_subset(
+#                                                     dem_path=dem_path,
+#                                                     center_lat_deg=lat,
+#                                                     center_lon_deg=lon,
+#                                                     box_radius_m=box_radius,
+#                                                     res_m=config['SAMPLE_RES_M'],
+#                                                     local_proj_type="stere",
+#                                                     verbose=False
+#                                                 )
     
-    # Resample to desired pixel size
-    if dem_array.shape != config["LRO_DEM_SIZE"]:
-        # Mask nodata before resampling
-        nodata = metadata.get('nodata', -9999)
-        mask = dem_array != nodata
+#     # Resample to desired pixel size
+#     if dem_array.shape != config["LRO_DEM_SIZE"]:
+#         # Mask nodata before resampling
+#         nodata = metadata.get('nodata', -9999)
+#         mask = dem_array != nodata
         
-        # Resample DEM and mask separately
-        dem_resampled = cv2.resize(dem_array, 
-                                   (config["LRO_DEM_SIZE"], config["LRO_DEM_SIZE"]), # (W, H)
-                                   interpolation=cv2.INTER_CUBIC)
-        mask_resampled = cv2.resize(mask.astype(np.uint8), 
-                                    (config["LRO_DEM_SIZE"], config["LRO_DEM_SIZE"]),
-                                    interpolation=cv2.INTER_NEAREST) > 0.5
+#         # Resample DEM and mask separately
+#         dem_resampled = cv2.resize(dem_array, 
+#                                    (config["LRO_DEM_SIZE"], config["LRO_DEM_SIZE"]), # (W, H)
+#                                    interpolation=cv2.INTER_CUBIC)
+#         mask_resampled = cv2.resize(mask.astype(np.uint8), 
+#                                     (config["LRO_DEM_SIZE"], config["LRO_DEM_SIZE"]),
+#                                     interpolation=cv2.INTER_NEAREST) > 0.5
         
-        # Restore nodata values
-        dem_resampled[~mask_resampled] = nodata
-        dem_array = dem_resampled
+#         # Restore nodata values
+#         dem_resampled[~mask_resampled] = nodata
+#         dem_array = dem_resampled
     
-    return dem_array, metadata
+#     return dem_array, metadata

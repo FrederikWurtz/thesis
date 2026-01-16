@@ -102,7 +102,7 @@ if not use_latex:
 def plot_comprehensive_pt(
     run_dir=None,
     n_test_sets=5, figsize=(24, 18), return_fig=False, 
-    save_fig=True, output_name='comprehensive_validation.pdf',
+    save_fig=True,
     same_scale=False, variant='random', use_train_set = False
 ):
 
@@ -122,6 +122,13 @@ def plot_comprehensive_pt(
     checkpoint = load_checkpoint(snapshot_path, map_location='cpu')
     train_data = np.genfromtxt(train_losses_path, delimiter=',', skip_header=1)
     val_data = np.genfromtxt(val_losses_path, delimiter=',', skip_header=1)
+
+    # Handle case where there's only one epoch (1D array instead of 2D)
+    if train_data.ndim == 1:
+        train_data = train_data.reshape(1, -1)
+    if val_data.ndim == 1:
+        val_data = val_data.reshape(1, -1)
+
     train_epochs = train_data[:, 0].astype(int).tolist()
     train_losses = train_data[:, 1].tolist()
     val_epochs = val_data[:, 0].astype(int).tolist()
@@ -130,6 +137,13 @@ def plot_comprehensive_pt(
     if os.path.exists(train_timings_path):
         train_timings_data = np.genfromtxt(train_timings_path, delimiter=',', skip_header=1)
         val_timings_data = np.genfromtxt(val_timings_path, delimiter=',', skip_header=1)
+
+        # Handle case where there's only one epoch (1D array instead of 2D)
+        if train_timings_data.ndim == 1:
+            train_timings_data = train_timings_data.reshape(1, -1)
+        if val_timings_data.ndim == 1:
+            val_timings_data = val_timings_data.reshape(1, -1)
+
         avg_train_time_per_epoch = np.mean(train_timings_data[:, 1])
         avg_val_time_per_epoch = np.mean(val_timings_data[:, 1])
         if os.path.exists(test_results_path):
@@ -437,7 +451,8 @@ def plot_comprehensive_pt(
     cbar_dem = plt.colorbar(last_pred_im, cax=cbar_dem_ax)
     cbar_dem.ax.tick_params(labelsize=10)
     
-    
+    output_name = "comprehensive_validation_test.pdf" if not use_train_set else "comprehensive_validation_train.pdf"
+
     # Save?
     if save_fig:
         figures_dir = os.path.join(sup_dir, run_dir, 'figures')
@@ -446,6 +461,179 @@ def plot_comprehensive_pt(
         fig.savefig(output_path, format='pdf', bbox_inches='tight', dpi=150)
         print(f"Figure saved to: {output_path}")
     
+    if return_fig:
+        return fig
+
+
+def plot_data_pt(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False, same_scale=False, variant='random', use_train_set = False):
+    """
+    Plot DEMs and images from .pt files (PyTorch format).
+    Similar to plot_data but works with .pt files instead of .npz files.
+    """
+
+    # Ensure figures directory exists
+    figures_dir = os.path.join(run_dir, 'figures')
+    os.makedirs(figures_dir, exist_ok=True)
+
+    test_dems_dir = os.path.join(run_dir, 'test')
+    test_files = None
+
+    print(f"Use train set: {use_train_set}")
+    if not use_train_set:
+        test_files = None
+        if os.path.isdir(test_dems_dir):
+            # Look for .pt files in the test_dems folder
+            candidate_files = sorted(glob.glob(os.path.join(test_dems_dir, '*.pt')))
+            if len(candidate_files) > 0:
+                test_files = candidate_files
+                print(f"Using {len(test_files)} test files from: {test_dems_dir}")
+            else:
+                print(f"Found '{test_dems_dir}' but no .pt files were present.")
+                raise FileNotFoundError(f"No .pt files found in {test_dems_dir}")
+        else:
+            raise FileNotFoundError(f"No test directory found at '{test_dems_dir}'")
+
+        test_dataset = DEMDataset(test_files)
+    
+    if use_train_set:
+        print("Using training set for plotting instead of test set.")
+        config = load_config_file(os.path.join(run_dir, 'stats', 'config.ini'))
+
+        train_set = FluidDEMDataset(config)
+        test_dataset = train_set
+    
+    # Select test sets based on variant
+    print(f"Selecting {n_sets} test sets using variant: {variant}")
+    available_indices = list(range(len(test_dataset)))
+    
+    if variant == 'first':
+        selected_indices = list(range(min(n_sets, len(test_dataset))))
+    elif variant == 'random':
+        selected_indices = sorted(random.sample(available_indices, min(n_sets, len(test_dataset))))
+        print("Selected test set indices:", selected_indices)
+    else:
+        raise ValueError(f"Unknown variant: {variant}. Use 'first' or 'random'.")
+    
+    # Load all data and find global min/max
+    all_dems = []
+    all_images = []
+    
+    for idx in selected_indices:
+        images, reflectance_maps, target, meta = test_dataset[idx]
+        dem = target.squeeze().numpy()
+        all_dems.append(dem)
+        for img_idx in range(n_images):
+            img = images[img_idx].numpy()
+            all_images.append(img)
+    
+    all_dems = np.array(all_dems)
+    all_images = np.array(all_images)
+    
+    # Find global min/max for DEMs and images
+    dem_vmin = np.min(all_dems)
+    dem_vmax = np.max(all_dems)
+    img_vmin = np.min(all_images)
+    img_vmax = np.max(all_images)
+
+    # Create figure with manual positioning for precise control
+    fig = plt.figure(figsize=(3.2*(n_images+1), 2.5*n_sets))
+    
+    # Layout parameters
+    row_height = 0.85 / n_sets  # Total height available divided by rows
+    row_spacing = 0.005  # Small gap between rows
+    
+    # Column widths and positions
+    dem_width = 0.13  # Width for DEM column
+    dem_x = 0.08  # Left position for DEM
+    
+    img_width = 0.11  # Width for each image
+    img_x_start = dem_x + dem_width + 0.03  # Start after DEM with larger gap
+    img_gap = 0.002  # Tiny gap between images
+    
+    # Starting y position (from top)
+    start_y = 0.92
+    
+    # Store the last DEM image object for colorbar
+    last_dem_im = None
+    
+    for i, test_idx in enumerate(selected_indices):
+        # Load data
+        images, reflectance_maps, target, meta = test_dataset[test_idx]
+        dem = target.squeeze().numpy()
+        dem_num = test_idx
+        images = np.array([images[j].numpy() for j in range(n_images)])
+        
+        # Calculate per-row min/max if same_scale='row'
+        if same_scale == 'row':
+            row_img_min = images.min()
+            row_img_max = images.max()
+        
+        # Calculate y position for this row
+        y_pos = start_y - i * (row_height + row_spacing)
+        
+        # Column 0: DEM (without individual colorbar)
+        ax_dem = fig.add_axes([dem_x, y_pos - row_height, dem_width, row_height])
+        im_dem = ax_dem.imshow(dem, cmap='terrain', vmin=dem_vmin, vmax=dem_vmax, origin='lower')
+        
+        # Store the image object for the colorbar
+        last_dem_im = im_dem
+        
+        # Remove ticks and tick labels
+        ax_dem.set_xticks([])
+        ax_dem.set_yticks([])
+        
+        # Title only on first row
+        if i == 0:
+            title_str = 'DEM'
+            ax_dem.set_title(title_str, fontsize=13, pad=5)
+        
+        # Y-label showing DEM number
+        if dem_num is not None:
+            ax_dem.set_ylabel(f'DEM {dem_num}', fontsize=12, rotation=90, labelpad=5)
+        
+        # Columns 1-5: Images with different scaling options
+        for j in range(n_images):
+            img_x = img_x_start + j * (img_width + img_gap)
+            ax_img = fig.add_axes([img_x, y_pos - row_height, img_width, row_height])
+            
+            if same_scale == 'all':
+                # Use same scale for all images across all rows
+                ax_img.imshow(images[j], cmap='gray', vmin=img_vmin, vmax=img_vmax, origin='lower')
+            elif same_scale == 'row':
+                # Use same scale for all images in this row
+                ax_img.imshow(images[j], cmap='gray', vmin=row_img_min, vmax=row_img_max, origin='lower')
+            else:  # same_scale=False
+                # Use individual scale for each image
+                ax_img.imshow(images[j], cmap='gray', origin='lower')
+            
+            # Remove ticks and tick labels
+            ax_img.set_xticks([])
+            ax_img.set_yticks([])
+            
+            # Title only on first row
+            if i == 0:
+                ax_img.set_title(f'Image {j+1}', fontsize=13, pad=5)
+    
+    # Add one tall colorbar spanning all rows, close to the DEMs
+    # Calculate the total height of all DEM plots
+    total_height = n_sets * row_height + (n_sets - 1) * row_spacing
+    bottom_y = start_y - total_height
+    
+    # Create a dummy axis for the colorbar (reduced width from 0.015 to 0.01)
+    cbar_ax = fig.add_axes([dem_x + dem_width - 0.006, bottom_y, 0.008, total_height])
+    cbar = plt.colorbar(last_dem_im, cax=cbar_ax)
+    cbar.ax.tick_params(labelsize=8)
+    
+    output_name = "data_summary_test.pdf" if not use_train_set else "data_summary_train.pdf"
+
+    # Save or show
+    if save_fig:
+        figures_dir = os.path.join(run_dir, 'figures')
+        os.makedirs(figures_dir, exist_ok=True)
+        output_path = os.path.join(figures_dir, output_name)
+        fig.savefig(output_path, format='pdf', bbox_inches='tight', dpi=150)
+        print(f"Figure saved to: {output_path}")
+
     if return_fig:
         return fig
 
@@ -601,190 +789,6 @@ def plot_data(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
     if return_fig:
         return fig
 
-def plot_data_pt(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
-                   fig_path='data_grid.pdf', variant='random', 
-                   same_scale=False, output_name='data_grid.pdf', use_train_set=False):
-    """
-    Plot DEMs and images from .pt files (PyTorch format).
-    Similar to plot_data but works with .pt files instead of .npz files.
-    """
-
-    #ensure figures directory exists
-    figures_dir = os.path.join(run_dir, 'figures')
-    os.makedirs(figures_dir, exist_ok=True)
-
-    test_dems_dir = os.path.join(run_dir, 'test')
-    test_files = None
-    test_dems_dir = os.path.join(sup_dir, run_dir, 'test')
-
-    print(f"Use train set: {use_train_set}")
-    if not use_train_set:
-        test_files = None
-        if os.path.isdir(test_dems_dir):
-            # Look for .pt files in the test_dems folder
-            candidate_files = sorted(glob.glob(os.path.join(test_dems_dir, '*.pt')))
-            if len(candidate_files) > 0:
-                test_files = candidate_files
-                print(f"Using {len(test_files)} test files from: {test_dems_dir}")
-            else:
-                print(f"Found '{test_dems_dir}' but no .pt files were present. Falling back to history['test_files'].")
-        else:
-            raise FileNotFoundError(f"No test directory found at '{test_dems_dir}'")
-
-        test_dataset = DEMDataset(test_files)
-    
-    if use_train_set:
-        print("Using training set for plotting instead of test set.")
-        run_path = os.path.join(sup_dir, run_dir)
-
-        train_set = FluidDEMDataset(config)
-        train_loader = DataLoader(
-            train_set,
-            batch_size=config["BATCH_SIZE"],
-            shuffle=False,
-            num_workers=config["NUM_WORKERS_DATALOADER"],
-            pin_memory=True,
-            prefetch_factor=config["PREFETCH_FACTOR"]
-        )
-        test_dataset = train_set
-    
-    # Select test sets based on variant
-    print(f"Selecting {n_test_sets} test sets using variant: {variant}")
-    available_indices = list(range(len(test_dataset)))
-    
-    if variant == 'first':
-        # Use the first n_test_sets from the test pool
-        selected_indices = list(range(min(n_test_sets, len(test_dataset))))
-    elif variant == 'random':
-        # Randomly sample n_test_sets and sort them by index
-        selected_indices = sorted(random.sample(available_indices, min(n_test_sets, len(test_dataset))))
-        print("Selected test set indices:", selected_indices)
-    else:
-        raise ValueError(f"Unknown variant: {variant}. Use 'first' or 'random'.")
-    
-    # find dataset number from and use to sort files
-    for i in range(len(files)):
-        files[i] = (extract_dataset_number(os.path.basename(files[i])), files[i])
-    files = sorted(files, key=lambda x: x[0])
-    files = [f[1] for f in files]
-
-    # Find global min/max for all DEMs and images
-    all_dems = []
-    all_images = []
-    for f in files:
-        d = torch.load(f, map_location='cpu')
-        # Convert tensors to numpy arrays
-        dem = d['dem'].numpy() if torch.is_tensor(d['dem']) else d['dem']
-        data = d['data'].numpy() if torch.is_tensor(d['data']) else d['data']
-        all_dems.append(dem)
-        all_images.append(data)
-    all_dems = np.stack(all_dems, axis=0)
-    all_images = np.concatenate(all_images, axis=0)
-    dem_vmin = np.min(all_dems)
-    dem_vmax = np.max(all_dems)
-    img_vmin = np.min(all_images)
-    img_vmax = np.max(all_images)
-
-    # Create figure with manual positioning for precise control
-    fig = plt.figure(figsize=(3.2*(n_images+1), 2.5*n_sets))
-    
-    # Layout parameters
-    row_height = 0.85 / n_sets  # Total height available divided by rows
-    row_spacing = 0.005  # Small gap between rows
-    
-    # Column widths and positions
-    dem_width = 0.13  # Width for DEM column
-    dem_x = 0.08  # Left position for DEM
-    
-    img_width = 0.11  # Width for each image
-    img_x_start = dem_x + dem_width + 0.03  # Start after DEM with larger gap
-    img_gap = 0.002  # Tiny gap between images
-    
-    # Starting y position (from top)
-    start_y = 0.92
-    
-    # Store the last DEM image object for colorbar
-    last_dem_im = None
-    
-    for i, f in enumerate(files):
-        d = torch.load(f, map_location='cpu')
-        # Convert tensors to numpy arrays
-        dem = d['dem'].numpy() if torch.is_tensor(d['dem']) else d['dem']
-        images = d['data'].numpy() if torch.is_tensor(d['data']) else d['data']
-        dem_num = extract_dataset_number(os.path.basename(f))
-        
-        # Calculate per-row min/max if same_scale='row'
-        if same_scale == 'row':
-            row_img_min = images.min()
-            row_img_max = images.max()
-        
-        # Calculate y position for this row
-        y_pos = start_y - i * (row_height + row_spacing)
-        
-        # Column 0: DEM (without individual colorbar)
-        ax_dem = fig.add_axes([dem_x, y_pos - row_height, dem_width, row_height])
-        im_dem = ax_dem.imshow(dem, cmap='terrain', vmin=dem_vmin, vmax=dem_vmax, origin='lower')
-        
-        # Store the image object for the colorbar
-        last_dem_im = im_dem
-        
-        # Remove ticks and tick labels
-        ax_dem.set_xticks([])
-        ax_dem.set_yticks([])
-        
-        # Title only on first row
-        if i == 0:
-            title_str = 'DEM'
-            ax_dem.set_title(title_str, fontsize=13, pad=5)
-        
-        # Y-label showing DEM number
-        if dem_num is not None:
-            ax_dem.set_ylabel(f'DEM {dem_num}', fontsize=12, rotation=90, labelpad=5)
-        
-        # Columns 1-5: Images with different scaling options
-        for j in range(n_images):
-            img_x = img_x_start + j * (img_width + img_gap)
-            ax_img = fig.add_axes([img_x, y_pos - row_height, img_width, row_height])
-            
-            if same_scale == 'all':
-                # Use same scale for all images across all rows
-                ax_img.imshow(images[j], cmap='gray', vmin=img_vmin, vmax=img_vmax, origin='lower')
-            elif same_scale == 'row':
-                # Use same scale for all images in this row
-                ax_img.imshow(images[j], cmap='gray', vmin=row_img_min, vmax=row_img_max, origin='lower')
-            else:  # same_scale=False
-                # Use individual scale for each image
-                ax_img.imshow(images[j], cmap='gray', origin='lower')
-            
-            # Remove ticks and tick labels
-            ax_img.set_xticks([])
-            ax_img.set_yticks([])
-            
-            # Title only on first row
-            if i == 0:
-                ax_img.set_title(f'Image {j+1}', fontsize=13, pad=5)
-    
-    # Add one tall colorbar spanning all rows, close to the DEMs
-    # Calculate the total height of all DEM plots
-    total_height = n_sets * row_height + (n_sets - 1) * row_spacing
-    bottom_y = start_y - total_height
-    
-    # Create a dummy axis for the colorbar (reduced width from 0.015 to 0.01)
-    cbar_ax = fig.add_axes([dem_x + dem_width - 0.006, bottom_y, 0.008, total_height])
-    cbar = plt.colorbar(last_dem_im, cax=cbar_ax)
-    cbar.ax.tick_params(labelsize=8)
-    
-    # Save or show
-    if save_fig:
-        figures_dir = os.path.join(run_dir, 'figures')
-        os.makedirs(figures_dir, exist_ok=True)
-        output_path = os.path.join(figures_dir, output_name)
-        fig.savefig(output_path, format='pdf', bbox_inches='tight', dpi=150)
-        print(f"Figure saved to: {output_path}")
-
-    if return_fig:
-        return fig
-
 
 def extract_dataset_number(filename):
     """Extract dataset number from filename."""
@@ -816,7 +820,6 @@ if __name__ == "__main__":
                         variant=args.variant,  # 'first' or 'random'
                         same_scale=False,  # False, 'row', or 'all'
                         save_fig=True,
-                        output_name='data_summary.pdf',
                         return_fig=False,
                         use_train_set = args.use_train_set)
     else:
@@ -827,7 +830,6 @@ if __name__ == "__main__":
                             same_scale=False,  # False, 'row', or 'all'
                             figsize=(15, 10),
                             save_fig=True,
-                            output_name='predictions_summary.pdf',
                             return_fig=False,
                             use_train_set = args.use_train_set
                             )
