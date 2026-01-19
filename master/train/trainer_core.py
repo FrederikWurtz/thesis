@@ -125,22 +125,34 @@ class FluidDEMDataset(Dataset):
     - __len__ returns n_dems
     - __getitem__ returns (images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor)
     """
-    def __init__(self, config=None):
+    def __init__(self, config=None, epoch_shared=None):
         # NOTE: store simple kwargs/dicts only so the Dataset is picklable by DataLoader workers
         self.config = config
-        self.epoch = 0
+        self.epoch_shared = epoch_shared if epoch_shared is not None else 0
         self.base_seed = config["BASE_SEED"] if "BASE_SEED" in config else 42
 
     def set_epoch(self, epoch):
         """Set epoch for deterministic data generation."""
-        self.epoch = epoch
+
+        # print(f"FluidDEMDataset: Old epoch: {self.epoch_shared.value}")
+        self.epoch_shared.value = epoch
+        # print(f"FluidDEMDataset: New epoch set to {self.epoch_shared.value} in shared memory.")
+        # self.epoch = epoch
+        # print(f"FluidDEMDataset: New epoch {self.epoch}")
 
     def __len__(self):
         return self.config["FLUID_TRAIN_DEMS"]
 
     def __getitem__(self, idx):
         # Set seed for reproducibility
-        epoch_seed = self.base_seed + self.epoch * len(self) + idx
+        
+        current_epoch = self.epoch_shared.value if hasattr(self.epoch_shared, 'value') else self.epoch_shared
+        epoch_seed = self.base_seed + current_epoch * len(self) + idx
+
+        # if idx == 0:
+        #     print(f"FluidDEMDataset: Generating item idx {idx} for epoch {self.epoch_shared.value if hasattr(self.epoch_shared, 'value') else self.epoch_shared}, with seed {epoch_seed}")
+        
+
         torch.manual_seed(epoch_seed)
         np.random.seed(epoch_seed % (2**32 - 1))
 

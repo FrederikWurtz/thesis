@@ -41,7 +41,7 @@ def ddp_setup():
         init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
         # 🔥 Enable cuDNN autotuner for convolution optimization
         torch.backends.cudnn.benchmark = True
-        
+        print(f"DDP setup complete on GPU {local_rank}")
         # Optional: Enable TF32 for Ampere GPUs (A100, RTX 3090, etc.)
         if torch.cuda.get_device_capability()[0] >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -171,7 +171,7 @@ class Trainer:
             print(f"Resuming model from snapshot at Epoch {self.epochs_run}")
         self.model.train()  # Set back to training mode
 
-    def _run_epoch(self, epoch):
+    def _run_epoch(self, epoch, return_val=False):
         t0 = time.time()
         if is_main():
             print("Running epoch {}".format(epoch))
@@ -189,9 +189,8 @@ class Trainer:
         # Set epoch for distributed sampler and dataset randomness, for reproducibility
         self.train_data.sampler.set_epoch(epoch)
 
-            # If your dataset has on-the-fly generation, set its random seed based on epoch
-        if hasattr(self.train_data.dataset, 'set_epoch'):
-            self.train_data.dataset.set_epoch(epoch)
+        # Also set epoch in dataset to ensure deterministic data generation
+        self.train_data.dataset.set_epoch(epoch)
 
         for batch_idx, (images, reflectance_maps, targets, metas) in enumerate(self.train_data):
             if use_profiler and is_main():
@@ -243,6 +242,9 @@ class Trainer:
             total_time = time.time() - t0
             self.train_timings.append(total_time)
             print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {global_avg_loss:.2e} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s")
+
+        if return_val:
+            return global_avg_loss
 
     def _run_batch(self, source, targets, return_tensors: bool = False):
         self.optimizer.zero_grad()
@@ -396,13 +398,16 @@ class Trainer:
         return global_avg_val_loss
 
     @torch.no_grad()
-    def test(self):
+    def test(self, data_loader: DataLoader = None):
         """Run testing and return average loss and AME"""
         if self.test_data is None:
             if is_main():
                 print("No test data provided. Skipping testing.")
             return None, None
-            
+        
+        # Allow custom data loader for testing
+        data_loader = self.test_data if data_loader is None else data_loader
+
         t0 = time.time()
         epoch = self.epochs_run
         if is_main():
@@ -413,7 +418,7 @@ class Trainer:
         total_ame = 0.0
         total_samples = 0
         
-        for images, reflectance_maps, targets, metas in self.test_data:
+        for images, reflectance_maps, targets, metas in data_loader:
             images = images.to(self.gpu_id)
             metas = metas.to(self.gpu_id)
             reflectance_maps = reflectance_maps.to(self.gpu_id)
@@ -472,8 +477,8 @@ class Trainer:
         self.model.train()  # Set back to training mode
         return global_test_loss, global_ame
 
-def load_train_objs(config, run_path: str):
-    train_set = FluidDEMDataset(config) # load your dataset
+def load_train_objs(config, run_path: str, epoch_shared=None):
+    train_set = FluidDEMDataset(config, epoch_shared=epoch_shared) # load your dataset
     val_path = os.path.join(run_path, 'val') # load validation dataset
     val_files = list_pt_files(val_path)
     val_set = DEMDataset(val_files)
@@ -483,16 +488,27 @@ def load_train_objs(config, run_path: str):
     optimizer = torch.optim.Adam(model.parameters(), lr=config["LR"], weight_decay=config["WEIGHT_DECAY"])
     return train_set, val_set, test_set, model, optimizer
 
-def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, prefetch_factor: int = 4) -> DataLoader:
-    rank = int(os.environ["LOCAL_RANK"])
+def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, prefetch_factor: int = 4, use_shuffle: bool = False, persistent_workers: bool = True) -> DataLoader:
+    rank = int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else 0
     return DataLoader(
         dataset,
         batch_size=batch_size,
         pin_memory=True,
-        shuffle=False,
+        shuffle=use_shuffle,
         sampler=DistributedSampler(dataset),
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
-        persistent_workers=True,  # 🔥 Keep workers alive between epochs
-        pin_memory_device=f'cuda:{rank}'  # 🔥 Pin directly to target GPU
+        persistent_workers=persistent_workers,  # 🔥 Keep workers alive between epochs
+        pin_memory_device=f'cuda:{rank}',  # 🔥 Pin directly to target GPU
     )
+
+        # worker_init_fn=worker_init_fn  # 🔥 Set epoch in workers for reproducibility
+def set_global_epoch(epoch):
+    global GLOBAL_EPOCH
+    GLOBAL_EPOCH = epoch
+
+def worker_init_fn(worker_id):
+    # Each worker sets the epoch in its dataset
+    worker_info = torch.utils.data.get_worker_info()
+    dataset = worker_info.dataset
+    dataset.set_epoch(GLOBAL_EPOCH)

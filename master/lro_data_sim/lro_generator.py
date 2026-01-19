@@ -113,7 +113,6 @@ def generate_and_return_lro_dem(config: dict = None):
 
     return dem_normalized
 
-
 def resample_dem_torch(dem_array, desired_pixel_size, device=None):
     """
     Resample using PyTorch (can use GPU).
@@ -146,6 +145,26 @@ def get_lat_lon_radius_height(config: dict):
         center_lon_deg += np.random.uniform(-lon_deg_pm, lon_deg_pm)
         box_radius_m += np.random.uniform(-box_radius_m_pm, box_radius_m_pm)
         height_normalization += np.random.uniform(-height_normalization_pm, height_normalization_pm)
+
+
+    # csv_path = os.path.join("master", "lro_data_sim", "lro_metadata.csv")
+    # os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    # # Read existing values if file exists, else start with empty list
+    # rows = []
+    # if os.path.isfile(csv_path):
+    #     with open(csv_path, 'r') as f:
+    #         for line in f:
+    #             line = line.strip()
+    #             if line:
+    #                 rows.append(line)
+    # # Add latest values
+    # new_row = f"{center_lat_deg},{center_lon_deg},{box_radius_m},{height_normalization}"
+    # rows.append(new_row)
+    # # Save all rows back to file
+    # with open(csv_path, 'w') as f:
+    #     for row in rows:
+    #         f.write(row + "\n")
 
     return center_lat_deg, center_lon_deg, box_radius_m, height_normalization
     

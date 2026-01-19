@@ -1,9 +1,14 @@
 import json
+import multiprocessing
 import os
 # 🔥 Must be set BEFORE importing torch
 os.environ['TORCH_LOGS'] = '-all'  # Suppress all torch logging warnings
 import sys
 import warnings
+# 🔥 Suppress torch.compile() warnings - MUST BE BEFORE torch.multiprocessing.set_start_method
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._logging')
+warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.*')
 
 import torch
 import torch.nn.functional as F
@@ -20,10 +25,6 @@ from torch.distributed import destroy_process_group
 from master.train.trainer_new import Trainer, ddp_setup, load_train_objs, prepare_dataloader, is_main
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 
-# 🔥 Suppress torch.compile() warnings - MUST BE BEFORE torch.multiprocessing.set_start_method
-warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
-warnings.filterwarnings('ignore', category=UserWarning, module='torch._logging')
-warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.*')
 
 from master.configs.config_utils import load_config_file
 from master.models.unet import UNet
@@ -31,11 +32,9 @@ torch.multiprocessing.set_start_method('spawn', force=True)
 
 def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     t0_main = time.time()
-
+    
     ddp_setup()
 
-    os.environ['OMP_NUM_THREADS'] = '2'  # Set number of OpenMP threads
-    
     sup_dir = "./runs"
     run_path = os.path.join(sup_dir, run_dir)
     if not os.path.exists(run_path):
@@ -73,15 +72,29 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     train_mean = torch.tensor([float(input_stats['MEAN'][i]) for i in range(len(input_stats['MEAN']))])
     train_std = torch.tensor([float(input_stats['STD'][i]) for i in range(len(input_stats['STD']))])
 
-    train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path)
+    EPOCH_SHARED = multiprocessing.Value('i', 0)  # 'i' means integer
+
+    train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path, epoch_shared=EPOCH_SHARED)
+
+    # train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
+    #                                   num_workers=0, 
+    #                                   prefetch_factor=None,
+    #                                   use_shuffle=False,
+    #                                   persistent_workers=False)
+
+    
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
                                       num_workers=config["NUM_WORKERS_DATALOADER"], 
-                                      prefetch_factor=config["PREFETCH_FACTOR"])
+                                      prefetch_factor=config["PREFETCH_FACTOR"],
+                                      use_shuffle=False)
+                                      
+    
     val_loader = prepare_dataloader(val_set, config["BATCH_SIZE"], 
                                     num_workers=config["NUM_WORKERS_DATALOADER"], 
-                                    prefetch_factor=config["PREFETCH_FACTOR"])
+                                    prefetch_factor=config["PREFETCH_FACTOR"],
+                                    use_shuffle=False)
     
-    trainer = Trainer(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader)
+    trainer = Trainer(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader)
 
     if is_main():
         number_of_gpus = torch.cuda.device_count()

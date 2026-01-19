@@ -1,12 +1,5 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "2"
-# 🔥 Must be set BEFORE importing torch
-os.environ['TORCH_LOGS'] = '-all'  # Suppress all torch logging warnings
-import warnings
-# 🔥 Suppress torch.compile() warnings - MUST BE BEFORE torch.multiprocessing.set_start_method
-warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
-warnings.filterwarnings('ignore', category=UserWarning, module='torch._logging')
-warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.*')
 
 import torch
 import torch.nn.functional as F
@@ -47,6 +40,11 @@ def main(run_dir: str):
     train_std = torch.tensor([float(input_stats['STD'][i]) for i in range(len(input_stats['STD']))])
 
     train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path)
+
+    # Prepare data loaders
+    # Create a global epoch counter, to help with reproducibility across dataloader workers - issue arrises when using num_workers>0
+    GLOBAL_EPOCH = 0
+
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
                                       num_workers=config["NUM_WORKERS_DATALOADER"], 
                                       prefetch_factor=config["PREFETCH_FACTOR"])
@@ -59,16 +57,30 @@ def main(run_dir: str):
     
     trainer = Trainer(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader, test_loader)
 
-    if is_main():
-        print("Starting testing...")
-    global_test_loss, global_ame = trainer.test()
+    # if is_main():
+    #     print("Starting testing...")
+    # # Actal test dataset is passed here
+    # global_test_loss, global_ame = trainer.test()
+    # # New addition: also evaluate on training data, using same test function
+    # global_train_loss, global_train_ame = trainer.test(data_loader=train_loader)
+    # Also evaluate on train data using train_function
+
+    # To access the current epoch value, use the variable 'epoch' directly:
+    # print(f"trainer.train_data.epoch: {trainer.train_data.dataset.epoch}")
+    epoch = 100  # arbitrary epoch number for logging
+    train_loss_via_train = trainer._run_epoch(epoch=epoch, return_val=True)
+    print(f"trainer.train_data.epoch: {trainer.train_data.dataset.epoch}")
     
-    if is_main():
-        test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
-        save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_AME': float(global_ame)}, test_loss_dir)
-        print(f"Test Loss: {global_test_loss:.2e}, Test AME: {global_ame:.6f}")
-        print("Test results saved.")
-        print("Cleaning up...")
+
+    # # print values nicely
+    # if is_main():
+    #     print(f"Train Loss via test(): {global_train_loss:.2e}, Train AME via test(): {global_train_ame:.6f}")
+    #     print(f"Train Loss via train(): {train_loss_via_train:.2e}, at epoch {epoch}")
+    #     print(f"Test Loss: {global_test_loss:.2e}, Test AME: {global_ame:.6f}")
+
+
+
+
 
     destroy_process_group()
 
