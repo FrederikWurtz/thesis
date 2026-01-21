@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader
 import os
 import shutil
 import argparse
-import time
 import numpy as np
 import torch
 import subprocess
@@ -18,30 +17,51 @@ import subprocess
 
 def _parse_args(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument('--run_dir', type=str, required=True)
-    p.add_argument('--new_run', action='store_true', default=False)
-    p.add_argument('--skip_data_gen', action='store_true', default=False)
-    p.add_argument('--use_LRO_dems', type=bool, default=None)
-    p.add_argument('--epochs', type=int, default=None)
-    p.add_argument('--num_workers', type=int, default=None)
-    p.add_argument('--lr_patience', type=int, default=None)
-    p.add_argument('--lr', type=float, default=None)
-    p.add_argument('--batch_size', type=int, default=None)
-    p.add_argument('--w_mse', type=float, default=None)
-    p.add_argument('--w_grad', type=float, default=None)
-    p.add_argument('--w_refl', type=float, default=None)
-    p.add_argument('--fluid_train_dems', type=int, default=None)
-    p.add_argument('--fluid_val_dems', type=int, default=None)
-    p.add_argument('--fluid_test_dems', type=int, default=None)
-    p.add_argument('--images_per_dem', type=int, default=None)
+    p.add_argument('run_dir', nargs="?", type=str,
+                   help='Name of the run directory to use or create.')
+    p.add_argument('--run_dir', type=str, dest='run_dir_flag', required=False,
+                   help='(Optional) Name of the run directory to use or create (overrides positional argument).')
+    p.add_argument('--new_run', action='store_true', default=False,
+                   help='If set, creates a new run directory (removes existing if present).')
+    p.add_argument('--skip_data_gen', action='store_true', default=False,
+                   help='If set, skips data generation (useful for continuing runs).')
+    p.add_argument('--use_LRO_dems', type=bool, default=None,
+                   help='Whether to use LRO DEMs for data generation (overrides config).')
+    p.add_argument('--epochs', type=int, default=None,
+                   help='Number of training epochs (overrides config).')
+    p.add_argument('--num_workers', type=int, default=None,
+                   help='Number of worker processes for data loading (overrides config).')
+    p.add_argument('--lr_patience', type=int, default=None,
+                   help='Number of epochs with no improvement after which learning rate will be reduced (overrides config).')
+    p.add_argument('--lr', type=float, default=None,
+                   help='Initial learning rate (overrides config).')
+    p.add_argument('--batch_size', type=int, default=None,
+                   help='Batch size for training and validation (overrides config).')
+    p.add_argument('--w_mse', type=float, default=None,
+                   help='Weight for MSE loss component (overrides config).')
+    p.add_argument('--w_grad', type=float, default=None,
+                   help='Weight for gradient loss component (overrides config).')
+    p.add_argument('--w_refl', type=float, default=None,
+                   help='Weight for reflectance loss component (overrides config).')
+    p.add_argument('--fluid_train_dems', type=int, default=None,
+                   help='Number of DEMs to use for training set (overrides config).')
+    p.add_argument('--fluid_val_dems', type=int, default=None,
+                   help='Number of DEMs to use for validation set (overrides config).')
+    p.add_argument('--fluid_test_dems', type=int, default=None,
+                   help='Number of DEMs to use for test set (overrides config).')
+    p.add_argument('--images_per_dem', type=int, default=None,
+                   help='Number of images to generate per DEM (overrides config).')
+    
+    # Support both positional and flag-based arguments
     return p.parse_args(argv)
 
 def main(argv=None):
     args = _parse_args(argv)
+    run_dir = args.run_dir_flag or args.run_dir
     config = load_config_file() # load default config
-    config["RUN_DIR"] = args.run_dir
+    config["RUN_DIR"] = run_dir
     # Determine run directory, and parse new/skip_data_gen flags
-    run_path = os.path.join(config["SUP_DIR"], args.run_dir)
+    run_path = os.path.join(config["SUP_DIR"], run_dir)
 
     if os.path.exists(run_path) and not os.path.exists(os.path.join(run_path, 'stats')):
         # Existing run directory found, but no stats subdir
@@ -185,5 +205,6 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+
     main(argv=None)
 

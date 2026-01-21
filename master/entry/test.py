@@ -1,31 +1,23 @@
 import os
-os.environ["OMP_NUM_THREADS"] = "2"
-# 🔥 Must be set BEFORE importing torch
-os.environ['TORCH_LOGS'] = '-all'  # Suppress all torch logging warnings
 import warnings
+import argparse
+
+
+# 🔥 Must be set BEFORE importing torch
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ['TORCH_LOGS'] = '-all'  # Suppress all torch logging warnings
+import torch
+
 # 🔥 Suppress torch.compile() warnings - MUST BE BEFORE torch.multiprocessing.set_start_method
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._logging')
 warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.*')
 
-import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import torch.optim as optim
-from master.train.trainer_core import FluidDEMDataset, DEMDataset
-import time
-import argparse
-
-import torch.multiprocessing as mp
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import destroy_process_group
 from master.train.trainer_new import Trainer, ddp_setup, load_train_objs, prepare_dataloader, is_main
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
-
-
 from master.configs.config_utils import load_config_file
-from master.models.unet import UNet
+
 torch.multiprocessing.set_start_method('spawn', force=True)
 
 def main(run_dir: str):
@@ -75,7 +67,13 @@ def main(run_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--run_dir', type=str, required=True)
+    parser.add_argument('run_dir', nargs="?", type=str,
+                        help='Directory of the trained model run containing stats and checkpoints.')
+    parser.add_argument('--run_dir', type=str, dest='run_dir_flag', required=False,
+                        help='Directory of the trained model run containing stats and checkpoints.')
     args = parser.parse_args()
 
-    main(args.run_dir)
+    # Support both positional and flag-based arguments
+    run_dir = args.run_dir_flag or args.run_dir
+
+    main(run_dir)
