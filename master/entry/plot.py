@@ -7,18 +7,29 @@ from master.train.checkpoints import read_file_from_ini
 from master.validate.plotting_new import plot_comprehensive_pt, plot_data_pt
 
 def run_test(run_dir):
-    n_proc_per_node = torch.cuda.device_count()
-    print(f"No test results found - running test with {n_proc_per_node} GPUs before plotting...")
-    cmd = [
-        "torchrun",
-        f"--nproc_per_node={n_proc_per_node}",
-        "--standalone",
-        "master/entry/test.py",
-        "--run_dir", run_dir
-    ]
-    env = os.environ.copy()
-    env["OMP_NUM_THREADS"] = "2"
-    subprocess.run(cmd, env=env, check=True)
+    # Check if we have CUDA available
+    if torch.cuda.is_available():
+        n_proc_per_node = torch.cuda.device_count()
+        print(f"No test results found - running test with {n_proc_per_node} GPUs before plotting...")
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={n_proc_per_node}",
+            "--standalone",
+            "master/entry/test.py",
+            "--run_dir", run_dir
+        ]
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = "2"
+        subprocess.run(cmd, env=env, check=True)
+    else:
+        print("No GPUs available - running test with python call before plotting...")
+        cmd = [
+            "python",
+            "master/entry/test.py",
+            "--run_dir", run_dir
+        ]
+        env = os.environ.copy()
+        subprocess.run(cmd, env=env, check=True)
 
 
 

@@ -1,10 +1,14 @@
 import os
 import warnings
 import argparse
+import numpy as np
+
+from master.data_sim.dataset_io import list_pt_files
+from master.data_sim.generator import generate_and_save_data_pooled_multi_gpu
+from master.legacy_files.trainer_core_multi_gpu import DEMDataset
 
 
 # 🔥 Must be set BEFORE importing torch
-os.environ["OMP_NUM_THREADS"] = "2"
 os.environ['TORCH_LOGS'] = '-all'  # Suppress all torch logging warnings
 import torch
 
@@ -14,7 +18,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='torch._logging')
 warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.*')
 
 from torch.distributed import destroy_process_group
-from master.train.trainer_new import Trainer, ddp_setup, load_train_objs, prepare_dataloader, is_main
+from master.train.trainer_new import Trainer_multiGPU, Trainer_singleGPU, ddp_setup, load_train_objs, prepare_dataloader, is_main
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 from master.configs.config_utils import load_config_file
 
@@ -22,8 +26,14 @@ torch.multiprocessing.set_start_method('spawn', force=True)
 
 def main(run_dir: str):
 
-    ddp_setup()
-    
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        if is_main():
+            print("Multiple GPUs and CUDA hardware detected - setting up multi-GPU testing...")
+        use_multiGPU = True
+        ddp_setup()
+    else:
+        use_multiGPU = False
+
     sup_dir = "./runs"
     run_path = os.path.join(sup_dir, run_dir)
     if not os.path.exists(run_path):
@@ -32,6 +42,7 @@ def main(run_dir: str):
     config_path = os.path.join(run_path, 'stats', 'config.ini')
     config = load_config_file(config_path) # load default config
     snapshot_path = os.path.join(run_path, 'checkpoints', 'snapshot.pt')
+    
 
     mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
     input_stats = read_file_from_ini(mean_std_path)
@@ -40,19 +51,48 @@ def main(run_dir: str):
 
     train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path)
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
-                                      num_workers=config["NUM_WORKERS_DATALOADER"], 
-                                      prefetch_factor=config["PREFETCH_FACTOR"])
+                                    num_workers=config["NUM_WORKERS_DATALOADER"], 
+                                    prefetch_factor=config["PREFETCH_FACTOR"],
+                                    multi_gpu=use_multiGPU)
     val_loader = prepare_dataloader(val_set, config["BATCH_SIZE"], 
                                     num_workers=config["NUM_WORKERS_DATALOADER"], 
-                                    prefetch_factor=config["PREFETCH_FACTOR"])
-    test_loader = prepare_dataloader(test_set, config["BATCH_SIZE"], 
-                                     num_workers=config["NUM_WORKERS_DATALOADER"], 
-                                     prefetch_factor=config["PREFETCH_FACTOR"])
+                                    prefetch_factor=config["PREFETCH_FACTOR"],
+                                    multi_gpu=use_multiGPU)
+    if not args.test_on_separate_data: # normal testing
+        test_loader = prepare_dataloader(test_set, config["BATCH_SIZE"], 
+                                        num_workers=config["NUM_WORKERS_DATALOADER"], 
+                                        prefetch_factor=config["PREFETCH_FACTOR"],
+                                        multi_gpu=use_multiGPU)
+    else: # testing on separate data
+        alt_test_dir = os.path.join(run_path, 'alt_test')
+        # check for existence, else generate data
+        if not os.path.exists(alt_test_dir):
+            os.makedirs(alt_test_dir, exist_ok=True)
+            print("\n=== Generating New Dataset ===")
+            # Set seed for reproducibility
+            base_seed = config["BASE_SEED"] if "BASE_SEED" in config else 42
+            torch.manual_seed(base_seed - 7) # -7 to differ from training seed
+            np.random.seed((base_seed - 7) % (2**32 - 1)) # -7 to differ from training seed
+            # create alternative test files
+            config["USE_SEPARATE_VALTEST_PARS"] = True
+            generate_and_save_data_pooled_multi_gpu(config, images_dir=alt_test_dir, n_dems=config["FLUID_VAL_DEMS"])
+        
+        test_set = list_pt_files(alt_test_dir)  # load test dataset
+        test_set = DEMDataset(test_set)
+        test_loader = prepare_dataloader(test_set, config["BATCH_SIZE"], 
+                                        num_workers=config["NUM_WORKERS_DATALOADER"], 
+                                        prefetch_factor=config["PREFETCH_FACTOR"],
+                                        multi_gpu=use_multiGPU)
+            
     
-    trainer = Trainer(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader, test_loader)
-
-    if is_main():
+    if use_multiGPU:
+        trainer = Trainer_multiGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader, test_loader)
+        if is_main():
+            print("Starting testing...")
+    else:
+        trainer = Trainer_singleGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader, test_loader)
         print("Starting testing...")
+
     global_test_loss, global_ame = trainer.test()
     
     if is_main():
@@ -62,7 +102,8 @@ def main(run_dir: str):
         print("Test results saved.")
         print("Cleaning up...")
 
-    destroy_process_group()
+    if use_multiGPU:
+        destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -71,6 +112,8 @@ if __name__ == "__main__":
                         help='Directory of the trained model run containing stats and checkpoints.')
     parser.add_argument('--run_dir', type=str, dest='run_dir_flag', required=False,
                         help='Directory of the trained model run containing stats and checkpoints.')
+    parser.add_argument('--test_on_separate_data', action='store_true',
+                        help="Indicates to test on separate data, generated with separate validation/testing parameters.")
     args = parser.parse_args()
 
     # Support both positional and flag-based arguments

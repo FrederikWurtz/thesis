@@ -15,18 +15,17 @@ warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.
 
 import torch
 
-from torch.distributed import destroy_process_group
-from master.train.trainer_new import Trainer, ddp_setup, load_train_objs, prepare_dataloader, is_main
+from master.train.trainer_new import Trainer_singleGPU, load_train_objs, prepare_dataloader
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 from master.configs.config_utils import load_config_file
 
 torch.multiprocessing.set_start_method('spawn', force=True)
 
-def run_plot(run_path: str):
+def run_plot(run_dir: str):
     cmd = [
         "python",
         "master/entry/plot.py",
-        "--run_dir", run_path
+        "--run_dir", run_dir
     ]
     env = os.environ.copy()
     subprocess.run(cmd, env=env, check=True)
@@ -34,8 +33,6 @@ def run_plot(run_path: str):
 def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     t0_main = time.time()
     
-    ddp_setup()
-
     sup_dir = "./runs"
     run_path = os.path.join(sup_dir, run_dir)
     if not os.path.exists(run_path):
@@ -49,21 +46,18 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
         with open(config_override_file, 'r') as f:
             overrides = json.load(f)
         config.update(overrides)
-        if is_main():
-            print(f"Applied config overrides: {overrides}")
+        print(f"Applied config overrides: {overrides}")
 
     if new_run:
-        if is_main():
-            print("Starting a new run, resetting relevant parameters...")
-            # Remove all files in checkpoint folder
-            checkpoint_dir = os.path.join(run_path, 'checkpoints')
-            if os.path.exists(checkpoint_dir):
-                for filename in os.listdir(checkpoint_dir):
-                    file_path = os.path.join(checkpoint_dir, filename)
-                    if os.path.isfile(file_path):
-                        os.remove(file_path)
-                if is_main():
-                    print(f"Cleared checkpoint directory: {checkpoint_dir}")
+        print("Starting a new run, resetting relevant parameters...")
+        # Remove all files in checkpoint folder
+        checkpoint_dir = os.path.join(run_path, 'checkpoints')
+        if os.path.exists(checkpoint_dir):
+            for filename in os.listdir(checkpoint_dir):
+                file_path = os.path.join(checkpoint_dir, filename)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+            print(f"Cleared checkpoint directory: {checkpoint_dir}")
 
     snapshot_path = os.path.join(run_path, 'checkpoints', 'snapshot.pt')
     mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
@@ -79,34 +73,37 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
                                       num_workers=config["NUM_WORKERS_DATALOADER"], 
                                       prefetch_factor=config["PREFETCH_FACTOR"],
-                                      use_shuffle=False)
+                                      use_shuffle=False,
+                                      persistent_workers=True,
+                                      multi_gpu=False)
                                       
     
     val_loader = prepare_dataloader(val_set, config["BATCH_SIZE"], 
                                     num_workers=config["NUM_WORKERS_DATALOADER"], 
                                     prefetch_factor=config["PREFETCH_FACTOR"],
-                                    use_shuffle=False)
+                                    use_shuffle=False,
+                                    persistent_workers=True,
+                                    multi_gpu=False)
     
     test_loader = prepare_dataloader(test_set, config["BATCH_SIZE"], 
                                      num_workers=config["NUM_WORKERS_DATALOADER"], 
                                      prefetch_factor=config["PREFETCH_FACTOR"],
-                                     use_shuffle=False)
+                                     use_shuffle=False,
+                                     persistent_workers=True,
+                                     multi_gpu=False)
     
-    trainer = Trainer(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
+    trainer = Trainer_singleGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
 
-    if is_main():
-        number_of_gpus = torch.cuda.device_count()
-        print(f"Number of GPUs detected: {number_of_gpus}")
-        equipment_info_path = os.path.join(run_path, 'stats', 'equipment_info.ini')
-        save_file_as_ini({'NUM_GPUS': [str(number_of_gpus)]}, equipment_info_path)
-        print("Everything set up")
+    number_of_gpus = 1 if torch.backends.mps.is_available() else 0
+    equipment_info_path = os.path.join(run_path, 'stats', 'equipment_info.ini')
+    save_file_as_ini({'NUM_GPUS': [str(number_of_gpus)]}, equipment_info_path)
+    print("Everything set up")
+
     trainer.train(config["EPOCHS"])
 
     # Skip testing if profiling
     if config.get("SKIP_TEST", False):
-        if is_main():
-            print("Skipping test phase (profiling mode)")
-        destroy_process_group()
+        print("Skipping test phase (profiling mode)")
         return
 
     print("Training complete.")
@@ -114,11 +111,11 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     global_test_loss, global_ame = trainer.test()
     
     test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
-    save_file_as_ini({'TEST_LOSS': [str(global_test_loss)], 'TEST_AME': [str(global_ame)]}, test_loss_dir)
+    save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_AME': float(global_ame)}, test_loss_dir)
     print(f"Test Loss: {global_test_loss:.6f}, Test AME: {global_ame:.6f}")
     print("Test results saved.")
 
-    run_plot(run_path, config)
+    run_plot(run_dir)
 
     t1_main = time.time()
     total_time = t1_main - t0_main
@@ -130,8 +127,6 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
 
 
     print("Cleaning up...")
-
-    destroy_process_group()
 
 
 if __name__ == "__main__":

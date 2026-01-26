@@ -23,6 +23,8 @@ def _parse_args(argv=None):
                    help='(Optional) Name of the run directory to use or create (overrides positional argument).')
     p.add_argument('--new_run', action='store_true', default=False,
                    help='If set, creates a new run directory (removes existing if present).')
+    p.add_argument('--run_training', action='store_true', default=False,
+                   help='If set, starts training after initialization.')
     p.add_argument('--skip_data_gen', action='store_true', default=False,
                    help='If set, skips data generation (useful for continuing runs).')
     p.add_argument('--use_LRO_dems', type=bool, default=None,
@@ -135,7 +137,7 @@ def main(argv=None):
 
 
     # apply CLI overrides to config by uppercasing arg names (only if key exists in config)
-    allowed_cli_only = {"NEW_RUN", "SKIP_DATA_GEN", "USE_LRO_DEMS"}
+    allowed_cli_only = {"NEW_RUN", "SKIP_DATA_GEN", "USE_LRO_DEMS", "RUN_TRAINING"}
     for arg_name, val in vars(args).items():
         if val is None:
             continue
@@ -166,7 +168,8 @@ def main(argv=None):
             # also calculate and save mean reflectance map over validation set
             val_files = list_pt_files(val_path)
             val_ds = DEMDataset(val_files)
-            val_loader = DataLoader(val_ds, batch_size=config["BATCH_SIZE"], shuffle=False, num_workers=4, pin_memory=True)
+            pin_memory = True if torch.cuda.is_available() else False
+            val_loader = DataLoader(val_ds, batch_size=config["BATCH_SIZE"], shuffle=False, num_workers=4, pin_memory=pin_memory)
             print("\n=== Computing Input Statistics ===")
             train_mean, train_std = compute_input_stats(val_loader, images_per_dem=config["IMAGES_PER_DEM"])
             print(f"Mean: {round_list(train_mean.tolist(), 10)}")
@@ -198,10 +201,17 @@ def main(argv=None):
 
 
     # Run validation plotting commands
-    subprocess.run(["python", "master/validate/plotting_new.py", "--run_dir", args.run_dir])
-    subprocess.run(["python", "master/validate/plotting_new.py", "--run_dir", args.run_dir, "--use_train_set"])
+    subprocess.run(["python", "master/entry/plot.py", "--run_dir", args.run_dir])
+    subprocess.run(["python", "master/entry/plot.py", "--run_dir", args.run_dir, "--use_train_set"])
 
-    print(f"Initialization complete, and data visualization done. You can now run the training script using run directory \"{args.run_dir}\".")
+    if not args.run_training:
+        print(f"Initialization complete, and data visualization done. You can now run the training script using run directory \"{args.run_dir}\".")
+    
+    if args.run_training:
+        # Start training
+        print("Starting training...")
+        from master.entry.train import run_train
+        run_train(run_dir=run_dir, new_run=args.new_run)
 
 
 if __name__ == '__main__':

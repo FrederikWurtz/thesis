@@ -4,20 +4,41 @@ import torch
 import argparse
 
 def run_train(run_dir, new_run=False):
-    n_proc_per_node = torch.cuda.device_count()
-    print(f"Starting training with {n_proc_per_node} GPUs...")
-    cmd = [
-        "torchrun",
-        f"--nproc_per_node={n_proc_per_node}",
-        "--standalone",
-        "master/train/train_main.py",
-        run_dir
-    ]
-    if new_run:
-        cmd.append("--new_run")
-    env = os.environ.copy()
-    env["OMP_NUM_THREADS"] = "2"
-    subprocess.run(cmd, env=env, check=True)
+    if torch.cuda.is_available():
+        n_proc_per_node = torch.cuda.device_count()
+        print(f"Starting training with {n_proc_per_node} GPUs...")
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={n_proc_per_node}",
+            "--standalone",
+            "master/runners/train_runner_multiGPU.py",
+            run_dir
+        ]
+        if new_run:
+            cmd.append("--new_run")
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = "2"
+        subprocess.run(cmd, env=env, check=True)
+    else:
+        print("No CUDA available - starting training with python call...")
+        import sys
+        env = os.environ.copy()
+        cmd = [
+            sys.executable,
+            "master/runners/train_runner_singleGPU.py",
+            run_dir
+        ]
+        if new_run:
+            cmd.append("--new_run")
+        # Only wrap the training command in caffeinate if on Darwin and not already caffeinated
+        if sys.platform == 'darwin' and 'CAFFEINATED' not in env:
+            print("=" * 60)
+            print("Starting caffeinate to prevent system sleep during training")
+            print("This ensures full performance even if the screen turns off")
+            print("=" * 60)
+            env['CAFFEINATED'] = '1'  # Mark that we're now caffeinated
+            cmd = ['caffeinate', '-dims'] + cmd
+        subprocess.run(cmd, env=env, check=True)
 
 
 if __name__ == "__main__":

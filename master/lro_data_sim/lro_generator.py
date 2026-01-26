@@ -131,20 +131,39 @@ def resample_dem_torch(dem_array, desired_pixel_size, device=None):
     return resampled.squeeze()
     
 def get_lat_lon_radius_height(config: dict):
-    center_lat_deg = config['CENTER_LAT_DEG']
-    center_lon_deg = config['CENTER_LON_DEG']
-    box_radius_m = config['BOX_RADIUS_M']
-    lat_deg_pm = config['CENTER_LAT_DEG_PM']
-    lon_deg_pm = config['CENTER_LON_DEG_PM']
-    box_radius_m_pm = config['BOX_RADIUS_M_PM']
-    height_normalization = config['HEIGHT_NORMALIZATION']
-    height_normalization_pm = config['HEIGHT_NORMALIZATION_PM']
+    if config["USE_SEPARATE_VALTEST_PARS"] == False:
+        center_lat_deg = config['CENTER_LAT_DEG']
+        center_lon_deg = config['CENTER_LON_DEG']
+        box_radius_m = config['BOX_RADIUS_M']
+        lat_deg_pm = config['CENTER_LAT_DEG_PM']
+        lon_deg_pm = config['CENTER_LON_DEG_PM']
+        box_radius_m_pm = config['BOX_RADIUS_M_PM']
+        height_normalization = config['HEIGHT_NORMALIZATION']
+        height_normalization_pm = config['HEIGHT_NORMALIZATION_PM']
 
-    if config["STOCHASTIC"]:
-        center_lat_deg += np.random.uniform(-lat_deg_pm, lat_deg_pm)
-        center_lon_deg += np.random.uniform(-lon_deg_pm, lon_deg_pm)
-        box_radius_m += np.random.uniform(-box_radius_m_pm, box_radius_m_pm)
-        height_normalization += np.random.uniform(-height_normalization_pm, height_normalization_pm)
+        if config["STOCHASTIC"]:
+            center_lat_deg += np.random.uniform(-lat_deg_pm, lat_deg_pm)
+            center_lon_deg += np.random.uniform(-lon_deg_pm, lon_deg_pm)
+            box_radius_m += np.random.uniform(-box_radius_m_pm, box_radius_m_pm)
+            height_normalization += np.random.uniform(-height_normalization_pm, height_normalization_pm)
+    else:
+        # use separate val/test parameters, including stochasticity if enabled
+        print("Using separate val/test parameters for LRO DEM generation")
+        center_lat_deg = config['CENTER_LAT_DEG_VALTEST']
+        center_lon_deg = config['CENTER_LON_DEG_VALTEST']
+        box_radius_m = config['BOX_RADIUS_M_VALTEST']
+        height_normalization = config['HEIGHT_NORMALIZATION_VALTEST']
+        lat_deg_pm = config['CENTER_LAT_DEG_PM_VALTEST']
+        lon_deg_pm = config['CENTER_LON_DEG_PM_VALTEST']
+        box_radius_m_pm = config['BOX_RADIUS_M_PM_VALTEST']
+        height_normalization_pm = config['HEIGHT_NORMALIZATION_PM_VALTEST']
+
+        if config["STOCHASTIC"]:
+            center_lat_deg += np.random.uniform(-lat_deg_pm, lat_deg_pm)
+            center_lon_deg += np.random.uniform(-lon_deg_pm, lon_deg_pm)
+            box_radius_m += np.random.uniform(-box_radius_m_pm, box_radius_m_pm)
+            height_normalization += np.random.uniform(-height_normalization_pm, height_normalization_pm)
+
 
 
     # csv_path = os.path.join("master", "lro_data_sim", "lro_metadata.csv")

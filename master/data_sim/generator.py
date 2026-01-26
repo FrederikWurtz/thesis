@@ -16,7 +16,7 @@ import pstats
 import io
 import time
 
-def generate_and_return_data(config: dict = None):
+def generate_and_return_data_bacteria(config: dict = None):
     """
     Generate a synthetic DEM and render five camera images + reflectance maps.
 
@@ -280,7 +280,7 @@ def generate_and_return_data_CPU(config: dict = None):
     return images, reflectance_maps, dem_np, metas
 
 
-def generate_and_save_data(path: str = None, config: dict = None):
+def generate_and_save_data_bacteria(path: str = None, config: dict = None):
     """
     Generate data (via ``generate_and_return_data``) and save to a compressed
     NumPy ``.npz`` file.
@@ -308,7 +308,7 @@ def generate_and_save_data(path: str = None, config: dict = None):
     if path is None:
         raise ValueError("path must be provided")
 
-    images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
+    images, reflectance_maps, dem_np, metas = generate_and_return_data_bacteria(config=config)
 
     # Convert to PyTorch tensors and save
     data_dict = {
@@ -326,7 +326,7 @@ def generate_and_return_worker_friendly(config):
         if config["USE_LRO_DEMS"]:
             images, reflectance_maps, dem_np, metas = generate_and_return_lro_data(config=config)
         else:
-            images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
+            images, reflectance_maps, dem_np, metas = generate_and_return_data_bacteria(config=config)
         # Explicit cleanup
         import gc
         gc.collect()
@@ -347,7 +347,7 @@ def generate_and_save_worker_friendly(args):
         if config["USE_LRO_DEMS"]:
             generate_and_save_lro_data(config=config, save_path=path)
         else:
-            generate_and_save_data(path=path, config=config)
+            generate_and_save_data_bacteria(path=path, config=config)
     except Exception:
         import traceback
         traceback.print_exc()
@@ -409,14 +409,15 @@ def _multiprocessing_worker(args):
     dem_idx, gpu_id, images_dir, config = args
     
     # Set GPU for this process
-    torch.cuda.set_device(gpu_id)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
     
     filename = os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
     try:
         if config["USE_LRO_DEMS"]:
             generate_and_save_lro_data(config=config, save_path=filename)
         else:
-            generate_and_save_data(path=filename, config=config)
+            generate_and_save_data_bacteria(path=filename, config=config)
         return True
     except Exception:
         import traceback
@@ -461,11 +462,17 @@ def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, 
     def gpu_worker(args):
         dem_idx, gpu_id = args
         filename = os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
-        torch.cuda.set_device(gpu_id)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(gpu_id)
+            device = f"cuda:{gpu_id}"
+        elif torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
         
         try:
             if config["USE_LRO_DEMS"]:
-                images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=config, device=f"cuda:{gpu_id}")
+                images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=config, device=device)
                 data_dict = {
                     'dem': dem_tensor,
                     'data': torch.stack(images),
@@ -474,14 +481,13 @@ def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, 
                 }
 
             else:
-                images, reflectance_maps, dem_np, metas = generate_and_return_data(config=config)
+                images, reflectance_maps, dem_np, metas = generate_and_return_data_bacteria(config=config, device=device)
                 data_dict = {
                     'dem': torch.from_numpy(dem_np),
                     'data': torch.stack(images).cpu(),
                     'reflectance_maps': torch.stack(reflectance_maps).cpu(),
                     'meta': torch.tensor(metas, dtype=torch.float32)
                 }
-            
             
             save_queue.put((filename, data_dict))
             return True
@@ -547,8 +553,26 @@ def generate_and_save_data_pooled_multi_gpu(config: dict = None,
 
     dem_size = config.get('DEM_SIZE', 512)
     
-    if torch.cuda.is_available():
-        n_gpus = torch.cuda.device_count()
+    if torch.cuda.is_available() or torch.backends.mps.is_available():
+        if torch.backends.mps.is_available():
+            print("MPS detected: Forcing single-threaded data generation due to MPS multiprocessing/threading incompatibility.")
+            for dem_idx in range(n_dems):
+                # Call the single-threaded data generation function directly
+                if config["USE_LRO_DEMS"]:
+                    generate_and_save_lro_data(
+                        config=config,
+                        save_path=os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
+                    )
+                else:
+                    generate_and_save_data_bacteria(
+                        path=os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt"),
+                        config=config
+                    )
+            print(f"Finished generating {n_dems} DEMs (single-threaded, MPS mode).")
+            return
+        else:
+            print("CUDA device detected and available.")
+            n_gpus = torch.cuda.device_count()
         
         # Optimal configuration based on DEM size
         if dem_size < 512:
@@ -799,7 +823,7 @@ def _render_single_image(renderer=None, params=None, image_w=None, image_h=None)
     img, refl_map = result
     return img, refl_map
 
-__all__ = ["generate_and_return_data", 
-           "generate_and_save_data", 
-           "generate_and_return_worker_friendly", 
-           "generate_and_save_worker_friendly"]
+__all__ = ["generate_and_return_data_bacteria",
+           "generate_and_save_data_bacteria",
+           "generate_and_save_data_pooled",
+           "generate_and_save_data_pooled_multi_gpu"]

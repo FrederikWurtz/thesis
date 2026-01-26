@@ -32,7 +32,7 @@ warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.
 
 
 def is_main():
-    return int(os.environ["LOCAL_RANK"]) == 0
+    return int(os.environ["LOCAL_RANK"]) == 0 if "LOCAL_RANK" in os.environ else True
 
 def ddp_setup():
     try:
@@ -54,7 +54,7 @@ def ddp_setup():
         raise RuntimeError("LOCAL_RANK not found in environment variables. Please run this script using torch.distributed.launch or torchrun for multi-GPU training.")
 
 
-class Trainer:
+class Trainer_multiGPU:
     def __init__(
         self,
         model: torch.nn.Module,
@@ -488,27 +488,294 @@ def load_train_objs(config, run_path: str, epoch_shared=None):
     optimizer = torch.optim.Adam(model.parameters(), lr=config["LR"], weight_decay=config["WEIGHT_DECAY"])
     return train_set, val_set, test_set, model, optimizer
 
-def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, prefetch_factor: int = 4, use_shuffle: bool = False, persistent_workers: bool = True) -> DataLoader:
-    rank = int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else 0
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        pin_memory=True,
-        shuffle=use_shuffle,
-        sampler=DistributedSampler(dataset),
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=persistent_workers,  # 🔥 Keep workers alive between epochs
-        pin_memory_device=f'cuda:{rank}',  # 🔥 Pin directly to target GPU
-    )
+def load_test_objs(config, test_path: str):
+    test_set = list_pt_files(test_path)  # load test dataset
+    test_set = DEMDataset(test_set)
+    return test_set
 
-        # worker_init_fn=worker_init_fn  # 🔥 Set epoch in workers for reproducibility
+
+def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, prefetch_factor: int = 4, use_shuffle: bool = False, persistent_workers: bool = True, multi_gpu: bool = True) -> DataLoader:
+    if multi_gpu:
+        rank = int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else 0
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            pin_memory=True,
+            shuffle=use_shuffle,
+            sampler=DistributedSampler(dataset),
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,  # 🔥 Keep workers alive between epochs
+            pin_memory_device=f'cuda:{rank}',  # 🔥 Pin directly to target GPU
+        )
+    else:
+        pin_memory = True if torch.cuda.is_available() else False
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            pin_memory=pin_memory,
+            shuffle=use_shuffle,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,  # 🔥 Keep workers alive between epochs
+        )
+
 def set_global_epoch(epoch):
     global GLOBAL_EPOCH
     GLOBAL_EPOCH = epoch
 
-def worker_init_fn(worker_id):
-    # Each worker sets the epoch in its dataset
-    worker_info = torch.utils.data.get_worker_info()
-    dataset = worker_info.dataset
-    dataset.set_epoch(GLOBAL_EPOCH)
+
+class Trainer_singleGPU:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        train_data: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        config: dict,
+        snapshot_path: str,
+        train_mean: torch.Tensor = None,
+        train_std: torch.Tensor = None,
+        val_data: DataLoader = None,
+        test_data: DataLoader = None,
+    ) -> None:
+        # Select device: prefer MPS, then CPU
+        if torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+            print("Using MPS device for training.")
+        else:
+            self.device = torch.device('cpu')
+            print("Using CPU for training.")
+        self.model = model.to(self.device)
+        self.train_data = train_data
+        self.val_data = val_data
+        self.test_data = test_data
+        self.optimizer = optimizer
+        self.save_every = config["SAVE_EVERY"]
+        self.epochs_run = 0
+        self.train_loss_history = []
+        self.val_loss_history = []
+        self.train_timings = []
+        self.val_timings = []
+        self.config = config
+        self.train_mean = train_mean
+        self.train_std = train_std
+        # No DDP or torch.compile for single GPU/CPU
+        self.dtype = torch.bfloat16 if self.config.get("USE_BF16", False) else torch.float16
+        self.use_amp = self.config.get("USE_AMP", False)
+        self.scaler = GradScaler(self.device) if (self.use_amp and self.dtype == torch.float16 and self.device.type == 'cuda') else None
+        self.snapshot_path = snapshot_path
+        if os.path.exists(snapshot_path):
+            print("Loading snapshot")
+            self._load_snapshot(snapshot_path)
+
+    def _save_snapshot(self, epoch):
+        snapshot = {
+            "MODEL_STATE": self.model.state_dict(),
+            "OPTIMIZER_STATE": self.optimizer.state_dict(),
+            "EPOCHS_RUN": epoch,
+            "TRAIN_LOSS_HISTORY": self.train_loss_history,
+            "VAL_LOSS_HISTORY": self.val_loss_history,
+            "TRAIN_TIMINGS": self.train_timings,
+            "VAL_TIMINGS": self.val_timings,
+        }
+        torch.save(snapshot, self.snapshot_path)
+        print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
+        # Save loss/timing CSVs as in multiGPU
+        train_loss_file = self.snapshot_path.replace('snapshot.pt', 'train_losses.csv')
+        with open(train_loss_file, 'w') as f:
+            f.write("epoch,loss\n")
+            for i, loss in enumerate(self.train_loss_history, start=0):
+                f.write(f"{i},{loss}\n")
+        val_loss_file = self.snapshot_path.replace('snapshot.pt', 'val_losses.csv')
+        with open(val_loss_file, 'w') as f:
+            f.write("epoch,loss\n")
+            for i, loss in enumerate(self.val_loss_history, start=0):
+                actual_epoch = i * self.save_every
+                f.write(f"{actual_epoch},{loss}\n")
+        train_timing_file = self.snapshot_path.replace('snapshot.pt', 'train_timings.csv')
+        with open(train_timing_file, 'w') as f:
+            f.write("epoch,time_seconds\n")
+            for i, timing in enumerate(self.train_timings, start=0):
+                f.write(f"{i},{timing}\n")
+        val_timing_file = self.snapshot_path.replace('snapshot.pt', 'val_timings.csv')
+        with open(val_timing_file, 'w') as f:
+            f.write("epoch,time_seconds\n")
+            for i, timing in enumerate(self.val_timings, start=0):
+                actual_epoch = i * self.save_every
+                f.write(f"{actual_epoch},{timing}\n")
+
+    def _load_snapshot(self, snapshot_path):
+        loc = self.device
+        snapshot = torch.load(snapshot_path, map_location=loc)
+        self.model.load_state_dict(snapshot["MODEL_STATE"])
+        optimizer_state = snapshot["OPTIMIZER_STATE"]
+        for state in optimizer_state['state'].values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(self.device)
+        self.optimizer.load_state_dict(optimizer_state)
+        if self.scaler is not None and "SCALER_STATE" in snapshot:
+            self.scaler.load_state_dict(snapshot["SCALER_STATE"])
+            print("Loaded GradScaler state")
+        self.epochs_run = snapshot["EPOCHS_RUN"] + 1
+        self.train_loss_history = snapshot["TRAIN_LOSS_HISTORY"]
+        self.val_loss_history = snapshot["VAL_LOSS_HISTORY"]
+        self.train_timings = snapshot["TRAIN_TIMINGS"]
+        self.val_timings = snapshot["VAL_TIMINGS"]
+        print(f"Found snapshot saved at epoch {self.epochs_run - 1}.")
+        print(f"Resuming model from snapshot at Epoch {self.epochs_run}")
+        self.model.train()
+
+    def _run_epoch(self, epoch, return_val=False):
+        t0 = time.time()
+        print(f"Running epoch {epoch}")
+        self.train_data.dataset.set_epoch(epoch) # Set epoch for dataset randomness
+        epoch_loss = torch.zeros(1, dtype=torch.float32, device=self.device)
+        total_samples = 0
+        for batch_idx, (images, reflectance_maps, targets, metas) in enumerate(self.train_data):
+            images = images.to(self.device)
+            metas = metas.to(self.device)
+            reflectance_maps = reflectance_maps.to(self.device)
+            images = normalize_inputs(images, self.train_mean, self.train_std)
+            targets = targets.to(self.device)
+            batch_size = images.size(0)
+            mean_batch_loss = self._run_batch((images, metas, reflectance_maps), targets, return_tensors=True)
+            epoch_loss += mean_batch_loss.detach() * batch_size
+            total_samples += batch_size
+        epoch_loss_value = epoch_loss.item()
+        global_avg_loss = epoch_loss_value / total_samples if total_samples > 0 else float('nan')
+        self.train_loss_history.append(global_avg_loss)
+        total_time = time.time() - t0
+        self.train_timings.append(total_time)
+        print(f"Epoch {epoch} | Loss: {global_avg_loss:.2e} | Samples: {total_samples} | Time: {total_time:.2f}s")
+        if return_val:
+            return global_avg_loss
+
+    def _run_batch(self, source, targets, return_tensors: bool = False):
+        self.optimizer.zero_grad()
+        images, metas, reflectance_maps = source
+        device = self.device
+        # AMP only for CUDA, not MPS/CPU
+        amp_enabled = self.use_amp and device.type == 'cuda'
+        with autocast(device.type, enabled=amp_enabled, dtype=self.dtype):
+            outputs = self.model(images, metas, target_size=targets.shape[-2:])
+            total_loss = calculate_total_loss(
+                outputs, targets, reflectance_maps, metas,
+                device=device,
+                camera_params=self.config["CAMERA_PARAMS"],
+                hapke_params=self.config["HAPKE_KWARGS"],
+                w_grad=self.config["W_GRAD"],
+                w_refl=self.config["W_REFL"],
+                w_mse=self.config["W_MSE"],
+                height_norm=self.config["HEIGHT_NORMALIZATION"] + self.config["HEIGHT_NORMALIZATION_PM"],
+                return_components=False
+            )
+        total_loss.backward()
+        total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config["GRAD_CLIP"])
+        if total_norm > self.config["GRAD_CLIP"] * 0.8:
+            print(f"⚠️ Large gradient norm: {total_norm:.4f} (clipped at {self.config['GRAD_CLIP']})")
+        self.optimizer.step()
+        if return_tensors:
+            return total_loss
+        else:
+            return total_loss.item()
+
+    def train(self, max_epochs: int):
+        for epoch in range(self.epochs_run, max_epochs):
+            self._run_epoch(epoch)
+            if epoch % self.save_every == 0:
+                self._validate(epoch)
+                self._save_snapshot(epoch)
+
+    @torch.no_grad()
+    def _validate(self, epoch):
+        if self.val_data is None:
+            return None
+        t0 = time.time()
+        print(f"Running validation for epoch {epoch}")
+        self.model.eval()
+        val_loss = 0.0
+        total_samples = 0
+        for images, reflectance_maps, targets, metas in self.val_data:
+            images = images.to(self.device)
+            metas = metas.to(self.device)
+            reflectance_maps = reflectance_maps.to(self.device)
+            targets = targets.to(self.device)
+            images = normalize_inputs(images, self.train_mean, self.train_std)
+            batch_size = images.size(0)
+            amp_enabled = self.use_amp and self.device.type == 'cuda'
+            with autocast(self.device.type, enabled=amp_enabled, dtype=self.dtype):
+                outputs = self.model(images, metas, target_size=targets.shape[-2:])
+                loss = calculate_total_loss(
+                    outputs, targets, reflectance_maps, metas,
+                    device=self.device,
+                    camera_params=self.config["CAMERA_PARAMS"],
+                    hapke_params=self.config["HAPKE_KWARGS"],
+                    w_grad=self.config["W_GRAD"],
+                    w_refl=self.config["W_REFL"],
+                    w_mse=self.config["W_MSE"],
+                    height_norm=self.config["HEIGHT_NORMALIZATION"] + self.config["HEIGHT_NORMALIZATION_PM"],
+                    return_components=False
+                )
+            val_loss += loss.item() * batch_size
+            total_samples += batch_size
+        global_total_samples = total_samples
+        if global_total_samples == 0:
+            print(f"Warning: No validation samples found. Skipping validation.")
+            return None
+        global_avg_val_loss = val_loss / global_total_samples
+        self.val_loss_history.append(global_avg_val_loss)
+        val_time = time.time() - t0
+        self.val_timings.append(val_time)
+        print(f"Epoch {epoch} | Val Loss: {global_avg_val_loss:.2e} | Samples: {global_total_samples} | Time: {val_time:.2f}s")
+        self.model.train()
+        return global_avg_val_loss
+
+    @torch.no_grad()
+    def test(self, data_loader: DataLoader = None):
+        if self.test_data is None:
+            print("No test data provided. Skipping testing.")
+            return None, None
+        data_loader = self.test_data if data_loader is None else data_loader
+        t0 = time.time()
+        epoch = self.epochs_run
+        print(f"Evaluating on test dataset, after epoch {epoch}")
+        self.model.eval()
+        test_loss = 0.0
+        total_ame = 0.0
+        total_samples = 0
+        for images, reflectance_maps, targets, metas in data_loader:
+            images = images.to(self.device)
+            metas = metas.to(self.device)
+            reflectance_maps = reflectance_maps.to(self.device)
+            targets = targets.to(self.device)
+            images = normalize_inputs(images, self.train_mean, self.train_std)
+            batch_size = images.size(0)
+            amp_enabled = self.use_amp and self.device.type == 'cuda'
+            with autocast(self.device.type, enabled=amp_enabled, dtype=self.dtype):
+                outputs = self.model(images, metas, target_size=targets.shape[-2:])
+                loss = calculate_total_loss(
+                    outputs, targets, reflectance_maps, metas,
+                    device=self.device,
+                    camera_params=self.config["CAMERA_PARAMS"],
+                    hapke_params=self.config["HAPKE_KWARGS"],
+                    w_grad=self.config["W_GRAD"],
+                    w_refl=self.config["W_REFL"],
+                    w_mse=self.config["W_MSE"],
+                    height_norm=self.config["HEIGHT_NORMALIZATION"] + self.config["HEIGHT_NORMALIZATION_PM"],
+                    return_components=False
+                )
+            ame = torch.abs(outputs - targets).mean()
+            test_loss += loss.item() * batch_size
+            total_ame += ame.item() * batch_size
+            total_samples += batch_size
+        global_total_samples = total_samples
+        if global_total_samples == 0:
+            print(f"Warning: No test samples found. Skipping testing.")
+            return None, None
+        global_test_loss = test_loss / global_total_samples
+        global_ame = total_ame / global_total_samples
+        test_time = time.time() - t0
+        print(f"Epoch {epoch} | Test Loss: {global_test_loss:.2e} | AME: {global_ame:.6f} | Samples: {global_total_samples} | Time: {test_time:.2f}s")
+        self.model.train()
+        return global_test_loss, global_ame
