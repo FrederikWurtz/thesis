@@ -33,6 +33,7 @@ MANIFEST
 /.ssh/
 /keys/
 master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif
+master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_test_bands.tif
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

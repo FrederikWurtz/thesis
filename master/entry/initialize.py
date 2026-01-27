@@ -169,7 +169,7 @@ def main(argv=None):
             generate_and_save_data_pooled_multi_gpu(config, images_dir=val_path, n_dems=config["FLUID_VAL_DEMS"])
             # also calculate and save mean reflectance map over validation set
             val_files = list_pt_files(val_path)
-            val_ds = DEMDataset(val_files)
+            val_ds = DEMDataset(val_files, config=config)
             pin_memory = True if torch.cuda.is_available() else False
             val_loader = DataLoader(val_ds, batch_size=config["BATCH_SIZE"], shuffle=False, num_workers=4, pin_memory=pin_memory)
             print("\n=== Computing Input Statistics ===")

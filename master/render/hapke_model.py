@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import math
 
 class HapkeModel:
     def __init__(self, w=0.5, B0=0.5, h=0.1, phase_fun="hg", xi=0.2):
@@ -140,3 +141,230 @@ class HapkeModel:
         # Return R only where both mu0 and mu are positive, else 0
         # Use torch.maximum to clamp negative values to 0 (equivalent to np.maximum)
         return torch.where((mu0 > 0) & (mu > 0), torch.maximum(R, torch.tensor(0.0)), torch.tensor(0.0))
+
+import torch
+import math
+
+
+# ============================================================
+#  Roughness correction (Hapke 1984 / 1986 / 1993)
+# ============================================================
+
+def hapke_roughness(mu0, mu, g, theta_bar):
+    """
+    Hapke macroscopic roughness correction.
+
+    Parameters
+    ----------
+    mu0 : torch.Tensor
+        Cos(i)
+    mu : torch.Tensor
+        Cos(e)
+    g : torch.Tensor
+        Phase angle [rad]
+    theta_bar : torch.Tensor or float
+        Mean surface slope angle [rad]
+
+    Returns
+    -------
+    mu0_eff, mu_eff, S
+        Roughness-corrected cosines & shadowing term
+    """
+    theta_bar = torch.as_tensor(theta_bar, device=mu0.device, dtype=mu0.dtype)
+    theta_bar = torch.clamp(theta_bar, 1e-6, math.radians(45.0))  # safe range
+
+    t = torch.tan(theta_bar)
+    sigma = t * torch.sqrt(torch.tensor(2.0 / math.pi, device=mu0.device))
+
+    # Corrected incidence cosine
+    mu0_eff = mu0 * (1.0 + (1.0/torch.cos(theta_bar) - 1.0) * torch.sqrt(1.0 - mu0**2))
+    mu0_eff = torch.clamp(mu0_eff, min=0.0)
+
+    # Corrected emission cosine
+    mu_eff = mu * (1.0 + (1.0/torch.cos(theta_bar) - 1.0) * torch.sqrt(1.0 - mu**2))
+    mu_eff = torch.clamp(mu_eff, min=0.0)
+
+    # Shadowing probability (illumination × visibility)
+    P0 = 1.0 - torch.exp(- (mu0 / sigma)**2)
+    P  = 1.0 - torch.exp(- (mu / sigma)**2)
+
+    S = P0 * P + 1e-6
+    return mu0_eff, mu_eff, S
+
+
+
+# ============================================================
+#  Full Hapke Model Class
+# ============================================================
+
+class FullHapkeModel:
+    """
+    Full Hapke model for lunar-surface simulation.
+    Supports:
+      - spatial parameter maps
+      - SHOE + CBOE
+      - 1-term or 2-term HG
+      - macroscopic roughness
+    """
+
+    def __init__(self,
+                 # Albedo
+                 w=0.12,
+
+                 # Roughness
+                 theta_bar=math.radians(20),
+
+                 # SHOE
+                 B0_sh=0.6,
+                 h_sh=0.05,
+
+                 # CBOE
+                 B0_cb=0.2,
+                 h_cb=0.02,
+
+                 # Phase function
+                 phase_fun="hg2",
+                 xi=0.25,     # for hg1
+                 b1=-0.3,     # for hg2
+                 b2=0.2,      # for hg2
+                 c=0.7        # for hg2
+                 ):
+        
+        self.w = w
+        self.theta_bar = theta_bar
+
+        self.B0_sh = B0_sh
+        self.h_sh = h_sh
+
+        self.B0_cb = B0_cb
+        self.h_cb = h_cb
+
+        self.phase_fun = phase_fun.lower()
+        self.xi = xi
+
+        self.b1 = b1
+        self.b2 = b2
+        self.c = c
+
+        self.eps = 1e-12
+
+
+    # ------------------ helper ------------------
+
+    def _to_tensor(self, val, like):
+        if isinstance(val, torch.Tensor):
+            return val.to(like.device, like.dtype)
+        return torch.tensor(val, device=like.device, dtype=like.dtype)
+
+
+    # ------------------ H-function ------------------
+
+    def _H(self, mu, w):
+        mu = torch.clamp(mu, 0.0, 1.0)
+        w = torch.clamp(w, 1e-6, 1.0-1e-6)
+
+        gamma = torch.sqrt(torch.clamp(1.0 - w, min=1e-6))
+        denom = 1.0 + 2.0 * gamma * mu
+        denom = torch.clamp(denom, min=1e-6)
+        return (1.0 + 2.0 * mu) / denom
+
+
+    # ------------------ Opposition effects ------------------
+
+    def _B_SH(self, g, B0, h):
+        g = torch.clamp(g, 0.0, math.pi - 1e-3)
+        tanh = torch.tan(0.5 * g)
+        h = torch.clamp(h, min=1e-6)
+        denom = 1.0 + (1.0 / h) * tanh
+        denom = torch.clamp(denom, min=1e-6)
+        return B0 / denom
+
+    def _B_CB(self, g, B0, h):
+        g = torch.clamp(g, 0.0, math.pi - 1e-3)
+        tanh = torch.tan(0.5 * g)
+        h = torch.clamp(h, min=1e-6)
+        denom = 1.0 + (tanh / h)**2
+        return B0 / torch.clamp(denom, min=1e-6)
+
+
+    # ------------------ Phase functions ------------------
+
+    def _P(self, g, xi=None, b1=None, b2=None, c=None):
+        cg = torch.cos(g)
+
+        if self.phase_fun == "hg1":
+            denom = 1 + 2*xi*cg + xi**2
+            denom = torch.clamp(denom, min=1e-6)
+            return (1 - xi**2) / denom**1.5
+
+        # 2-term HG
+        denom1 = 1 + 2*b1*cg + b1**2
+        denom2 = 1 + 2*b2*cg + b2**2
+        P1 = (1 - b1**2) / torch.clamp(denom1, min=1e-6)**1.5
+        P2 = (1 - b2**2) / torch.clamp(denom2, min=1e-6)**1.5
+        return c * P1 + (1 - c) * P2
+
+
+
+    # ============================================================
+    #  Main: Radiance factor I/F
+    # ============================================================
+
+    def radiance_factor(self, mu0, mu, g):
+        # Convert inputs to tensors
+        if not isinstance(mu0, torch.Tensor): mu0 = torch.tensor(mu0)
+        if not isinstance(mu, torch.Tensor):  mu = torch.tensor(mu)
+        if not isinstance(g, torch.Tensor):   g = torch.tensor(g)
+
+        mu0, mu, g = torch.broadcast_tensors(mu0, mu, g)
+        mu0 = mu0.to(g.device).float()
+        mu  = mu.to(g.device).float()
+
+        # Map support
+        w      = self._to_tensor(self.w, mu0)
+        theta  = self._to_tensor(self.theta_bar, mu0)
+        B0_sh  = self._to_tensor(self.B0_sh, mu0)
+        h_sh   = self._to_tensor(self.h_sh,  mu0)
+        B0_cb  = self._to_tensor(self.B0_cb, mu0)
+        h_cb   = self._to_tensor(self.h_cb,  mu0)
+
+        # Phase params
+        if self.phase_fun == "hg1":
+            xi = self._to_tensor(self.xi, mu0)
+            phase_params = {"xi": xi}
+        else:
+            b1 = self._to_tensor(self.b1, mu0)
+            b2 = self._to_tensor(self.b2, mu0)
+            c  = self._to_tensor(self.c,  mu0)
+            phase_params = {"b1": b1, "b2": b2, "c": c}
+
+        # ---------------- Roughness ----------------
+        mu0_eff, mu_eff, S = hapke_roughness(mu0, mu, g, theta)
+
+        denom = torch.clamp(mu0_eff + mu_eff, min=self.eps)
+
+        # Phase + opposition effects
+        P = self._P(g, **phase_params)
+        Bsh = self._B_SH(g, B0_sh, h_sh)
+        Bcb = self._B_CB(g, B0_cb, h_cb)
+        Btot = Bsh + Bcb
+
+        # H-functions use *unroughened* incident/emission
+        H0 = self._H(mu0_eff, w)
+        H  = self._H(mu_eff,  w)
+
+        # --------- Bi-directional reflectance r(i,e,g) ---------
+        r = (w / (4*math.pi)) * (mu0_eff / denom) * ((1 + Btot)*P + H0*H - 1)
+
+        # Apply roughness shadowing
+        r = S * r
+
+        # Radiance factor I/F = π * r
+        R = math.pi * r
+        R = torch.clamp(R, min=0.0)
+
+        # Apply physical visibility mask
+        mask = (mu0 > 0) & (mu > 0)
+        R = torch.where(mask, R, torch.zeros_like(R))
+        
+        return R

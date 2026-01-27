@@ -4,6 +4,7 @@ import os
 from multiprocessing import Pool
 from tqdm import tqdm
 
+from master.lro_data_sim.lro_generator_multi_band import generate_and_return_lro_data_multi_band, generate_and_save_lro_data_multi_band
 from master.render.dem_utils import DEM
 from master.render.hapke_model import HapkeModel
 from master.render.camera import Camera
@@ -147,136 +148,136 @@ def generate_and_return_data_bacteria(config: dict = None):
             
     return images, reflectance_maps, dem_np, metas
 
-def generate_and_return_data_CPU(config: dict = None):
-    """
-    Generate a synthetic DEM and render five camera images + reflectance maps.
+# def generate_and_return_data_CPU(config: dict = None):
+#     """
+#     Generate a synthetic DEM and render five camera images + reflectance maps.
 
-    This is the top-level data generator used by the project. It creates a
-    synthetic DEM (via ``_generate_synthetic_dem``), constructs the rendering
-    pipeline (``DEM``, ``HapkeModel``, ``Camera``, ``Renderer``) and produces
-    five image / reflectance-map pairs using the project's suncam sampling
-    helper.
+#     This is the top-level data generator used by the project. It creates a
+#     synthetic DEM (via ``_generate_synthetic_dem``), constructs the rendering
+#     pipeline (``DEM``, ``HapkeModel``, ``Camera``, ``Renderer``) and produces
+#     five image / reflectance-map pairs using the project's suncam sampling
+#     helper.
 
-    Parameters
-    ----------
-    config : dict-like
-        Configuration dictionary. Required keys used by this function include
-        (names are the ones expected in the project defaults):
-        - ``DEM_SIZE`` (int or (H, W))
-        - ``IMAGE_HEIGHT``, ``IMAGE_WIDTH`` (int)
-        - ``FOCAL_LENGTH`` (float)
-        - ``MANUAL_SUNCAM_PARS`` (bool)
-        - manual suncam parameter ranges: ``MANUAL_SUN_AZ_PM``, ``MANUAL_SUN_EL_PM``,
-          ``MANUAL_CAM_AZ_PM``, ``MANUAL_CAM_EL_PM``, ``MANUAL_CAM_DIST_PM``
-        - feature placement ranges / counts: ``N_CRATERS``, ``N_RIDGES``, ``N_HILLS``,
-          ``CRATER_DEPTH_RANGE``, ``CRATER_RADIUS_RANGE``, ``RIDGE_HEIGHT_RANGE``,
-          ``RIDGE_LENGTH_RANGE``, ``RIDGE_WIDTH_RANGE``, ``HILL_HEIGHT_RANGE``,
-          ``HILL_SIGMA_RANGE``
+#     Parameters
+#     ----------
+#     config : dict-like
+#         Configuration dictionary. Required keys used by this function include
+#         (names are the ones expected in the project defaults):
+#         - ``DEM_SIZE`` (int or (H, W))
+#         - ``IMAGE_HEIGHT``, ``IMAGE_WIDTH`` (int)
+#         - ``FOCAL_LENGTH`` (float)
+#         - ``MANUAL_SUNCAM_PARS`` (bool)
+#         - manual suncam parameter ranges: ``MANUAL_SUN_AZ_PM``, ``MANUAL_SUN_EL_PM``,
+#           ``MANUAL_CAM_AZ_PM``, ``MANUAL_CAM_EL_PM``, ``MANUAL_CAM_DIST_PM``
+#         - feature placement ranges / counts: ``N_CRATERS``, ``N_RIDGES``, ``N_HILLS``,
+#           ``CRATER_DEPTH_RANGE``, ``CRATER_RADIUS_RANGE``, ``RIDGE_HEIGHT_RANGE``,
+#           ``RIDGE_LENGTH_RANGE``, ``RIDGE_WIDTH_RANGE``, ``HILL_HEIGHT_RANGE``,
+#           ``HILL_SIGMA_RANGE``
 
-    Returns
-    -------
-    images, reflectance_maps, dem_np, metas
-        images : list of numpy.ndarray
-            Five camera-sampled images, each shaped (IMAGE_HEIGHT, IMAGE_WIDTH).
-        reflectance_maps : list of numpy.ndarray
-            Five reflectance maps at DEM resolution (H_dem, W_dem).
-        dem_np : numpy.ndarray
-            Generated DEM as a 2D array (H_dem, W_dem), dtype float32.
-        metas : list
-            A list of five metadata tuples/lists describing sun/camera params
-            used for each render.
+#     Returns
+#     -------
+#     images, reflectance_maps, dem_np, metas
+#         images : list of numpy.ndarray
+#             Five camera-sampled images, each shaped (IMAGE_HEIGHT, IMAGE_WIDTH).
+#         reflectance_maps : list of numpy.ndarray
+#             Five reflectance maps at DEM resolution (H_dem, W_dem).
+#         dem_np : numpy.ndarray
+#             Generated DEM as a 2D array (H_dem, W_dem), dtype float32.
+#         metas : list
+#             A list of five metadata tuples/lists describing sun/camera params
+#             used for each render.
 
-    Raises
-    ------
-    ValueError
-        If ``config`` is None.
+#     Raises
+#     ------
+#     ValueError
+#         If ``config`` is None.
 
-    Notes
-    -----
-    - The function runs the generation and rendering inside ``torch.no_grad()``
-      to avoid tracking gradients.
-    - This docstring focuses on the API; implementation details are in the
-      helper functions (see ``_generate_synthetic_dem`` and
-      ``_get_5_sets_of_suncam_values``).
-    """
+#     Notes
+#     -----
+#     - The function runs the generation and rendering inside ``torch.no_grad()``
+#       to avoid tracking gradients.
+#     - This docstring focuses on the API; implementation details are in the
+#       helper functions (see ``_generate_synthetic_dem`` and
+#       ``_get_5_sets_of_suncam_values``).
+#     """
 
-    if config is None:
-        raise ValueError("config must be provided")
+#     if config is None:
+#         raise ValueError("config must be provided")
 
-    # unpack once to avoid repeated dict lookups and make locals explicit
-    dem_size = config['DEM_SIZE']
-    images_per_dem = config['IMAGES_PER_DEM']
-    image_h = config['IMAGE_H']
-    image_w = config['IMAGE_W']
-    focal_length = config['FOCAL_LENGTH']
-    manual_suncam_pars = config['MANUAL_SUNCAM_PARS']
-    n_craters = config['N_CRATERS']
-    n_ridges = config['N_RIDGES']
-    n_hills = config['N_HILLS']
-    crater_depth_range = config['CRATER_DEPTH_RANGE']
-    crater_radius_range = config['CRATER_RADIUS_RANGE']
-    ridge_height_range = config['RIDGE_HEIGHT_RANGE']
-    ridge_length_range = config['RIDGE_LENGTH_RANGE']
-    ridge_width_range = config['RIDGE_WIDTH_RANGE']
-    hill_height_range = config['HILL_HEIGHT_RANGE']
-    hill_sigma_range = config['HILL_SIGMA_RANGE']
-    manual_sun_az_pm = config['MANUAL_SUN_AZ_PM']
-    manual_sun_el_pm = config['MANUAL_SUN_EL_PM']
-    manual_cam_az_pm = config['MANUAL_CAM_AZ_PM']
-    manual_cam_el_pm = config['MANUAL_CAM_EL_PM']
-    manual_cam_dist_pm = config['MANUAL_CAM_DIST_PM']
+#     # unpack once to avoid repeated dict lookups and make locals explicit
+#     dem_size = config['DEM_SIZE']
+#     images_per_dem = config['IMAGES_PER_DEM']
+#     image_h = config['IMAGE_H']
+#     image_w = config['IMAGE_W']
+#     focal_length = config['FOCAL_LENGTH']
+#     manual_suncam_pars = config['MANUAL_SUNCAM_PARS']
+#     n_craters = config['N_CRATERS']
+#     n_ridges = config['N_RIDGES']
+#     n_hills = config['N_HILLS']
+#     crater_depth_range = config['CRATER_DEPTH_RANGE']
+#     crater_radius_range = config['CRATER_RADIUS_RANGE']
+#     ridge_height_range = config['RIDGE_HEIGHT_RANGE']
+#     ridge_length_range = config['RIDGE_LENGTH_RANGE']
+#     ridge_width_range = config['RIDGE_WIDTH_RANGE']
+#     hill_height_range = config['HILL_HEIGHT_RANGE']
+#     hill_sigma_range = config['HILL_SIGMA_RANGE']
+#     manual_sun_az_pm = config['MANUAL_SUN_AZ_PM']
+#     manual_sun_el_pm = config['MANUAL_SUN_EL_PM']
+#     manual_cam_az_pm = config['MANUAL_CAM_AZ_PM']
+#     manual_cam_el_pm = config['MANUAL_CAM_EL_PM']
+#     manual_cam_dist_pm = config['MANUAL_CAM_DIST_PM']
 
 
-    n_craters, n_ridges, n_hills = _get_random_n_features(n_craters_max=n_craters, 
-                                                            n_ridges_max=n_ridges, 
-                                                            n_hills_max=n_hills)
+#     n_craters, n_ridges, n_hills = _get_random_n_features(n_craters_max=n_craters, 
+#                                                             n_ridges_max=n_ridges, 
+#                                                             n_hills_max=n_hills)
 
-    dem_np = _generate_synthetic_dem(size=dem_size, 
-                                    n_craters=n_craters, 
-                                    n_ridges=n_ridges, 
-                                    n_hills=n_hills,
-                                    crater_depth_range=crater_depth_range,
-                                    crater_radius_range=crater_radius_range,
-                                    ridge_height_range=ridge_height_range,
-                                    ridge_length_range=ridge_length_range,
-                                    ridge_width_range=ridge_width_range,
-                                    hill_height_range=hill_height_range,
-                                    hill_sigma_range=hill_sigma_range)
+#     dem_np = _generate_synthetic_dem(size=dem_size, 
+#                                     n_craters=n_craters, 
+#                                     n_ridges=n_ridges, 
+#                                     n_hills=n_hills,
+#                                     crater_depth_range=crater_depth_range,
+#                                     crater_radius_range=crater_radius_range,
+#                                     ridge_height_range=ridge_height_range,
+#                                     ridge_length_range=ridge_length_range,
+#                                     ridge_width_range=ridge_width_range,
+#                                     hill_height_range=hill_height_range,
+#                                     hill_sigma_range=hill_sigma_range)
         
-    with torch.no_grad():
-        # Convert DEM to torch tensor on CPU, not GPU
-        dem_tensor = torch.from_numpy(dem_np).to(dtype=torch.float32)
-        device = torch.device('cpu')
+#     with torch.no_grad():
+#         # Convert DEM to torch tensor on CPU, not GPU
+#         dem_tensor = torch.from_numpy(dem_np).to(dtype=torch.float32)
+#         device = torch.device('cpu')
 
-        dem_obj = DEM(dem_tensor, cellsize=1, x0=0, y0=0)
-        hapke = HapkeModel(w=0.6, B0=0.4, h=0.1, phase_fun="hg", xi=0.1)
-        camera = Camera(image_width=image_w,
-                        image_height=image_h,
-                        focal_length=focal_length,
-                        device=device)
-        renderer = Renderer(dem_obj, hapke, camera)
+#         dem_obj = DEM(dem_tensor, cellsize=1, x0=0, y0=0)
+#         hapke = HapkeModel(w=0.6, B0=0.4, h=0.1, phase_fun="hg", xi=0.1)
+#         camera = Camera(image_width=image_w,
+#                         image_height=image_h,
+#                         focal_length=focal_length,
+#                         device=device)
+#         renderer = Renderer(dem_obj, hapke, camera)
 
-        reflectance_maps = []
-        images = []
-        metas = []
+#         reflectance_maps = []
+#         images = []
+#         metas = []
 
-        # Use the project's standard suncam variation function
-        sets_of_params = _get_sets_of_suncam_values(manual_suncam_pars=manual_suncam_pars,
-                                                          manual_sun_az_pm=manual_sun_az_pm,
-                                                          manual_sun_el_pm=manual_sun_el_pm,
-                                                          manual_cam_az_pm=manual_cam_az_pm,
-                                                          manual_cam_el_pm=manual_cam_el_pm,
-                                                          manual_cam_dist_pm=manual_cam_dist_pm,
-                                                          images_per_dem=images_per_dem)
-        # Render images + reflectance maps
-        for i in range(images_per_dem):
-            params = sets_of_params[i]
-            img, reflectance_map = _render_single_image(renderer=renderer, params=params, image_w=image_w, image_h=image_h)
-            reflectance_maps.append(reflectance_map)
-            images.append(img)
-            metas.append(list(params))
+#         # Use the project's standard suncam variation function
+#         sets_of_params = _get_sets_of_suncam_values(manual_suncam_pars=manual_suncam_pars,
+#                                                           manual_sun_az_pm=manual_sun_az_pm,
+#                                                           manual_sun_el_pm=manual_sun_el_pm,
+#                                                           manual_cam_az_pm=manual_cam_az_pm,
+#                                                           manual_cam_el_pm=manual_cam_el_pm,
+#                                                           manual_cam_dist_pm=manual_cam_dist_pm,
+#                                                           images_per_dem=images_per_dem)
+#         # Render images + reflectance maps
+#         for i in range(images_per_dem):
+#             params = sets_of_params[i]
+#             img, reflectance_map = _render_single_image(renderer=renderer, params=params, image_w=image_w, image_h=image_h)
+#             reflectance_maps.append(reflectance_map)
+#             images.append(img)
+#             metas.append(list(params))
             
-    return images, reflectance_maps, dem_np, metas
+#     return images, reflectance_maps, dem_np, metas
 
 
 def generate_and_save_data_bacteria(path: str = None, config: dict = None):
@@ -323,7 +324,10 @@ def generate_and_return_worker_friendly(config):
     # args is a (path, config) tuple so this worker remains picklable and simple
     try:
         if config["USE_LRO_DEMS"]:
-            images, reflectance_maps, dem_np, metas = generate_and_return_lro_data(config=config)
+            if config["USE_MULTI_BAND"]:
+                images, reflectance_maps, dem_np, metas, w_np, theta_bar_np, lro_meta = generate_and_return_lro_data_multi_band(config=config)
+            else:
+                images, reflectance_maps, dem_np, metas = generate_and_return_lro_data(config=config)
         else:
             images, reflectance_maps, dem_np, metas = generate_and_return_data_bacteria(config=config)
         # Explicit cleanup
@@ -333,7 +337,13 @@ def generate_and_return_worker_friendly(config):
         import traceback
         traceback.print_exc()
         return None
-    return images, reflectance_maps, dem_np, metas
+    if config["USE_LRO_DEMS"]:
+        if config["USE_MULTI_BAND"]:
+            return images, reflectance_maps, dem_np, metas, w_np, theta_bar_np, lro_meta
+        else:
+            return images, reflectance_maps, dem_np, metas
+    else:
+        return images, reflectance_maps, dem_np, metas
 
 def generate_and_save_worker_friendly(args):
     """Worker-friendly generator: instantiate local HapkeModel/Camera/Renderer and save a .npz.
@@ -344,7 +354,10 @@ def generate_and_save_worker_friendly(args):
     path, config = args
     try:
         if config["USE_LRO_DEMS"]:
-            generate_and_save_lro_data(config=config, save_path=path)
+            if config["USE_MULTI_BAND"]:
+                generate_and_save_lro_data_multi_band(config=config, save_path=path)
+            else:
+                generate_and_save_lro_data(config=config, save_path=path)
         else:
             generate_and_save_data_bacteria(path=path, config=config)
     except Exception:
@@ -414,7 +427,16 @@ def _multiprocessing_worker(args):
     filename = os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
     try:
         if config["USE_LRO_DEMS"]:
-            generate_and_save_lro_data(config=config, save_path=filename)
+            if config["USE_MULTI_BAND"]:
+                generate_and_save_lro_data_multi_band(
+                    config=config,
+                    save_path=filename
+                )
+            else:
+                generate_and_save_lro_data(
+                    config=config,
+                    save_path=filename
+                )
         else:
             generate_and_save_data_bacteria(path=filename, config=config)
         return True
@@ -471,15 +493,18 @@ def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, 
         
         try:
             if config["USE_LRO_DEMS"]:
-                if not config["SAVE_LRO_METAS"]:
-                    images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=config, device=device)
+                if config["USE_MULTI_BAND"]:
+                    images, reflectance_maps, dem_tensor, metas, w_tensor, theta_bar_tensor, lro_meta = generate_and_return_lro_data_multi_band(config=config, device=device)
                     data_dict = {
                         'dem': dem_tensor,
                         'data': torch.stack(images),
                         'reflectance_maps': torch.stack(reflectance_maps),
-                        'meta': torch.tensor(metas, dtype=torch.float32)
+                        'meta': torch.tensor(metas, dtype=torch.float32),
+                        'w': w_tensor,
+                        'theta_bar': theta_bar_tensor,
+                        'lro_meta': torch.tensor(lro_meta, dtype=torch.float32)
                     }
-                else:
+                elif config["SAVE_LRO_METAS"] == True:
                     images, reflectance_maps, dem_tensor, metas, lro_meta = generate_and_return_lro_data(config=config, device=device)
                     data_dict = {
                         'dem': dem_tensor,
@@ -488,7 +513,14 @@ def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, 
                         'meta': torch.tensor(metas, dtype=torch.float32),
                         'lro_meta': torch.tensor(lro_meta, dtype=torch.float32)
                     }
-
+                elif config["SAVE_LRO_METAS"] == False:
+                    images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=config, device=device)
+                    data_dict = {
+                        'dem': dem_tensor,
+                        'data': torch.stack(images),
+                        'reflectance_maps': torch.stack(reflectance_maps),
+                        'meta': torch.tensor(metas, dtype=torch.float32)
+                    }
             else:
                 images, reflectance_maps, dem_np, metas = generate_and_return_data_bacteria(config=config, device=device)
                 data_dict = {
@@ -547,7 +579,8 @@ def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, 
 
 def generate_and_save_data_pooled_multi_gpu(config: dict = None,
                                   images_dir: str = None,
-                                  n_dems: int = None):
+                                  n_dems: int = None,
+                                  multi_band: bool = False):
     """
     Optimized multi-GPU data generation with automatic tuning.
     """
@@ -568,10 +601,16 @@ def generate_and_save_data_pooled_multi_gpu(config: dict = None,
             for dem_idx in range(n_dems):
                 # Call the single-threaded data generation function directly
                 if config["USE_LRO_DEMS"]:
-                    generate_and_save_lro_data(
-                        config=config,
-                        save_path=os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
-                    )
+                    if multi_band:
+                        generate_and_save_lro_data_multi_band(
+                            config=config,
+                            save_path=os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
+                        )
+                    else:
+                        generate_and_save_lro_data(
+                            config=config,
+                            save_path=os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
+                        )
                 else:
                     generate_and_save_data_bacteria(
                         path=os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt"),

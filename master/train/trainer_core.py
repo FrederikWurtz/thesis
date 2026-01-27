@@ -13,14 +13,17 @@ import h5py
 from torch.utils.data import Dataset
 
 from master.lro_data_sim.lro_generator import generate_and_return_lro_data
-from master.data_sim.generator import generate_and_return_data_CPU
+from master.data_sim.generator import generate_and_return_data_bacteria
+from master.lro_data_sim.lro_generator_multi_band import generate_and_return_lro_data_multi_band
 from master.models.losses import calculate_total_loss
 from master.train.train_utils import normalize_inputs
 
 
 class DEMDataset(Dataset):
-    def __init__(self, files):
+    def __init__(self, files, config=None):
         self.files = files
+        if config is not None:
+            self.config = config
 
     def __len__(self):
         return len(self.files)
@@ -28,14 +31,23 @@ class DEMDataset(Dataset):
     def __getitem__(self, idx):
         # Load PyTorch tensors directly
         loaded = torch.load(self.files[idx], map_location='cpu')
-        
-        # Extract tensors using the correct keys from generator.py
-        target_tensor = loaded['dem'].unsqueeze(0)  # Add channel dim
-        images_tensor = loaded['data']
-        reflectance_maps_tensor = loaded['reflectance_maps']
-        meta_tensor = loaded['meta']
-        
-        return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
+        if hasattr(self, "config") and self.config is not None and self.config.get("USE_MULTI_BAND", False):
+            # Extract tensors using the correct keys from generator.py
+            target_tensor = loaded['dem'].unsqueeze(0)  # Add channel dim
+            images_tensor = loaded['data']
+            reflectance_maps_tensor = loaded['reflectance_maps']
+            meta_tensor = loaded['meta']
+            w_tensor = loaded['w']
+            theta_bar_tensor = loaded['theta_bar']
+            return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor, w_tensor, theta_bar_tensor
+        else:
+            # Extract tensors using the correct keys from generator.py
+            target_tensor = loaded['dem'].unsqueeze(0)  # Add channel dim
+            images_tensor = loaded['data']
+            reflectance_maps_tensor = loaded['reflectance_maps']
+            meta_tensor = loaded['meta']
+            
+            return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
 
 class FluidDEMDataset(Dataset):
     """Dataset that synthesizes DEMs and corresponding 5-image sets on the fly.
@@ -75,15 +87,23 @@ class FluidDEMDataset(Dataset):
         np.random.seed(epoch_seed % (2**32 - 1))
 
         if self.config["USE_LRO_DEMS"]:
-            images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=self.config, device='cpu')
+            if self.config["USE_MULTI_BAND"]:
+                images, reflectance_maps, dem_tensor, metas, w_tensor, theta_bar_tensor, lro_meta = generate_and_return_lro_data_multi_band(config=self.config, device='cpu')
 
-            if not torch.is_tensor(dem_tensor):
-                dem_tensor = torch.from_numpy(dem_tensor)
-   
-            return torch.stack(images), torch.stack(reflectance_maps), dem_tensor.unsqueeze(0), torch.tensor(metas, dtype=torch.float32)
+                if not torch.is_tensor(dem_tensor):
+                    dem_tensor = torch.from_numpy(dem_tensor)
+
+                return torch.stack(images), torch.stack(reflectance_maps), dem_tensor.unsqueeze(0), torch.tensor(metas, dtype=torch.float32), w_tensor.unsqueeze(0), theta_bar_tensor.unsqueeze(0), torch.tensor(lro_meta, dtype=torch.float32)
+            else:
+                images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=self.config, device='cpu')
+
+                if not torch.is_tensor(dem_tensor):
+                    dem_tensor = torch.from_numpy(dem_tensor)
+    
+                return torch.stack(images), torch.stack(reflectance_maps), dem_tensor.unsqueeze(0), torch.tensor(metas, dtype=torch.float32)
 
         else:
-            images, reflectance_maps, dem_np, metas = generate_and_return_data_CPU(config=self.config)
+            images, reflectance_maps, dem_np, metas = generate_and_return_data_bacteria(config=self.config)
 
             images_np = np.stack(images, axis=0)  # (5, H_img, W_img)
             refl_np = np.stack(reflectance_maps, axis=0)  # (5, H_dem, W_dem)

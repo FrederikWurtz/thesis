@@ -34,6 +34,7 @@ def run_train(run_dir, new_run=False):
             cmd.append("--new_run")
         env = os.environ.copy()
         env["OMP_NUM_THREADS"] = "2"
+        env["GDAL_NUM_THREADS"] = "2"
 
         signal.signal(signal.SIGINT, handle_sigint)
         signal.signal(signal.SIGTERM, handle_sigint)
