@@ -155,6 +155,7 @@ def extract_local_dem_subset(
         - 'height': output height in pixels
         - 'resolution_m': resolution in meters per pixel
     """
+    
     # Build local CRS
     dst_crs = build_local_crs(center_lat_deg, center_lon_deg, 
                                proj=local_proj_type, moon_radius_m=moon_radius_m)

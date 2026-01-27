@@ -5,32 +5,7 @@ import torch
 
 from master.train.checkpoints import read_file_from_ini
 from master.validate.plotting_new import plot_comprehensive_pt, plot_data_pt
-
-def run_test(run_dir):
-    # Check if we have CUDA available
-    if torch.cuda.is_available():
-        n_proc_per_node = torch.cuda.device_count()
-        print(f"No test results found - running test with {n_proc_per_node} GPUs before plotting...")
-        cmd = [
-            "torchrun",
-            f"--nproc_per_node={n_proc_per_node}",
-            "--standalone",
-            "master/entry/test.py",
-            "--run_dir", run_dir
-        ]
-        env = os.environ.copy()
-        env["OMP_NUM_THREADS"] = "2"
-        subprocess.run(cmd, env=env, check=True)
-    else:
-        print("No GPUs available - running test with python call before plotting...")
-        cmd = [
-            "python",
-            "master/entry/test.py",
-            "--run_dir", run_dir
-        ]
-        env = os.environ.copy()
-        subprocess.run(cmd, env=env, check=True)
-
+from master.entry.test import run_test
 
 
 if __name__ == "__main__":
@@ -43,6 +18,8 @@ if __name__ == "__main__":
                       help="Variant for selecting test sets: 'first' or 'random'.")
     args.add_argument('--use_train_set', action='store_true',
                       help="Use the training set for plotting instead of the test set.")
+    args.add_argument('--test_on_separate_data', action='store_true',
+                      help="Indicates testing on separate data.")
     args = args.parse_args()
 
     # Support both positional and flag-based arguments
@@ -62,13 +39,28 @@ if __name__ == "__main__":
                         use_train_set = args.use_train_set)
     else:
         # Ensure test results exist and are valid
-        test_results_path = os.path.join("runs", run_dir, 'stats', 'test_results.ini')
-        if not os.path.exists(test_results_path):
-            run_test(run_dir)
+        if not args.test_on_separate_data:
+            test_results_path = os.path.join("runs", run_dir, 'stats', 'test_results.ini')
         else:
-            test_results = read_file_from_ini(test_results_path)
-            if test_results.get("TEST_LOSS") is None:
-                    run_test(run_dir)
+            test_results_path = os.path.join("runs", run_dir, 'stats', 'alt_test_results.ini')
+
+        if not os.path.exists(test_results_path):
+            print("No test results found, running testing...")
+            run_test(run_dir, test_on_separate_data=args.test_on_separate_data)
+
+        filename = "comprehensive"
+        if not args.use_train_set:
+            filename += "_testset"
+        if args.use_train_set:
+            filename += "_trainset"
+        if args.test_on_separate_data:
+            filename += "_alt"
+        if args.variant == 'first':
+            filename += "_first"
+        if args.variant == 'random':
+            filename += "_random"
+            
+        filename += ".pdf"
 
         print("Training snapshot and test results found, plotting predictions...")
         plot_comprehensive_pt(run_dir=run_dir,
@@ -78,5 +70,6 @@ if __name__ == "__main__":
                             figsize=(15, 10),
                             save_fig=True,
                             return_fig=False,
-                            use_train_set = args.use_train_set
-                            )
+                            use_train_set = args.use_train_set,
+                            filename=filename,
+                            test_on_separate_data = args.test_on_separate_data)

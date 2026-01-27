@@ -164,6 +164,8 @@ def main(argv=None):
             torch.manual_seed(base_seed - 1) # -1 to differ from training seed
             np.random.seed((base_seed - 1) % (2**32 - 1)) # -1 to differ from training seed
             # create validation files
+            config["USE_SEPARATE_VALTEST_PARS"] = True  # ensure separate val/test params
+            print(f"Using alternative val/test parameters: {config['USE_SEPARATE_VALTEST_PARS']}")
             generate_and_save_data_pooled_multi_gpu(config, images_dir=val_path, n_dems=config["FLUID_VAL_DEMS"])
             # also calculate and save mean reflectance map over validation set
             val_files = list_pt_files(val_path)
@@ -185,9 +187,33 @@ def main(argv=None):
             mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
             save_file_as_ini({'MEAN': train_mean.tolist(), 'STD': train_std.tolist()}, mean_std_path)
 
+            # plot LRO sampling distributions for val and test sets
+            config["USE_SEPARATE_VALTEST_PARS"] = False  # reset to default for training data generation
+            print(f"Using alternative val/test parameters: {config['USE_SEPARATE_VALTEST_PARS']}")
+            # reset seeds for training data generation - only used to plot LRO sampling distributions
+            torch.manual_seed(base_seed) 
+            np.random.seed(base_seed % (2**32 - 1))
+            train_path = os.path.join(run_path, 'train')
+            os.makedirs(train_path, exist_ok=True)
+            generate_and_save_data_pooled_multi_gpu(config, images_dir=train_path, n_dems=config["FLUID_TRAIN_DEMS"])
+
+            import sys
+            env = os.environ.copy()
+            cmd = [
+                sys.executable,
+                "master/validate/plot_lro_sampling.py",
+                run_dir,
+                "val",
+                "train"
+            ]
+            subprocess.run(cmd, env=env)
+
         elif args.skip_data_gen:
             pass  # skip data generation as per user request
-    
+
+    config["SAVE_LRO_METAS"] = False  
+    print("SAVE_LRO_METAS set to:", end=" ")
+    print(config["SAVE_LRO_METAS"])
     config_path = os.path.join(run_path, 'stats', 'config.ini')
     save_file_as_ini(config, config_path) # save final config to run directory
 

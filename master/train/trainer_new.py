@@ -493,7 +493,6 @@ def load_test_objs(config, test_path: str):
     test_set = DEMDataset(test_set)
     return test_set
 
-
 def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, prefetch_factor: int = 4, use_shuffle: bool = False, persistent_workers: bool = True, multi_gpu: bool = True) -> DataLoader:
     if multi_gpu:
         rank = int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else 0

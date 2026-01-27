@@ -12,30 +12,52 @@ from master.render.hapke_model import HapkeModel
 from master.render.camera import Camera
 from master.render.renderer import Renderer
 
+
 import torch
 import torch.nn.functional as F
 
 
 def generate_and_save_lro_data(config: dict = None, save_path: str = None):
 
-    images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config)
+    if not config["SAVE_LRO_METAS"]:
+        images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config)
 
-    if not torch.is_tensor(dem_tensor):
-        dem_tensor = torch.from_numpy(dem_tensor)
+        if not torch.is_tensor(dem_tensor):
+            dem_tensor = torch.from_numpy(dem_tensor)
 
-    data_dict = {
-        'dem': dem_tensor,
-        'data': torch.stack(images),
-        'reflectance_maps': torch.stack(reflectance_maps),
-        'meta': torch.tensor(metas, dtype=torch.float32)
-    }
-        
-    torch.save(data_dict, save_path)
+        data_dict = {
+            'dem': dem_tensor,
+            'data': torch.stack(images),
+            'reflectance_maps': torch.stack(reflectance_maps),
+            'meta': torch.tensor(metas, dtype=torch.float32)
+        }
+            
+        torch.save(data_dict, save_path)
+    else:
+        images, reflectance_maps, dem_tensor, metas, lro_meta = generate_and_return_lro_data(config)
+        lro_meta = torch.tensor(lro_meta, dtype=torch.float32)
+
+        if not torch.is_tensor(dem_tensor):
+            dem_tensor = torch.from_numpy(dem_tensor)
+
+        data_dict = {
+            'dem': dem_tensor,
+            'data': torch.stack(images),
+            'reflectance_maps': torch.stack(reflectance_maps),
+            'meta': torch.tensor(metas, dtype=torch.float32),
+            'lro_meta': lro_meta
+        }
+            
+        torch.save(data_dict, save_path)
+
 
 
 def generate_and_return_lro_data(config: dict = None, device: str = "cpu"):
 
-    dem_tensor = generate_and_return_lro_dem(config)
+    if not config["SAVE_LRO_METAS"]:
+        dem_tensor = generate_and_return_lro_dem(config)
+    else:
+        dem_tensor, lro_meta = generate_and_return_lro_dem(config)
 
     with torch.no_grad():
         # Convert DEM to torch tensor on GPU in a single operation
@@ -53,9 +75,10 @@ def generate_and_return_lro_data(config: dict = None, device: str = "cpu"):
         reflectance_maps = []
         images = []
         metas = []
-
-        # Use the project's standard suncam variation function
+        
+        # Import internal functions for parameter handling and rendering - has to be done here to avoid circular imports
         from master.data_sim.generator import _get_sets_of_suncam_values, _render_single_image
+        
         
         sets_of_params = _get_sets_of_suncam_values(manual_suncam_pars=config["MANUAL_SUNCAM_PARS"],
                                                           manual_sun_az_pm=config["MANUAL_SUN_AZ_PM"],
@@ -71,8 +94,12 @@ def generate_and_return_lro_data(config: dict = None, device: str = "cpu"):
             reflectance_maps.append(reflectance_map)
             images.append(img)
             metas.append(list(params))
-            
-    return images, reflectance_maps, dem_tensor, metas
+    
+    if not config["SAVE_LRO_METAS"]:
+        return images, reflectance_maps, dem_tensor, metas
+    
+    else:
+        return images, reflectance_maps, dem_tensor, metas, lro_meta
 
 
 def generate_and_return_lro_dem(config: dict = None):
@@ -110,8 +137,11 @@ def generate_and_return_lro_dem(config: dict = None):
 
     # normalize heights
     dem_normalized = dem_resampled / torch.max(torch.abs(dem_resampled)) * height_norm
-
-    return dem_normalized
+    if not config["SAVE_LRO_METAS"]:
+        return dem_normalized
+    
+    else:
+        return dem_normalized, [lat, lon, box_radius, height_norm]
 
 def resample_dem_torch(dem_array, desired_pixel_size, device=None):
     """
@@ -148,7 +178,7 @@ def get_lat_lon_radius_height(config: dict):
             height_normalization += np.random.uniform(-height_normalization_pm, height_normalization_pm)
     else:
         # use separate val/test parameters, including stochasticity if enabled
-        print("Using separate val/test parameters for LRO DEM generation")
+        # print("Using separate val/test parameters for LRO DEM generation")
         center_lat_deg = config['CENTER_LAT_DEG_VALTEST']
         center_lon_deg = config['CENTER_LON_DEG_VALTEST']
         box_radius_m = config['BOX_RADIUS_M_VALTEST']
@@ -164,6 +194,11 @@ def get_lat_lon_radius_height(config: dict):
             box_radius_m += np.random.uniform(-box_radius_m_pm, box_radius_m_pm)
             height_normalization += np.random.uniform(-height_normalization_pm, height_normalization_pm)
 
+    # Clamp latitude to valid range
+    center_lat_deg = np.clip(center_lat_deg, -90.0, 90.0)
+
+    # Wrap longituded using modulus, such that -180 < lon <= 180
+    center_lon_deg = ((center_lon_deg + 180) % 360) - 180
 
 
     # csv_path = os.path.join("master", "lro_data_sim", "lro_metadata.csv")

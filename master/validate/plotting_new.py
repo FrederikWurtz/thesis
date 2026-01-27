@@ -103,7 +103,7 @@ def plot_comprehensive_pt(
     run_dir=None,
     n_test_sets=5, figsize=(24, 18), return_fig=False, 
     save_fig=True,
-    same_scale=False, variant='random', use_train_set = False
+    same_scale=False, variant='random', use_train_set = False, filename=None, test_on_separate_data=False
 ):
 
     # Load config to find paths
@@ -115,7 +115,10 @@ def plot_comprehensive_pt(
     input_stats_path = os.path.join(sup_dir, run_dir, 'stats', 'input_stats.ini')
     train_timings_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'train_timings.csv')
     val_timings_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'val_timings.csv')
-    test_results_path = os.path.join(sup_dir, run_dir, 'stats', 'test_results.ini')
+    if not test_on_separate_data:
+        test_results_path = os.path.join(sup_dir, run_dir, 'stats', 'test_results.ini')
+    else:
+        test_results_path = os.path.join(sup_dir, run_dir, 'stats', 'alt_test_results.ini')
     equipment_info_path = os.path.join(sup_dir, run_dir, 'stats', 'equipment_info.ini')
     
     # Load model, history, and test dataset
@@ -167,7 +170,8 @@ def plot_comprehensive_pt(
     # lr_changes = read_file_from_ini(lr_changes_path, ftype=dict)
     test_dems_dir = os.path.join(sup_dir, run_dir, 'test')
     print(f"Use train set: {use_train_set}")
-    if not use_train_set:
+    print(f"Use separate test data: {test_on_separate_data}")
+    if not use_train_set and not test_on_separate_data:
         test_files = None
         if os.path.isdir(test_dems_dir):
             # Look for .pt files in the test_dems folder
@@ -182,8 +186,7 @@ def plot_comprehensive_pt(
 
         test_dataset = DEMDataset(test_files)
     
-    if use_train_set:
-        print("Using training set for plotting instead of test set.")
+    if use_train_set and not test_on_separate_data:
         run_path = os.path.join(sup_dir, run_dir)
 
         train_set = FluidDEMDataset(config)
@@ -196,6 +199,12 @@ def plot_comprehensive_pt(
             prefetch_factor=config["PREFETCH_FACTOR"]
         )
         test_dataset = train_set
+    
+    if test_on_separate_data:
+        alt_test_dir = os.path.join(sup_dir, run_dir, 'alt_test')
+        test_files = sorted(glob.glob(os.path.join(alt_test_dir, '*.pt')))
+        test_dataset = DEMDataset(test_files)
+        print(f"Using {len(test_files)} alternative test files from: {alt_test_dir}")
 
     model = UNet(in_channels=config["IMAGES_PER_DEM"], out_channels=1)
     model.load_state_dict(checkpoint['MODEL_STATE'])
@@ -450,14 +459,13 @@ def plot_comprehensive_pt(
     cbar_dem_ax = fig.add_axes([cbar_dem_x, bottom_y, cbar_dem_width, total_height])
     cbar_dem = plt.colorbar(last_pred_im, cax=cbar_dem_ax)
     cbar_dem.ax.tick_params(labelsize=10)
-    
-    output_name = "comprehensive_validation_test.pdf" if not use_train_set else "comprehensive_validation_train.pdf"
+
 
     # Save?
     if save_fig:
         figures_dir = os.path.join(sup_dir, run_dir, 'figures')
         os.makedirs(figures_dir, exist_ok=True)
-        output_path = os.path.join(figures_dir, output_name)
+        output_path = os.path.join(figures_dir, filename if filename is not None else 'comprehensive_plot.pdf')
         fig.savefig(output_path, format='pdf', bbox_inches='tight', dpi=150)
         print(f"Figure saved to: {output_path}")
     
@@ -495,9 +503,9 @@ def plot_data_pt(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
 
         test_dataset = DEMDataset(test_files)
     
+    config = load_config_file(os.path.join(run_dir, 'stats', 'config.ini'))
     if use_train_set:
         print("Using training set for plotting instead of test set.")
-        config = load_config_file(os.path.join(run_dir, 'stats', 'config.ini'))
 
         train_set = FluidDEMDataset(config)
         test_dataset = train_set
@@ -519,7 +527,13 @@ def plot_data_pt(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
     all_images = []
     
     for idx in selected_indices:
-        images, reflectance_maps, target, meta = test_dataset[idx]
+        if not config["SAVE_LRO_METAS"]:
+            images, reflectance_maps, target, meta = test_dataset[idx]
+        elif use_train_set:
+            images, reflectance_maps, target, meta = test_dataset[idx]
+        elif config["SAVE_LRO_METAS"]:
+            images, reflectance_maps, target, meta, lro_metas = test_dataset[idx]
+
         dem = target.squeeze().numpy()
         all_dems.append(dem)
         for img_idx in range(n_images):
@@ -558,11 +572,13 @@ def plot_data_pt(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
     
     for i, test_idx in enumerate(selected_indices):
         # Load data
-        images, reflectance_maps, target, meta = test_dataset[test_idx]
+        if not config["SAVE_LRO_METAS"]:
+            images, reflectance_maps, target, meta = test_dataset[test_idx]
+        else:
+            images, reflectance_maps, target, meta, lro_metas = test_dataset[test_idx]
         dem = target.squeeze().numpy()
         dem_num = test_idx
         images = np.array([images[j].numpy() for j in range(n_images)])
-        
         # Calculate per-row min/max if same_scale='row'
         if same_scale == 'row':
             row_img_min = images.min()

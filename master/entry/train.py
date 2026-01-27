@@ -2,9 +2,25 @@ import subprocess
 import os
 import torch
 import argparse
+import sys
+import signal
+import torch.distributed
+
+def handle_sigint(signum, frame):
+    print("Interrupt received. Destroying process group...")
+    try:
+        torch.distributed.destroy_process_group()
+    except Exception as e:
+        print(f"Error destroying process group: {e}")
+    raise KeyboardInterrupt
+
+def kill_orphaned_processes():
+    subprocess.run(["pkill", "-f", "train_runner_multiGPU.py"])
+    subprocess.run(["pkill", "-f", "torchrun"])
 
 def run_train(run_dir, new_run=False):
     if torch.cuda.is_available():
+
         n_proc_per_node = torch.cuda.device_count()
         print(f"Starting training with {n_proc_per_node} GPUs...")
         cmd = [
@@ -18,10 +34,17 @@ def run_train(run_dir, new_run=False):
             cmd.append("--new_run")
         env = os.environ.copy()
         env["OMP_NUM_THREADS"] = "2"
-        subprocess.run(cmd, env=env, check=True)
+
+        signal.signal(signal.SIGINT, handle_sigint)
+        signal.signal(signal.SIGTERM, handle_sigint)
+
+        try:
+            subprocess.run(cmd, env=env, check=True)
+        except KeyboardInterrupt:
+            print("Training interrupted by user.")
+            kill_orphaned_processes()
     else:
         print("No CUDA available - starting training with python call...")
-        import sys
         env = os.environ.copy()
         cmd = [
             sys.executable,

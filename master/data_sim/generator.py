@@ -8,7 +8,6 @@ from master.render.dem_utils import DEM
 from master.render.hapke_model import HapkeModel
 from master.render.camera import Camera
 from master.render.renderer import Renderer
-
 from master.lro_data_sim.lro_generator import generate_and_return_lro_data, generate_and_save_lro_data
 
 import cProfile
@@ -472,13 +471,23 @@ def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, 
         
         try:
             if config["USE_LRO_DEMS"]:
-                images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=config, device=device)
-                data_dict = {
-                    'dem': dem_tensor,
-                    'data': torch.stack(images),
-                    'reflectance_maps': torch.stack(reflectance_maps),
-                    'meta': torch.tensor(metas, dtype=torch.float32)
-                }
+                if not config["SAVE_LRO_METAS"]:
+                    images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=config, device=device)
+                    data_dict = {
+                        'dem': dem_tensor,
+                        'data': torch.stack(images),
+                        'reflectance_maps': torch.stack(reflectance_maps),
+                        'meta': torch.tensor(metas, dtype=torch.float32)
+                    }
+                else:
+                    images, reflectance_maps, dem_tensor, metas, lro_meta = generate_and_return_lro_data(config=config, device=device)
+                    data_dict = {
+                        'dem': dem_tensor,
+                        'data': torch.stack(images),
+                        'reflectance_maps': torch.stack(reflectance_maps),
+                        'meta': torch.tensor(metas, dtype=torch.float32),
+                        'lro_meta': torch.tensor(lro_meta, dtype=torch.float32)
+                    }
 
             else:
                 images, reflectance_maps, dem_np, metas = generate_and_return_data_bacteria(config=config, device=device)

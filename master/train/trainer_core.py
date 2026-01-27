@@ -18,6 +18,85 @@ from master.models.losses import calculate_total_loss
 from master.train.train_utils import normalize_inputs
 
 
+class DEMDataset(Dataset):
+    def __init__(self, files):
+        self.files = files
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        # Load PyTorch tensors directly
+        loaded = torch.load(self.files[idx], map_location='cpu')
+        
+        # Extract tensors using the correct keys from generator.py
+        target_tensor = loaded['dem'].unsqueeze(0)  # Add channel dim
+        images_tensor = loaded['data']
+        reflectance_maps_tensor = loaded['reflectance_maps']
+        meta_tensor = loaded['meta']
+        
+        return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
+
+class FluidDEMDataset(Dataset):
+    """Dataset that synthesizes DEMs and corresponding 5-image sets on the fly.
+
+    - __len__ returns n_dems
+    - __getitem__ returns (images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor)
+    """
+    def __init__(self, config=None, epoch_shared=None):
+        # NOTE: store simple kwargs/dicts only so the Dataset is picklable by DataLoader workers
+        self.config = config
+        self.epoch_shared = epoch_shared if epoch_shared is not None else 0
+        self.base_seed = config["BASE_SEED"] if "BASE_SEED" in config else 42
+
+    def set_epoch(self, epoch):
+        """Set epoch for deterministic data generation."""
+
+        # print(f"FluidDEMDataset: Old epoch: {self.epoch_shared.value}")
+        self.epoch_shared.value = epoch
+        # print(f"FluidDEMDataset: New epoch set to {self.epoch_shared.value} in shared memory.")
+        # self.epoch = epoch
+        # print(f"FluidDEMDataset: New epoch {self.epoch}")
+
+    def __len__(self):
+        return self.config["FLUID_TRAIN_DEMS"]
+
+    def __getitem__(self, idx):
+        # Set seed for reproducibility
+        
+        current_epoch = self.epoch_shared.value if hasattr(self.epoch_shared, 'value') else self.epoch_shared
+        epoch_seed = self.base_seed + current_epoch * len(self) + idx
+
+        # if idx == 0:
+        #     print(f"FluidDEMDataset: Generating item idx {idx} for epoch {self.epoch_shared.value}, with seed {epoch_seed}")
+        
+
+        torch.manual_seed(epoch_seed)
+        np.random.seed(epoch_seed % (2**32 - 1))
+
+        if self.config["USE_LRO_DEMS"]:
+            images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=self.config, device='cpu')
+
+            if not torch.is_tensor(dem_tensor):
+                dem_tensor = torch.from_numpy(dem_tensor)
+   
+            return torch.stack(images), torch.stack(reflectance_maps), dem_tensor.unsqueeze(0), torch.tensor(metas, dtype=torch.float32)
+
+        else:
+            images, reflectance_maps, dem_np, metas = generate_and_return_data_CPU(config=self.config)
+
+            images_np = np.stack(images, axis=0)  # (5, H_img, W_img)
+            refl_np = np.stack(reflectance_maps, axis=0)  # (5, H_dem, W_dem)
+            meta_np = np.array(metas, dtype=np.float32)  # (5,5)
+
+            target_tensor = torch.from_numpy(dem_np).unsqueeze(0)
+            images_tensor = torch.from_numpy(images_np)
+            reflectance_maps_tensor = torch.from_numpy(refl_np)
+            meta_tensor = torch.from_numpy(meta_np)
+
+            return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
+
+            
 class DEMDatasetHDF5(Dataset):
     def __init__(self, hdf5_path):
         self.hdf5_path = hdf5_path
@@ -97,83 +176,6 @@ class DEMDatasetHDF5(Dataset):
 #         return self._load_from_disk(idx)
 
 
-class DEMDataset(Dataset):
-    def __init__(self, files):
-        self.files = files
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        # Load PyTorch tensors directly
-        loaded = torch.load(self.files[idx], map_location='cpu')
-        
-        # Extract tensors using the correct keys from generator.py
-        target_tensor = loaded['dem'].unsqueeze(0)  # Add channel dim
-        images_tensor = loaded['data']
-        reflectance_maps_tensor = loaded['reflectance_maps']
-        meta_tensor = loaded['meta']
-        
-        return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
-
-class FluidDEMDataset(Dataset):
-    """Dataset that synthesizes DEMs and corresponding 5-image sets on the fly.
-
-    - __len__ returns n_dems
-    - __getitem__ returns (images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor)
-    """
-    def __init__(self, config=None, epoch_shared=None):
-        # NOTE: store simple kwargs/dicts only so the Dataset is picklable by DataLoader workers
-        self.config = config
-        self.epoch_shared = epoch_shared if epoch_shared is not None else 0
-        self.base_seed = config["BASE_SEED"] if "BASE_SEED" in config else 42
-
-    def set_epoch(self, epoch):
-        """Set epoch for deterministic data generation."""
-
-        # print(f"FluidDEMDataset: Old epoch: {self.epoch_shared.value}")
-        # self.epoch_shared.value = epoch
-        # print(f"FluidDEMDataset: New epoch set to {self.epoch_shared.value} in shared memory.")
-        # self.epoch = epoch
-        # print(f"FluidDEMDataset: New epoch {self.epoch}")
-
-    def __len__(self):
-        return self.config["FLUID_TRAIN_DEMS"]
-
-    def __getitem__(self, idx):
-        # Set seed for reproducibility
-        
-        current_epoch = self.epoch_shared.value if hasattr(self.epoch_shared, 'value') else self.epoch_shared
-        epoch_seed = self.base_seed + current_epoch * len(self) + idx
-
-        # if idx == 0:
-        #     print(f"FluidDEMDataset: Generating item idx {idx} for epoch {self.epoch_shared.value if hasattr(self.epoch_shared, 'value') else self.epoch_shared}, with seed {epoch_seed}")
-        
-
-        torch.manual_seed(epoch_seed)
-        np.random.seed(epoch_seed % (2**32 - 1))
-
-        if self.config["USE_LRO_DEMS"]:
-            images, reflectance_maps, dem_tensor, metas = generate_and_return_lro_data(config=self.config, device='cpu')
-
-            if not torch.is_tensor(dem_tensor):
-                dem_tensor = torch.from_numpy(dem_tensor)
-   
-            return torch.stack(images), torch.stack(reflectance_maps), dem_tensor.unsqueeze(0), torch.tensor(metas, dtype=torch.float32)
-
-        else:
-            images, reflectance_maps, dem_np, metas = generate_and_return_data_CPU(config=self.config)
-
-            images_np = np.stack(images, axis=0)  # (5, H_img, W_img)
-            refl_np = np.stack(reflectance_maps, axis=0)  # (5, H_dem, W_dem)
-            meta_np = np.array(metas, dtype=np.float32)  # (5,5)
-
-            target_tensor = torch.from_numpy(dem_np).unsqueeze(0)
-            images_tensor = torch.from_numpy(images_np)
-            reflectance_maps_tensor = torch.from_numpy(refl_np)
-            meta_tensor = torch.from_numpy(meta_np)
-
-            return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor
 
 
 # def train_epoch(model, train_loader, optimizer, scaler, device, train_mean, train_std, current_epoch=None, total_epochs=None, non_blocking=None,

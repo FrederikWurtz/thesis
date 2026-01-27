@@ -91,7 +91,7 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
                                      num_workers=config["NUM_WORKERS_DATALOADER"], 
                                      prefetch_factor=config["PREFETCH_FACTOR"],
                                      use_shuffle=False)
-    
+
     trainer = Trainer_multiGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
 
     if is_main():
@@ -100,7 +100,11 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
         equipment_info_path = os.path.join(run_path, 'stats', 'equipment_info.ini')
         save_file_as_ini({'NUM_GPUS': [str(number_of_gpus)]}, equipment_info_path)
         print("Everything set up")
-    trainer.train(config["EPOCHS"])
+
+    try:
+        trainer.train(config["EPOCHS"])
+    finally:
+            torch.distributed.destroy_process_group()
 
     # Skip testing if profiling
     if config.get("SKIP_TEST", False):
