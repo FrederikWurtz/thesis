@@ -151,9 +151,9 @@ def main(argv=None):
         else:
             # print(f"Overriding config key '{cfg_key}' from CLI with value: {val}")
             config[cfg_key] = val
-    
-    print("LRO DEM usage set to:", end=" ")
-    print(config["USE_LRO_DEMS"])
+
+    print(f"Use LRO DEMs: {config['USE_LRO_DEMS']}")
+    print(f"Use multi-band DEMs: {config['USE_MULTIBAND_DEMS']}")
 
     # If run is found to be new, generate data
     if args.new_run:

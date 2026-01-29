@@ -79,9 +79,15 @@ def generate_and_return_lro_data_multi_band(config: dict = None, device: str = "
 
 def generate_and_return_lro_multi_band(config: dict = None, device: str = "cpu"):
 
-    dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_test_bands.tif"
+    dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_bands_random_blob.tif"
 
-    lat, lon, box_radius, height_norm = get_lat_lon_radius_height(config)    
+    # lat, lon, box_radius, height_norm = get_lat_lon_radius_height(config)   
+    # for test use fixed values
+    lat = 60
+    lon = -170
+    box_radius = 75000.0
+    height_norm = 30.0 
+
     all_bands_array, metadata = extract_local_subset_all_bands(
                                                     dem_path=dem_path,
                                                     center_lat_deg=lat,
@@ -95,7 +101,9 @@ def generate_and_return_lro_multi_band(config: dict = None, device: str = "cpu")
     w_array = all_bands_array[1, :, :]    # Second band is albedo (w)
     theta_bar_array = all_bands_array[2, :, :]  # Third band is theta_bar (for roughness)
     
-    dem_input = np.ma.masked_equal(dem_array, metadata['nodata'])
+    print(f"Extracted DEM shape: {dem_array.shape}, w shape: {w_array.shape}, theta_bar shape: {theta_bar_array.shape}")
+    print(f"Metadata nodata length: {len(metadata['nodata'])}, nodata value: {metadata['nodata']}")
+    dem_input = np.ma.masked_equal(dem_array, metadata['nodata'][0])
 
     # Detrend data
     dem_detrended = dem_input - np.nanmean(dem_input)
@@ -110,8 +118,11 @@ def generate_and_return_lro_multi_band(config: dict = None, device: str = "cpu")
 
     desired_pixel_size = (config["LRO_DEM_SIZE"], config["LRO_DEM_SIZE"])  # (H, W)
     dem_resampled = resample_dem_torch(masked.filled(0), desired_pixel_size, device=device)
-    w_resampled = resample_dem_torch(w_array.filled(0), desired_pixel_size, device=device)
-    theta_bar_resampled = resample_dem_torch(theta_bar_array.filled(0), desired_pixel_size, device=device)
+
+    # W og Theta HAR INGEN NODATA → brug direkte arrays
+    w_resampled = resample_dem_torch(w_array.astype(float), desired_pixel_size, device=device)
+    theta_bar_resampled = resample_dem_torch(theta_bar_array.astype(float), desired_pixel_size, device=device)
+
 
     # normalize heights
     dem_normalized = dem_resampled / torch.max(torch.abs(dem_resampled)) * height_norm

@@ -31,7 +31,7 @@ class DEMDataset(Dataset):
     def __getitem__(self, idx):
         # Load PyTorch tensors directly
         loaded = torch.load(self.files[idx], map_location='cpu')
-        if hasattr(self, "config") and self.config is not None and self.config.get("USE_MULTI_BAND", False):
+        if self.config is not None and self.config["USE_MULTI_BAND"]:
             # Extract tensors using the correct keys from generator.py
             target_tensor = loaded['dem'].unsqueeze(0)  # Add channel dim
             images_tensor = loaded['data']

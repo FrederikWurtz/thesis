@@ -579,8 +579,7 @@ def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, 
 
 def generate_and_save_data_pooled_multi_gpu(config: dict = None,
                                   images_dir: str = None,
-                                  n_dems: int = None,
-                                  multi_band: bool = False):
+                                  n_dems: int = None):
     """
     Optimized multi-GPU data generation with automatic tuning.
     """
@@ -601,7 +600,7 @@ def generate_and_save_data_pooled_multi_gpu(config: dict = None,
             for dem_idx in range(n_dems):
                 # Call the single-threaded data generation function directly
                 if config["USE_LRO_DEMS"]:
-                    if multi_band:
+                    if config["USE_MULTI_BAND"]:
                         generate_and_save_lro_data_multi_band(
                             config=config,
                             save_path=os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")

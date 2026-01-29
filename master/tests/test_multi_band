@@ -1,0 +1,164 @@
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+import rasterio
+from rasterio.windows import Window
+import os
+from tqdm import tqdm
+import torch
+
+
+from master.configs.config_utils import load_config_file
+from master.lro_data_sim.lro_generator_multi_band import generate_and_return_lro_data_multi_band
+
+# -----------------------------
+# Device helper
+# -----------------------------
+def get_best_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    else:
+        return torch.device("cpu")
+
+def plot_all_in_one_figure(
+    images,
+    reflectance_maps,
+    dem_tensor,
+    w_tensor,
+    theta_bar_tensor,
+    out_path="figures/overview.png",
+    max_show=3
+):
+    """
+    Lav én stor figur med:
+      - op til max_show images og deres reflectance_maps
+      - DEM
+      - W-band
+      - Theta-band
+
+    images, reflectance_maps: liste af torch.Tensor eller np.ndarray (H, W)
+    dem_tensor, w_tensor, theta_bar_tensor: torch.Tensor eller np.ndarray (H, W)
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # Konverter til numpy, hvis det er torch tensors
+    def to_np(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return x
+
+    images_np = [to_np(img) for img in images]
+    refls_np = [to_np(r) for r in reflectance_maps]
+    dem_np = to_np(dem_tensor)
+    w_np = to_np(w_tensor)
+    theta_np = to_np(theta_bar_tensor)
+
+    n_images = len(images_np)
+    n_show = min(n_images, max_show)
+
+    n_cols = n_show if n_show > 0 else 1
+    n_rows = 3  # 1st: images, 2nd: reflectances, 3rd: dem/w/theta
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows))
+    if n_rows == 1:
+        axes = np.expand_dims(axes, axis=0)
+    if n_cols == 1:
+        axes = np.expand_dims(axes, axis=1)
+
+    # 1st row: images
+    for i in range(n_show):
+        ax_img = axes[0, i]
+        im1 = ax_img.imshow(images_np[i], cmap="gray")
+        ax_img.set_title(f"Image {i}")
+        ax_img.axis("off")
+
+    # 2nd row: reflectances
+    for i in range(n_show):
+        ax_refl = axes[1, i]
+        im2 = ax_refl.imshow(refls_np[i], cmap="gray")
+        ax_refl.set_title(f"Reflectance {i}")
+        ax_refl.axis("off")
+
+    # 3rd row: dem, w, theta (fill first 3 columns)
+    band_titles = ["DEM", "W band", "Theta band"]
+    band_data = [dem_np, w_np, theta_np]
+    band_cmaps = ["terrain", "plasma", "plasma"]
+    for j in range(3):
+        if j < n_cols:
+            ax = axes[2, j]
+            im = ax.imshow(band_data[j], cmap=band_cmaps[j])
+            ax.set_title(band_titles[j])
+            ax.axis("off")
+            vmin = np.nanmin(band_data[j])
+            if j == 1:
+                vmin = 0.1  # for W band, avoid very low values
+            vmax = np.nanmax(band_data[j])
+            im.set_clim(vmin, vmax)
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Turn off any unused axes in 3rd row
+    for j in range(3, n_cols):
+        axes[2, j].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(out_path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    print(f"Saved overview figure to {out_path}")
+
+def main():
+    config = load_config_file()
+    device = get_best_device()
+
+
+    # Generate synthetic LRO data with multi-band support
+    new_dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_bands.tif"
+
+    print(f"Use multi band set to {config['USE_MULTI_BAND']}")
+
+    images, reflectance_maps, dem_tensor, metas, w_tensor, theta_bar_tensor, lro_meta = generate_and_return_lro_data_multi_band(config, device=device)
+    print("Generated LRO multi-band data.")
+
+    # make sure figures directory exists
+    os.makedirs("master/tests/figures", exist_ok=True)
+
+    # Så kalder du:
+    plot_all_in_one_figure(
+        images=images,
+        reflectance_maps=reflectance_maps,
+        dem_tensor=dem_tensor,
+        w_tensor=w_tensor,
+        theta_bar_tensor=theta_bar_tensor,
+        out_path="master/tests/figures/overview.png",
+        max_show=3,  # vis op til 3 billeder
+    )
+
+
+
+
+import rasterio
+from rasterio.warp import transform_bounds
+
+
+def get_moon_latlon_bounds(path, moon_radius_m=1737400):
+    """
+    Return (min_lon, min_lat, max_lon, max_lat) in DEGREES for the Moon.
+    """
+    dst_crs = f"+proj=longlat +R={moon_radius_m} +no_defs"
+
+    with rasterio.open(path) as src:
+        b = src.bounds       # in the file's projected lunar CRS
+        src_crs = src.crs
+
+        latlon_bounds = transform_bounds(src_crs, dst_crs, *b, densify_pts=21)
+        return latlon_bounds
+
+
+if __name__ == "__main__":
+
+    # print(get_moon_latlon_bounds("master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_bands.tif"))
+
+    print("Running multi-band LRO data generation test...")
+    main()
+    print("Test completed.")
