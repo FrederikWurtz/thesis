@@ -572,6 +572,225 @@ def generate_noise_bands(
         return
 
 
+import os
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+from tqdm import tqdm
+
+def generate_noise_bands_random_blob_independent_globalnorm(
+    dem_path,
+    new_dem_path,
+    tile=2048,
+    range_w=(0.7, 1.0),
+    range_theta=(0.0, 40.0),
+    random_blob_params_w=None,      # {"blob_radius_px":..., "density":..., "seed":...}
+    random_blob_params_theta=None,  # {"blob_radius_px":..., "density":..., "seed":...}
+    final_size=None,                # (H_out, W_out) – endelig størrelse; hvis None bruges hele DEM
+):
+    """
+    Generér W- og Theta-bånd med random_blob, hvor:
+
+      - Hvert tile får sit eget uafhængige random_blob-felt
+      - Der gøres INTET for at udglatte kanter mellem tiles
+      - Normalisering sker GLOBALT (samme min/max over hele scenen)
+
+    Strategi:
+      PASS 1:
+        - Looper over alle tiles
+        - Genererer random_blob-felt pr. tile
+        - Opdaterer global min/max for W og Theta
+        - Gemmer ikke noget til fil
+
+      PASS 2:
+        - Åbner output-GeoTIFF
+        - Skriver DEM (beskåret til final_size, hvis angivet)
+        - Looper over alle tiles igen (samme seed-logik)
+        - Genererer random_blob-felt igen
+        - Skalerer med global min/max til range_w / range_theta
+        - Skriver direkte til GeoTIFF med Window
+
+    Parametre:
+      dem_path: sti til input DEM (GeoTIFF)
+      new_dem_path: sti til output GeoTIFF
+      tile: I/O-tile-størrelse (og noise-tile-størrelse)
+      final_size: (H_out, W_out) – hvis sat, bruges kun øverste venstre hjørne
+    """
+
+    # --- Tjek input-parametre ---
+    if random_blob_params_w is None or "blob_radius_px" not in random_blob_params_w:
+        raise ValueError("random_blob_params_w['blob_radius_px'] skal sættes")
+
+    if random_blob_params_theta is None or "blob_radius_px" not in random_blob_params_theta:
+        raise ValueError("random_blob_params_theta['blob_radius_px'] skal sættes")
+
+    # defaults
+    random_blob_params_w.setdefault("density", 0.001)
+    random_blob_params_w.setdefault("seed", 0)
+    random_blob_params_theta.setdefault("density", 0.001)
+    random_blob_params_theta.setdefault("seed", 1)
+
+    # Sanity range
+    assert range_w[0] is not None and range_w[1] is not None, "range_w skal være (min,max)"
+    assert range_theta[0] is not None and range_theta[1] is not None, "range_theta skal være (min,max)"
+
+    # --- Device ---
+    device = get_best_device()
+    print("Using device:", device)
+
+    # --- Læs DEM ---
+    with rasterio.open(dem_path) as src:
+        dem = src.read(1)
+        crs = src.crs
+        transform = src.transform
+
+    H_dem, W_dem = dem.shape
+
+    # --- Bestem endelig størrelse (H, W) ---
+    if final_size is not None:
+        H, W = final_size
+        H = min(H, H_dem)
+        W = min(W, W_dem)
+        dem = dem[0:H, 0:W]
+    else:
+        H, W = H_dem, W_dem
+
+    print(f"DEM shape (bruges til output): {H} x {W}")
+
+    dtype_out = "float32"
+    dem_out = dem.astype(np.float32)
+
+    # --- PASS 1: Scan global min/max over alle tiles ---
+    print("PASS 1: Beregner global min/max for random_blob-felter (W og Theta)...")
+
+    global_min_w = float('inf')
+    global_max_w = float('-inf')
+    global_min_theta = float('inf')
+    global_max_theta = float('-inf')
+
+    n_tiles_y = (H + tile - 1) // tile
+    n_tiles_x = (W + tile - 1) // tile
+    n_tiles_total = n_tiles_y * n_tiles_x
+
+    with tqdm(total=n_tiles_total, desc="Pass 1 (stats)", unit="tile") as pbar:
+        for tile_idx_y, y0 in enumerate(range(0, H, tile)):
+            for tile_idx_x, x0 in enumerate(range(0, W, tile)):
+                h = min(tile, H - y0)
+                w_ = min(tile, W - x0)
+
+                # Unikke seeds pr. tile (samme formel skal bruges i PASS 2)
+                seed_w = random_blob_params_w["seed"] + tile_idx_y * 100000 + tile_idx_x
+                seed_t = random_blob_params_theta["seed"] + tile_idx_y * 100000 + tile_idx_x
+
+                nw = random_blob_field_tile(
+                    (h, w_),
+                    blob_radius_px=random_blob_params_w["blob_radius_px"],
+                    density=random_blob_params_w["density"],
+                    device=device,
+                    seed=seed_w,
+                )
+
+                nt = random_blob_field_tile(
+                    (h, w_),
+                    blob_radius_px=random_blob_params_theta["blob_radius_px"],
+                    density=random_blob_params_theta["density"],
+                    device=device,
+                    seed=seed_t,
+                )
+
+                # Min/max for dette tile
+                tile_min_w = float(nw.min())
+                tile_max_w = float(nw.max())
+                tile_min_t = float(nt.min())
+                tile_max_t = float(nt.max())
+
+                # Opdater globale stats
+                global_min_w = min(global_min_w, tile_min_w)
+                global_max_w = max(global_max_w, tile_max_w)
+                global_min_theta = min(global_min_theta, tile_min_t)
+                global_max_theta = max(global_max_theta, tile_max_t)
+
+                pbar.set_postfix({
+                    "W_min": f"{global_min_w:.3f}",
+                    "W_max": f"{global_max_w:.3f}",
+                    "T_min": f"{global_min_theta:.3f}",
+                    "T_max": f"{global_max_theta:.3f}",
+                })
+                pbar.update(1)
+
+    print(f"Global W min/max: {global_min_w:.6f}, {global_max_w:.6f}")
+    print(f"Global Theta min/max: {global_min_theta:.6f}, {global_max_theta:.6f}")
+
+    # --- Forbered output-fil ---
+    if os.path.exists(new_dem_path):
+        print(f"{new_dem_path} findes allerede. Sletter og laver ny.")
+        os.remove(new_dem_path)
+
+    with rasterio.open(
+        new_dem_path,
+        'w',
+        driver='GTiff',
+        height=H,
+        width=W,
+        count=3,
+        dtype=dtype_out,
+        crs=crs,
+        transform=transform,
+        tiled=True,
+        blockxsize=tile,
+        blockysize=tile,
+        compress='deflate',
+        BIGTIFF='YES',
+    ) as dst:
+        print(f"Creating new GeoTIFF with 3 bands at {new_dem_path}...")
+        dst.write(dem_out[0:H, 0:W], 1)
+        print("First band (DEM) written.")
+
+        # --- PASS 2: Generér igen og skriv med global normalisering ---
+        print("PASS 2: Genererer random_blob-felter igen og skriver med global normalisering...")
+
+        with tqdm(total=n_tiles_total, desc="Pass 2 (write)", unit="tile") as pbar:
+            for tile_idx_y, y0 in enumerate(range(0, H, tile)):
+                for tile_idx_x, x0 in enumerate(range(0, W, tile)):
+                    h = min(tile, H - y0)
+                    w_ = min(tile, W - x0)
+
+                    # Samme seeds som i PASS 1, så vi genskaber samme felter
+                    seed_w = random_blob_params_w["seed"] + tile_idx_y * 100000 + tile_idx_x
+                    seed_t = random_blob_params_theta["seed"] + tile_idx_y * 100000 + tile_idx_x
+
+                    nw = random_blob_field_tile(
+                        (h, w_),
+                        blob_radius_px=random_blob_params_w["blob_radius_px"],
+                        density=random_blob_params_w["density"],
+                        device=device,
+                        seed=seed_w,
+                    )
+
+                    nt = random_blob_field_tile(
+                        (h, w_),
+                        blob_radius_px=random_blob_params_theta["blob_radius_px"],
+                        density=random_blob_params_theta["density"],
+                        device=device,
+                        seed=seed_t,
+                    )
+
+                    # Global normalisering
+                    nw_norm = (nw - global_min_w) / (global_max_w - global_min_w + 1e-12)
+                    nt_norm = (nt - global_min_theta) / (global_max_theta - global_min_theta + 1e-12)
+
+                    nw_scaled = nw_norm * (range_w[1] - range_w[0]) + range_w[0]
+                    nt_scaled = nt_norm * (range_theta[1] - range_theta[0]) + range_theta[0]
+
+                    window = Window(x0, y0, w_, h)
+                    dst.write(nw_scaled.astype(dtype_out), 2, window=window)
+                    dst.write(nt_scaled.astype(dtype_out), 3, window=window)
+
+                    pbar.set_postfix({"tile": f"y:{y0}-{y0+h}, x:{x0}-{x0+w_}"})
+                    pbar.update(1)
+
+    print(f"✓ New DEM with W + Theta (random_blob, independent tiles, global norm) saved to {new_dem_path}")
+
 # doesnt work - tomorrow use this tile-wise upscaling function
 
 import torch
@@ -640,72 +859,90 @@ if __name__ == "__main__":
     new_dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_bands_random_blob.tif"
 
       # Brug mindre størrelse til test/visualisering
-    custom_H_W = (10000, 10000)
+    # custom_H_W = (10000, 10000)
 
-    # remove existing file for testing
-    if os.path.exists(new_dem_path):
-        print(f"Removing existing file {new_dem_path} for testing...")
-        os.remove(new_dem_path)
 
-    if not os.path.exists(new_dem_path):
-        # generate_noise_bands(
-        #     dem_path=dem_path,
-        #     new_dem_path=new_dem_path,
-        #     tile=2048,
-        #     noise_type="gaussian",
-        #     range_w=(0.1, 0.3),
-        #     range_theta=(math.radians(0.0), math.radians(40.0)),
-        #     gauss_params_w={
-        #         "corr_len_px": 850,   # ~100 km hvis 118 m/px
-        #     },
-        #     gauss_params_theta={
-        #         "corr_len_px": 170,   # ~20 km
-        #     },
-        #     custom_H_W=custom_H_W
-        # )
-        # generate_noise_bands(
-        #     dem_path=".../Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif",
-        #     new_dem_path=".../Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_fbm.tif",
-        #     tile=2048,
-        #     noise_type="fbm",
-        #     range_w=(0.1, 0.3),
-        #     range_theta=(math.radians(0.0), math.radians(40.0)),
-        #     fbm_params_w={
-        #         "base_scale": 1.0 / 8000.0,  # store albedo-strukturer
-        #         "octaves": 4,
-        #         "lacunarity": 2.0,
-        #         "gain": 0.5,
-        #         "hash_seed": 0,
-        #     },
-        #     fbm_params_theta={
-        #         "base_scale": 1.0 / 3000.0,  # lidt finere roughness
-        #         "octaves": 4,
-        #         "lacunarity": 2.0,
-        #         "gain": 0.5,
-        #         "hash_seed": 1,
-        #     },
-        # )
-        generate_noise_bands(
-            dem_path=dem_path,
-            new_dem_path=new_dem_path,
-            tile=2048,
-            noise_type="random_blob",
-            range_w=(0.1, 0.3),
-            range_theta=(math.radians(0.0), math.radians(40.0)),
-            random_blob_params_w={
-                "blob_radius_px": 20,   # ~60 km hvis 118 m/px
-                "density": 0.01,
-                "seed": 0,
-            },
-            random_blob_params_theta={
-                "blob_radius_px": 20,   # ~12 km
-                "density": 0.01,
-                "seed": 1,
-            },
-            global_downsample_factor=8         
-            )
-    else:
-        print(f"File {new_dem_path} already exists. Skipping creation.")
+    generate_noise_bands_random_blob_independent_globalnorm(
+                                                            dem_path,
+                                                            new_dem_path,
+                                                            tile=2048*3,
+                                                            range_w=(0.1, 0.3),
+                                                            range_theta=(math.radians(0.0), math.radians(40.0)),
+                                                            random_blob_params_w={
+                                                                                    "blob_radius_px": 20,   # ~60 km hvis 118 m/px
+                                                                                    "density": 0.01,
+                                                                                    "seed": 0,},
+                                                           random_blob_params_theta={
+                                                                                    "blob_radius_px": 20,   # ~60 km hvis 118 m/px
+                                                                                    "density": 0.01,
+                                                                                    "seed": 1,},
+                                                            final_size=None,                # (H_out, W_out) – endelig størrelse; hvis None bruges hele DEM
+                                                            )
+
+    # # remove existing file for testing
+    # if os.path.exists(new_dem_path):
+    #     print(f"Removing existing file {new_dem_path} for testing...")
+    #     os.remove(new_dem_path)
+
+    # if not os.path.exists(new_dem_path):
+    #     # generate_noise_bands(
+    #     #     dem_path=dem_path,
+    #     #     new_dem_path=new_dem_path,
+    #     #     tile=2048,
+    #     #     noise_type="gaussian",
+    #     #     range_w=(0.1, 0.3),
+    #     #     range_theta=(math.radians(0.0), math.radians(40.0)),
+    #     #     gauss_params_w={
+    #     #         "corr_len_px": 850,   # ~100 km hvis 118 m/px
+    #     #     },
+    #     #     gauss_params_theta={
+    #     #         "corr_len_px": 170,   # ~20 km
+    #     #     },
+    #     #     custom_H_W=custom_H_W
+    #     # )
+    #     # generate_noise_bands(
+    #     #     dem_path=".../Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif",
+    #     #     new_dem_path=".../Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_fbm.tif",
+    #     #     tile=2048,
+    #     #     noise_type="fbm",
+    #     #     range_w=(0.1, 0.3),
+    #     #     range_theta=(math.radians(0.0), math.radians(40.0)),
+    #     #     fbm_params_w={
+    #     #         "base_scale": 1.0 / 8000.0,  # store albedo-strukturer
+    #     #         "octaves": 4,
+    #     #         "lacunarity": 2.0,
+    #     #         "gain": 0.5,
+    #     #         "hash_seed": 0,
+    #     #     },
+    #     #     fbm_params_theta={
+    #     #         "base_scale": 1.0 / 3000.0,  # lidt finere roughness
+    #     #         "octaves": 4,
+    #     #         "lacunarity": 2.0,
+    #     #         "gain": 0.5,
+    #     #         "hash_seed": 1,
+    #     #     },
+    #     # )
+    #     generate_noise_bands(
+    #         dem_path=dem_path,
+    #         new_dem_path=new_dem_path,
+    #         tile=2048,
+    #         noise_type="random_blob",
+    #         range_w=(0.1, 0.3),
+    #         range_theta=(math.radians(0.0), math.radians(40.0)),
+    #         random_blob_params_w={
+    #             "blob_radius_px": 20,   # ~60 km hvis 118 m/px
+    #             "density": 0.01,
+    #             "seed": 0,
+    #         },
+    #         random_blob_params_theta={
+    #             "blob_radius_px": 20,   # ~12 km
+    #             "density": 0.01,
+    #             "seed": 1,
+    #         },
+    #         global_downsample_factor=8         
+    #         )
+    # else:
+    #     print(f"File {new_dem_path} already exists. Skipping creation.")
 
 
     # #make sure figures directory exists
