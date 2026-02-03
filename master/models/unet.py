@@ -53,9 +53,11 @@ class DoubleConv(nn.Module):
 
 class UNet(nn.Module):
     def __init__(self, in_channels=None, out_channels=1, features=(64, 128, 256, 512), 
-                 meta_dim=5, meta_hidden=64, meta_out=128, upsample_factor=4):
+                 meta_dim=5, meta_hidden=64, meta_out=128, upsample_factor=4, w_range=None, theta_range=None):
         super().__init__()
         self.upsample_factor = upsample_factor
+        self.w_range = w_range
+        self.theta_range = theta_range
         self.encs = nn.ModuleList()
         self.pools = nn.ModuleList()
         ch = in_channels
@@ -96,6 +98,21 @@ class UNet(nn.Module):
             x = F.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
         else:
             x = self.final_upsample(x)
+
+        # Apply activation functions to constrain outputs to physical ranges
+        if self.final_conv.out_channels == 3 and self.w_range is not None and self.theta_range is not None:
+            dem = x[:, 0:1, :, :]  # No activation for DEM
+            
+            # Scale w to [w_min, w_max]
+            w_raw = x[:, 1:2, :, :]
+            w = torch.sigmoid(w_raw) * (self.w_range[1] - self.w_range[0]) + self.w_range[0]
+            
+            # Scale theta to [theta_min, theta_max]
+            theta_raw = x[:, 2:3, :, :]
+            theta = torch.sigmoid(theta_raw) * (self.theta_range[1] - self.theta_range[0]) + self.theta_range[0]
+            
+            x = torch.cat([dem, w, theta], dim=1)
+
         return x
 
 

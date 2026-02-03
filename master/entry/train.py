@@ -8,10 +8,6 @@ import torch.distributed
 
 def handle_sigint(signum, frame):
     print("Interrupt received. Destroying process group...")
-    try:
-        torch.distributed.destroy_process_group()
-    except Exception as e:
-        print(f"Error destroying process group: {e}")
     raise KeyboardInterrupt
 
 def kill_orphaned_processes():
@@ -44,6 +40,8 @@ def run_train(run_dir, new_run=False):
         except KeyboardInterrupt:
             print("Training interrupted by user.")
             kill_orphaned_processes()
+            sys.exit(0)
+            print("Cleaned up after interruption.")
     else:
         print("No CUDA available - starting training with python call...")
         env = os.environ.copy()

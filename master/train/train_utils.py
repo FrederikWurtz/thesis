@@ -5,6 +5,7 @@ import numpy as np
 import glob
 import os
 from tqdm import tqdm
+import math
 
 def _move_to_device(obj, device):
     if torch.is_tensor(obj):
@@ -97,37 +98,16 @@ def collate(batch):
     metas = torch.stack(metas, dim=0)
     return images, refls, targets, metas
 
+# @torch.no_grad()
+# def normalize_inputs(x, mean, std):
+#     mean = mean.view(1, -1, 1, 1).to(x.device)
+#     std = std.view(1, -1, 1, 1).to(x.device)
+#     return (x - mean) / std.clamp_min(1e-6)
+
 @torch.no_grad()
 def normalize_inputs(x, mean, std):
-    mean = mean.view(1, -1, 1, 1).to(x.device)
-    std = std.view(1, -1, 1, 1).to(x.device)
-    return (x - mean) / std.clamp_min(1e-6)
+    return (x - mean) / (std + 1e-7)
 
-def worker_init_fn(worker_id):
-    worker_info = torch.utils.data.get_worker_info()
-    dataset = worker_info.dataset
-    dataset.file = h5py.File(dataset.hdf5_path, 'r', swmr=True)  # SWMR = sikker til flere readers
-    dataset.images = dataset.file['images']
-    dataset.reflectance_maps = dataset.file['reflectance_maps']
-    dataset.dems = dataset.file['dem']
-    dataset.metas = dataset.file['meta']
-
-    # --- per-worker RNG seeding ---
-    # Non-deterministic: use OS entropy so workers produce independent random streams each run
-    import os, time, random as _random, numpy as _np, torch as _torch
-    seed = (int.from_bytes(os.urandom(8), 'little')
-            ^ (os.getpid() << 16)
-            ^ worker_id
-            ^ int(time.time() * 1e6))
-    seed32 = seed % (2**32)
-    _np.random.seed(seed32)
-    _random.seed(seed32)
-    _torch.manual_seed(seed32)
-    try:
-        if _torch.cuda.is_available():
-            _torch.cuda.manual_seed(seed32)
-    except Exception:
-        pass
 
 # @torch.no_grad()
 # def compute_input_stats(loader, images_per_dem):
@@ -151,24 +131,66 @@ def worker_init_fn(worker_id):
 #     return mean, std
 
 
+# @torch.no_grad()
+# def compute_input_stats(loader, images_per_dem):
+#     total_sum = torch.zeros(images_per_dem)
+#     total_sq_sum = torch.zeros(images_per_dem)
+#     total_pixels = 0
+#     for batch in tqdm(loader, desc="Computing input stats", leave=False, position=0, dynamic_ncols=True):
+#         images = batch[0]  # (B, C, H, W) or numpy array
+#         if isinstance(images, np.ndarray):
+#             images = torch.from_numpy(images)
+#         images = images.cpu().float()
+#         B, C, H, W = images.shape
+#         total_sum += images.sum(dim=[0, 2, 3])
+#         total_sq_sum += (images ** 2).sum(dim=[0, 2, 3])
+#         total_pixels += B * H * W
+#     mean = total_sum / total_pixels
+#     var = (total_sq_sum / total_pixels) - mean ** 2
+#     std = torch.sqrt(var.clamp_min(1e-8))
+#     return mean, std
+
+# New version, that computes a single mean and std over all geometries
+
 @torch.no_grad()
 def compute_input_stats(loader, images_per_dem):
-    total_sum = torch.zeros(images_per_dem)
-    total_sq_sum = torch.zeros(images_per_dem)
-    total_pixels = 0
-    for batch in tqdm(loader, desc="Computing input stats", leave=False, position=0, dynamic_ncols=True):
-        images = batch[0]  # (B, C, H, W) or numpy array
+    total_sum = 0.0
+    total_sq_sum = 0.0
+    total_count = 0
+
+    for batch_idx, batch in enumerate(loader):
+        images = batch[0]  # forventer (B, C, H, W) eller np.ndarray
+
         if isinstance(images, np.ndarray):
             images = torch.from_numpy(images)
-        images = images.cpu().float()
-        B, C, H, W = images.shape
-        total_sum += images.sum(dim=[0, 2, 3])
-        total_sq_sum += (images ** 2).sum(dim=[0, 2, 3])
-        total_pixels += B * H * W
-    mean = total_sum / total_pixels
-    var = (total_sq_sum / total_pixels) - mean ** 2
-    std = torch.sqrt(var.clamp_min(1e-8))
+
+        images = images.cpu().float()  # (B, C, H, W)
+
+        # Tjek for NaNs – ingen masking, vi fejler i stedet
+        nan_mask = torch.isnan(images)
+        if nan_mask.any():
+            # Find første NaN til debug
+            idx = torch.nonzero(nan_mask, as_tuple=False)[0].tolist()
+            b, c, y, x = idx
+            raise ValueError(
+                f"[compute_input_stats] NaN opdaget i input-data!\n"
+                f"  batch_idx = {batch_idx}\n"
+                f"  local_batch_index (i batch) = {b}\n"
+                f"  channel = {c}\n"
+                f"  y = {y}, x = {x}\n"
+                f"  pixel_value = {images[b, c, y, x].item()}"
+            )
+
+        # Ingen NaNs, så vi kan roligt beregne stats
+        total_sum += images.sum().item()
+        total_sq_sum += (images ** 2).sum().item()
+        total_count += images.numel()
+
+    mean = total_sum / total_count
+    var = (total_sq_sum / total_count) - mean ** 2
+    std = math.sqrt(max(var, 1e-8))
     return mean, std
+
 
 
 

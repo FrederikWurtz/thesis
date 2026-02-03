@@ -153,7 +153,7 @@ def main(argv=None):
             config[cfg_key] = val
 
     print(f"Use LRO DEMs: {config['USE_LRO_DEMS']}")
-    print(f"Use multi-band DEMs: {config['USE_MULTIBAND_DEMS']}")
+    print(f"Use multi-band DEMs: {config['USE_MULTI_BAND']}")
 
     # If run is found to be new, generate data
     if args.new_run:
@@ -174,8 +174,8 @@ def main(argv=None):
             val_loader = DataLoader(val_ds, batch_size=config["BATCH_SIZE"], shuffle=False, num_workers=4, pin_memory=pin_memory)
             print("\n=== Computing Input Statistics ===")
             train_mean, train_std = compute_input_stats(val_loader, images_per_dem=config["IMAGES_PER_DEM"])
-            print(f"Mean: {round_list(train_mean.tolist(), 10)}")
-            print(f"Std: {round_list(train_std.tolist(), 10)}")
+            print(f"Mean: {train_mean}")
+            print(f"Std: {train_std}")
 
             # create test files
             # also set different seed for test set generation
@@ -185,7 +185,7 @@ def main(argv=None):
             print("Dataset generation complete.\n")
 
             mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
-            save_file_as_ini({'MEAN': train_mean.tolist(), 'STD': train_std.tolist()}, mean_std_path)
+            save_file_as_ini({'MEAN': train_mean, 'STD': train_std}, mean_std_path)
 
             # plot LRO sampling distributions for val and test sets
             config["USE_SEPARATE_VALTEST_PARS"] = False  # reset to default for training data generation

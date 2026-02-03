@@ -146,51 +146,145 @@ import torch
 import math
 
 
+import torch
+import math
+
+def _check_nan_hapke(tensor, name):
+    if not isinstance(tensor, torch.Tensor):
+        return
+    nan_mask = torch.isnan(tensor)
+    if nan_mask.any():
+        idx = torch.nonzero(nan_mask, as_tuple=False)[0].tolist()
+        msg = (
+            f"[hapke_roughness] NaN detected in '{name}' at index {idx}.\n"
+            f"  shape = {tuple(tensor.shape)}\n"
+        )
+        valid = tensor[~nan_mask]
+        if valid.numel() > 0:
+            msg += (
+                f"  valid min={valid.min().item():.6e}, "
+                f"max={valid.max().item():.6e}, "
+                f"mean={valid.mean().item():.6e}\n"
+            )
+        raise ValueError(msg)
+
 # ============================================================
 #  Roughness correction (Hapke 1984 / 1986 / 1993)
 # ============================================================
 
-def hapke_roughness(mu0, mu, g, theta_bar):
+def hapke_roughness(mu0, mu, g, theta_bar, debug: bool = False):
     """
     Hapke macroscopic roughness correction.
-
-    Parameters
-    ----------
-    mu0 : torch.Tensor
-        Cos(i)
-    mu : torch.Tensor
-        Cos(e)
-    g : torch.Tensor
-        Phase angle [rad]
-    theta_bar : torch.Tensor or float
-        Mean surface slope angle [rad]
-
-    Returns
-    -------
-    mu0_eff, mu_eff, S
-        Roughness-corrected cosines & shadowing term
+    Returns mu0_eff, mu_eff, S.
     """
+
+    # Sørg for tensors & fælles shape
+    if not isinstance(mu0, torch.Tensor): mu0 = torch.tensor(mu0)
+    if not isinstance(mu, torch.Tensor):  mu  = torch.tensor(mu)
+    if not isinstance(g, torch.Tensor):   g   = torch.tensor(g)
+
+    mu0, mu, g = torch.broadcast_tensors(mu0, mu, g)
+    mu0 = mu0.to(dtype=torch.float32)
+    mu  = mu.to(dtype=torch.float32)
+
     theta_bar = torch.as_tensor(theta_bar, device=mu0.device, dtype=mu0.dtype)
     theta_bar = torch.clamp(theta_bar, 1e-6, math.radians(45.0))  # safe range
 
+    if debug:
+        _check_nan_hapke(mu0,       "mu0 (input)")
+        _check_nan_hapke(mu,        "mu (input)")
+        _check_nan_hapke(g,         "g (input)")
+        _check_nan_hapke(theta_bar, "theta_bar (input)")
+
+    # *** VIGTIGT: clamp mu0 og mu til [-1, 1] ***
+    mu0 = torch.clamp(mu0, -1.0, 1.0)
+    mu  = torch.clamp(mu,  -1.0, 1.0)
+
+    # Roughness-parametre
     t = torch.tan(theta_bar)
-    sigma = t * torch.sqrt(torch.tensor(2.0 / math.pi, device=mu0.device))
+    sigma = t * torch.sqrt(torch.tensor(2.0 / math.pi,
+                                        device=mu0.device,
+                                        dtype=mu0.dtype))
+
+    if debug:
+        _check_nan_hapke(t,     "t = tan(theta_bar)")
+        _check_nan_hapke(sigma, "sigma")
+
+    # radikanter til sqrt
+    rad0 = 1.0 - mu0**2
+    rad  = 1.0 - mu**2
+
+    # clamp til [0, ∞) for at undgå sqrt(negative)
+    eps = 1e-6 # lille positiv værdi, så vi undgår 0 senere, hvor den er i nævneren
+    rad0_clamped = torch.clamp(rad0, min=eps)
+    rad_clamped  = torch.clamp(rad,  min=eps)
+
+    if debug:
+        _check_nan_hapke(rad0,         "rad0 = 1 - mu0^2 (før clamp)")
+        _check_nan_hapke(rad,          "rad  = 1 - mu^2  (før clamp)")
+        _check_nan_hapke(rad0_clamped, "rad0_clamped")
+        _check_nan_hapke(rad_clamped,  "rad_clamped")
+
+    sqrt0 = torch.sqrt(rad0_clamped)
+    sqrt1 = torch.sqrt(rad_clamped)
+
+    if debug:
+        _check_nan_hapke(sqrt0, "sqrt0 = sqrt(1 - mu0^2)")
+        _check_nan_hapke(sqrt1, "sqrt1 = sqrt(1 - mu^2)")
 
     # Corrected incidence cosine
-    mu0_eff = mu0 * (1.0 + (1.0/torch.cos(theta_bar) - 1.0) * torch.sqrt(1.0 - mu0**2))
-    mu0_eff = torch.clamp(mu0_eff, min=0.0)
+    cos_theta = torch.cos(theta_bar)
+    cos_theta = torch.clamp(cos_theta, min=1e-6)  # undgå 1/0
+
+    factor = (1.0 / cos_theta - 1.0)
+
+    mu0_eff = mu0 * (1.0 + factor * sqrt0)
+    mu0_eff = torch.clamp(mu0_eff, min=0.0, max=1.0)
 
     # Corrected emission cosine
-    mu_eff = mu * (1.0 + (1.0/torch.cos(theta_bar) - 1.0) * torch.sqrt(1.0 - mu**2))
-    mu_eff = torch.clamp(mu_eff, min=0.0)
+    mu_eff = mu * (1.0 + factor * sqrt1)
+    mu_eff = torch.clamp(mu_eff, min=0.0, max=1.0)
 
-    # Shadowing probability (illumination × visibility)
-    P0 = 1.0 - torch.exp(- (mu0 / sigma)**2)
-    P  = 1.0 - torch.exp(- (mu / sigma)**2)
+    if debug:
+        # Hvis der stadig er NaNs, print lokalt context
+        nan_mask = torch.isnan(mu_eff)
+        if nan_mask.any():
+            idx = torch.nonzero(nan_mask, as_tuple=False)[0]
+            y, x = idx[-2:].tolist() if mu_eff.dim() == 2 else idx[-3:].tolist()[1:]
+            mu_val      = mu[idx]
+            mu0_val     = mu0[idx]
+            theta_val   = theta_bar[idx] if theta_bar.shape == mu.shape else theta_bar
+            rad_val     = rad[idx]
+            rad_cl_val  = rad_clamped[idx]
+            print(
+                "[hapke_roughness DEBUG] NaN i mu_eff ved pixel:\n"
+                f"  index = {idx.tolist()}\n"
+                f"  mu      = {mu_val.item():.6e}\n"
+                f"  mu0     = {mu0_val.item():.6e}\n"
+                f"  theta   = {theta_val.item():.6e} rad\n"
+                f"  rad     = 1 - mu^2 = {rad_val.item():.6e}\n"
+                f"  rad_cl  = {rad_cl_val.item():.6e}\n"
+            )
+            _check_nan_hapke(mu_eff, "mu_eff")
+
+        _check_nan_hapke(mu0_eff, "mu0_eff")
+        _check_nan_hapke(mu_eff,  "mu_eff")
+
+    # Shadowing probability
+    sigma_safe = torch.clamp(sigma, min=1e-6)
+    P0 = 1.0 - torch.exp(- (mu0 / sigma_safe)**2)
+    P  = 1.0 - torch.exp(- (mu  / sigma_safe)**2)
+
+    if debug:
+        _check_nan_hapke(P0, "P0 (shadowing-incidence)")
+        _check_nan_hapke(P,  "P  (shadowing-emission)")
 
     S = P0 * P + 1e-6
-    return mu0_eff, mu_eff, S
 
+    if debug:
+        _check_nan_hapke(S, "S (shadowing term)")
+
+    return mu0_eff, mu_eff, S
 
 
 # ============================================================
@@ -227,7 +321,9 @@ class FullHapkeModel:
                  xi=0.25,     # for hg1
                  b1=-0.3,     # for hg2
                  b2=0.2,      # for hg2
-                 c=0.7        # for hg2
+                 c=0.7,        # for hg2
+
+                 debug: bool = False
                  ):
         
         self.w = w
@@ -248,8 +344,33 @@ class FullHapkeModel:
 
         self.eps = 1e-12
 
+        self.debug = debug
+
 
     # ------------------ helper ------------------
+
+
+    def _check_nan(self, tensor, name):
+        if not isinstance(tensor, torch.Tensor):
+            return
+        nan_mask = torch.isnan(tensor)
+        if nan_mask.any():
+            # Tag første NaN indeks
+            idx = torch.nonzero(nan_mask, as_tuple=False)[0].tolist()
+            msg = (
+                f"[FullHapkeModel] NaN detected in '{name}' at index {idx}.\n"
+                f"  tensor shape: {tuple(tensor.shape)}\n"
+            )
+            # prøv at printe nogle stats, hvis der også er valide værdier
+            valid = tensor[~nan_mask]
+            if valid.numel() > 0:
+                msg += (
+                    f"  valid min={valid.min().item():.6e}, "
+                    f"max={valid.max().item():.6e}, "
+                    f"mean={valid.mean().item():.6e}\n"
+                )
+            raise ValueError(msg)
+
 
     def _to_tensor(self, val, like):
         if isinstance(val, torch.Tensor):
@@ -320,6 +441,13 @@ class FullHapkeModel:
         mu0 = mu0.to(g.device).float()
         mu  = mu.to(g.device).float()
 
+        if self.debug:
+            # --- Debug: check inputs ---
+            self._check_nan(mu0, "mu0 (input)")
+            self._check_nan(mu,  "mu (input)")
+            self._check_nan(g,   "g (input)")
+
+
         # Map support
         w      = self._to_tensor(self.w, mu0)
         theta  = self._to_tensor(self.theta_bar, mu0)
@@ -327,6 +455,16 @@ class FullHapkeModel:
         h_sh   = self._to_tensor(self.h_sh,  mu0)
         B0_cb  = self._to_tensor(self.B0_cb, mu0)
         h_cb   = self._to_tensor(self.h_cb,  mu0)
+
+        if self.debug:
+            # Debug parameter maps
+            self._check_nan(w,     "w (albedo map)")
+            self._check_nan(theta, "theta_bar (roughness map)")
+            self._check_nan(B0_sh, "B0_sh")
+            self._check_nan(h_sh,  "h_sh")
+            self._check_nan(B0_cb, "B0_cb")
+            self._check_nan(h_cb,  "h_cb")
+
 
         # Phase params
         if self.phase_fun == "hg1":
@@ -339,7 +477,14 @@ class FullHapkeModel:
             phase_params = {"b1": b1, "b2": b2, "c": c}
 
         # ---------------- Roughness ----------------
-        mu0_eff, mu_eff, S = hapke_roughness(mu0, mu, g, theta)
+        mu0_eff, mu_eff, S = hapke_roughness(mu0, mu, g, theta, debug=self.debug)
+
+        if self.debug:
+            # Debug efter roughness
+            self._check_nan(mu0_eff, "mu0_eff (after hapke_roughness)")
+            self._check_nan(mu_eff,  "mu_eff (after hapke_roughness)")
+            self._check_nan(S,       "S (roughness shadowing)")
+
 
         denom = torch.clamp(mu0_eff + mu_eff, min=self.eps)
 
@@ -348,6 +493,14 @@ class FullHapkeModel:
         Bsh = self._B_SH(g, B0_sh, h_sh)
         Bcb = self._B_CB(g, B0_cb, h_cb)
         Btot = Bsh + Bcb
+
+        if self.debug:
+            # Debug efter fase + opposition
+            self._check_nan(P,     "P (phase function)")
+            self._check_nan(Bsh,  "B_SH (opposition)")
+            self._check_nan(Bcb,  "B_CB (opposition)")
+            self._check_nan(Btot, "Btot (B_SH + B_CB)")
+
 
         # H-functions use *unroughened* incident/emission
         H0 = self._H(mu0_eff, w)

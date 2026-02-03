@@ -7,10 +7,12 @@ from tqdm import tqdm
 import cv2
 
 from master.lro_data_sim.lro_data_utils_multi_band import detrend_2d, extract_local_subset_all_bands
+from master.lro_data_sim.lro_data_utils import extract_local_dem_subset
 from master.render.dem_utils import DEM
 from master.render.hapke_model import FullHapkeModel
 from master.render.camera import Camera
 from master.render.renderer import Renderer
+from master.lro_data_sim.noise_map_generator import random_blob_field_tile
 
 
 import torch
@@ -34,13 +36,24 @@ def generate_and_save_lro_data_multi_band(config: dict = None, save_path: str = 
     torch.save(data_dict, save_path)
 
 def generate_and_return_lro_data_multi_band(config: dict = None, device: str = "cpu"):
-    dem_tensor, w_tensor, theta_bar_tensor, lro_meta = generate_and_return_lro_multi_band(config, device=device)
+    dem_tensor, lro_meta = generate_and_return_dem(config, device=device)
 
     with torch.no_grad():
         # Convert DEM to torch tensor on GPU in a single operation
         dem_tensor = dem_tensor.to(device=device, dtype=torch.float32)
-        w_tensor = w_tensor.to(device=device, dtype=torch.float32)
-        theta_bar_tensor = theta_bar_tensor.to(device=device, dtype=torch.float32)
+
+        # Generate w and theta_bar maps using random blob fields
+        w_tensor = random_blob_field_tile(shape=dem_tensor.shape, 
+                                            blob_radius_px=config["W_BLOB_RADIUS_PX"], 
+                                            density=config["W_BLOB_DENSITY"], 
+                                            device=device, 
+                                            range=(config["W_MIN"], config["W_MAX"]))
+        theta_bar_tensor = random_blob_field_tile(shape=dem_tensor.shape, 
+                                                  blob_radius_px=config["THETA_BAR_BLOB_RADIUS_PX"], 
+                                                  density=config["THETA_BAR_BLOB_DENSITY"], 
+                                                  device=device, 
+                                                  range=(config["THETA_BAR_MIN"], config["THETA_BAR_MAX"]))
+
 
         dem_obj = DEM(dem_tensor, cellsize=1, x0=0, y0=0)
         hapke = FullHapkeModel(w=w_tensor, theta_bar=theta_bar_tensor)
@@ -77,33 +90,36 @@ def generate_and_return_lro_data_multi_band(config: dict = None, device: str = "
     return images, reflectance_maps, dem_tensor, metas, w_tensor, theta_bar_tensor, lro_meta
 
 
-def generate_and_return_lro_multi_band(config: dict = None, device: str = "cpu"):
+def generate_and_return_dem(config: dict = None, device: str = "cpu"):
 
-    dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_bands_random_blob.tif"
+    dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
 
-    # lat, lon, box_radius, height_norm = get_lat_lon_radius_height(config)   
-    # for test use fixed values
-    lat = 60
-    lon = -170
-    box_radius = 75000.0
-    height_norm = 30.0 
+    lat, lon, box_radius, height_norm = get_lat_lon_radius_height(config)   
 
-    all_bands_array, metadata = extract_local_subset_all_bands(
-                                                    dem_path=dem_path,
-                                                    center_lat_deg=lat,
-                                                    center_lon_deg=lon,
-                                                    box_radius_m=box_radius,
-                                                    res_m=config['SAMPLE_RES_M'],
-                                                    local_proj_type="stere",
-                                                    verbose = False
-                                                )
-    dem_array = all_bands_array[0, :, :]  # First band is DEM
-    w_array = all_bands_array[1, :, :]    # Second band is albedo (w)
-    theta_bar_array = all_bands_array[2, :, :]  # Third band is theta_bar (for roughness)
-    
-    print(f"Extracted DEM shape: {dem_array.shape}, w shape: {w_array.shape}, theta_bar shape: {theta_bar_array.shape}")
-    print(f"Metadata nodata length: {len(metadata['nodata'])}, nodata value: {metadata['nodata']}")
-    dem_input = np.ma.masked_equal(dem_array, metadata['nodata'][0])
+    # all_bands_array, metadata = extract_local_subset_all_bands(
+    #                                                 dem_path=dem_path,
+    #                                                 center_lat_deg=lat,
+    #                                                 center_lon_deg=lon,
+    #                                                 box_radius_m=box_radius,
+    #                                                 res_m=config['SAMPLE_RES_M'],
+    #                                                 local_proj_type="stere",
+    #                                                 verbose = False
+    #                                             )
+    # dem_array = all_bands_array[0, :, :]  # First band is DEM
+    # w_array = all_bands_array[1, :, :]    # Second band is albedo (w)
+    # theta_bar_array = all_bands_array[2, :, :]  # Third band is theta_bar (for roughness)
+
+    dem_array, metadata = extract_local_dem_subset(
+                                                dem_path=dem_path,
+                                                center_lat_deg=lat,
+                                                center_lon_deg=lon,
+                                                box_radius_m=box_radius,
+                                                res_m=config['SAMPLE_RES_M'],
+                                                local_proj_type="stere",
+                                                verbose = False
+                                            )
+
+    dem_input = np.ma.masked_equal(dem_array, metadata['nodata'])
 
     # Detrend data
     dem_detrended = dem_input - np.nanmean(dem_input)
@@ -119,15 +135,10 @@ def generate_and_return_lro_multi_band(config: dict = None, device: str = "cpu")
     desired_pixel_size = (config["LRO_DEM_SIZE"], config["LRO_DEM_SIZE"])  # (H, W)
     dem_resampled = resample_dem_torch(masked.filled(0), desired_pixel_size, device=device)
 
-    # W og Theta HAR INGEN NODATA → brug direkte arrays
-    w_resampled = resample_dem_torch(w_array.astype(float), desired_pixel_size, device=device)
-    theta_bar_resampled = resample_dem_torch(theta_bar_array.astype(float), desired_pixel_size, device=device)
-
-
     # normalize heights
     dem_normalized = dem_resampled / torch.max(torch.abs(dem_resampled)) * height_norm
 
-    return dem_normalized, w_resampled, theta_bar_resampled, [lat, lon, box_radius, height_norm]
+    return dem_normalized, [lat, lon, box_radius, height_norm]
 
 def resample_dem_torch(dem_array, desired_pixel_size, device=None):
     """

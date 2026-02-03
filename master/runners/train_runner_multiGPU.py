@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.
 import torch
 
 from torch.distributed import destroy_process_group
-from master.train.trainer_new import Trainer_multiGPU, ddp_setup, load_train_objs, prepare_dataloader, is_main
+from master.train.trainer_new import Trainer_multiGPU, Trainer_multiGPU_multi_band, ddp_setup, load_train_objs, prepare_dataloader, is_main
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 from master.configs.config_utils import load_config_file
 
@@ -68,8 +68,8 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     snapshot_path = os.path.join(run_path, 'checkpoints', 'snapshot.pt')
     mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
     input_stats = read_file_from_ini(mean_std_path)
-    train_mean = torch.tensor([float(input_stats['MEAN'][i]) for i in range(len(input_stats['MEAN']))])
-    train_std = torch.tensor([float(input_stats['STD'][i]) for i in range(len(input_stats['STD']))])
+    train_mean = torch.tensor(input_stats['MEAN'])
+    train_std = torch.tensor(input_stats['STD'])
 
     # value for each process to share current epoch - otherwise the deterministic randomness will not be set correctly!
     EPOCH_SHARED = multiprocessing.Value('i', 0)  # 'i' means integer
@@ -92,7 +92,11 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
                                      prefetch_factor=config["PREFETCH_FACTOR"],
                                      use_shuffle=False)
 
-    trainer = Trainer_multiGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
+    if config["USE_MULTI_BAND"]:
+        print("Using multi-band model for training...")
+        trainer = Trainer_multiGPU_multi_band(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
+    else:
+        trainer = Trainer_multiGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
 
     if is_main():
         number_of_gpus = torch.cuda.device_count()

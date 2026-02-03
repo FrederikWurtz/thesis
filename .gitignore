@@ -32,11 +32,9 @@ MANIFEST
 /Jobs/
 /.ssh/
 /keys/
-master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif
-master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_test_bands.tif
-master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_bands_gaussian.tif
-master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_bands_perlin.tif
-master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014_with_bands_random_blob.tif
+master/lro_data_sim/*.tif
+master/tests/figures/
+
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

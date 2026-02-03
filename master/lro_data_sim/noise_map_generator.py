@@ -9,7 +9,6 @@ import torch
 
 
 from master.configs.config_utils import load_config_file
-from master.lro_data_sim.lro_generator_multi_band import generate_and_return_lro_data_multi_band
 
 
 # -----------------------------
@@ -154,7 +153,7 @@ def gaussian_field_tile(shape, corr_len_px, device=None):
     return field.detach().cpu().numpy().astype(np.float32)
 
 
-def random_blob_field_tile(shape, blob_radius_px, density=0.001, device=None, seed=None):
+def random_blob_field_tile(shape, blob_radius_px, density=0.001, device=None, range=(0.1, 0.3), seed=None):
     """
     Generér et 'random blob field' på en tile.
 
@@ -164,15 +163,8 @@ def random_blob_field_tile(shape, blob_radius_px, density=0.001, device=None, se
     device       : torch.device("mps"/"cuda"/"cpu")
     seed         : valgfri, hvis du vil have deterministisk output for en given tile
 
-    Returnerer: np.ndarray float32 (h, w) med ca. range [-1, 1]
+    Returnerer: np.ndarray float32 (h, w) med ca. range [range[0], range[1]].
     """
-    if device is None:
-        if torch.backends.mps.is_available():
-            device = torch.device("mps")
-        elif torch.cuda.is_available():
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cpu")
 
     h, w = shape
 
@@ -201,11 +193,12 @@ def random_blob_field_tile(shape, blob_radius_px, density=0.001, device=None, se
     field_fft = centers_fft * kernel_fft
     field = torch.fft.ifft2(field_fft).real
 
-    # 4) Normalisér til [-1, 1]
-    field = field - field.mean()
-    field = field / (field.abs().max() + 1e-12)
+    # 4) Normalisér til range (efficient)
+    min_val, max_val = field.min(), field.max()
+    field = (field - min_val) / (max_val - min_val + 1e-12)  # Normalize to [0, 1]
+    field = field * (range[1] - range[0]) + range[0]         # Scale to [range[0], range[1]]
 
-    return field.detach().cpu().numpy().astype(np.float32)
+    return field
 
 import os
 import numpy as np

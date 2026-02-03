@@ -39,7 +39,8 @@ class DEMDataset(Dataset):
             meta_tensor = loaded['meta']
             w_tensor = loaded['w']
             theta_bar_tensor = loaded['theta_bar']
-            return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor, w_tensor, theta_bar_tensor
+            lro_meta_tensor = loaded['lro_meta']
+            return images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor, w_tensor, theta_bar_tensor, lro_meta_tensor
         else:
             # Extract tensors using the correct keys from generator.py
             target_tensor = loaded['dem'].unsqueeze(0)  # Add channel dim
@@ -89,6 +90,18 @@ class FluidDEMDataset(Dataset):
         if self.config["USE_LRO_DEMS"]:
             if self.config["USE_MULTI_BAND"]:
                 images, reflectance_maps, dem_tensor, metas, w_tensor, theta_bar_tensor, lro_meta = generate_and_return_lro_data_multi_band(config=self.config, device='cpu')
+
+                # DEBUG: check for nans in all outputs
+                if any(torch.isnan(tensor).any() for tensor in images):
+                    print("NaN detected in images tensor")
+                if any(torch.isnan(tensor).any() for tensor in reflectance_maps):
+                    print("NaN detected in reflectance maps tensor")
+                if torch.isnan(dem_tensor).any():
+                    print("NaN detected in dem tensor")
+                if torch.isnan(w_tensor).any():
+                    print("NaN detected in w tensor")
+                if torch.isnan(theta_bar_tensor).any():
+                    print("NaN detected in theta_bar tensor")
 
                 if not torch.is_tensor(dem_tensor):
                     dem_tensor = torch.from_numpy(dem_tensor)

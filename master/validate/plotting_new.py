@@ -654,6 +654,245 @@ def plot_data_pt(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
         return fig
 
 
+def plot_data_multi_band(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False, same_scale=False, variant='random', use_train_set=False):
+    """
+    Plot multi-band data (W, Theta_bar, DEM) and images from .pt files (PyTorch format).
+    Similar to plot_data_pt but includes W and Theta_bar bands.
+    
+    Layout: 8 columns per row
+    - Columns 0-2: W band, Theta_bar band, DEM
+    - Columns 3-7: 5 input images
+    """
+
+    # read config file
+    config = load_config_file(os.path.join(run_dir, 'stats', 'config.ini'))
+
+    if not config["USE_MULTI_BAND"]:
+        raise ValueError("The provided run_dir does not correspond to a multi-band model. Please use plot_data_pt instead.")
+
+    # Ensure figures directory exists
+    figures_dir = os.path.join(run_dir, 'figures')
+    os.makedirs(figures_dir, exist_ok=True)
+
+    test_dems_dir = os.path.join(run_dir, 'test')
+    test_files = None
+
+    print(f"Use train set: {use_train_set}")
+    if not use_train_set:
+        test_files = None
+        if os.path.isdir(test_dems_dir):
+            # Look for .pt files in the test_dems folder
+            candidate_files = sorted(glob.glob(os.path.join(test_dems_dir, '*.pt')))
+            if len(candidate_files) > 0:
+                test_files = candidate_files
+                print(f"Using {len(test_files)} test files from: {test_dems_dir}")
+            else:
+                print(f"Found '{test_dems_dir}' but no .pt files were present.")
+                raise FileNotFoundError(f"No .pt files found in {test_dems_dir}")
+        else:
+            raise FileNotFoundError(f"No test directory found at '{test_dems_dir}'")
+
+        test_dataset = DEMDataset(test_files, config=config)
+    
+    if use_train_set:
+        print("Using training set for plotting instead of test set.")
+        train_set = FluidDEMDataset(config=config)
+        test_dataset = train_set
+    
+    # Select test sets based on variant
+    print(f"Selecting {n_sets} test sets using variant: {variant}")
+    available_indices = list(range(len(test_dataset)))
+    
+    if variant == 'first':
+        selected_indices = list(range(min(n_sets, len(test_dataset))))
+    elif variant == 'random':
+        selected_indices = sorted(random.sample(available_indices, min(n_sets, len(test_dataset))))
+        print("Selected test set indices:", selected_indices)
+    else:
+        raise ValueError(f"Unknown variant: {variant}. Use 'first' or 'random'.")
+    
+    # Load all data and find global min/max
+    all_w_bands = []
+    all_theta_bands = []
+    all_dems = []
+    all_images = []
+    
+    for idx in selected_indices:
+        images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor, w_tensor, theta_bar_tensor, lro_meta_tensor = test_dataset[idx]
+
+        dem = target_tensor.squeeze().numpy()
+        all_dems.append(dem)
+        
+        # Extract W and Theta_bar 
+        w_band = w_tensor.numpy()
+        theta_band = theta_bar_tensor.numpy()
+        all_w_bands.append(w_band)
+        all_theta_bands.append(theta_band)
+        
+        for img_idx in range(n_images):
+            img = images_tensor[img_idx].numpy()
+            all_images.append(img)
+    
+    all_w_bands = np.array(all_w_bands)
+    all_theta_bands = np.array(all_theta_bands)
+    all_dems = np.array(all_dems)
+    all_images = np.array(all_images)
+    
+    # Find global min/max for all data
+    w_vmin = np.min(all_w_bands)
+    w_vmax = np.max(all_w_bands)
+    theta_vmin = np.min(all_theta_bands)
+    theta_vmax = np.max(all_theta_bands)
+    dem_vmin = np.min(all_dems)
+    dem_vmax = np.max(all_dems)
+    img_vmin = np.min(all_images)
+    img_vmax = np.max(all_images)
+
+    # Create figure with manual positioning for precise control
+    # 8 columns: W, Theta, DEM, + 5 images
+    fig = plt.figure(figsize=(3.6*8, 2.5*n_sets))
+    
+    # Layout parameters
+    row_height = 0.85 / n_sets  # Total height available divided by rows
+    row_spacing = 0.005  # Small gap between rows
+    
+    # Column widths and positions for 8 columns
+    band_width = 0.09  # Width for W, Theta, DEM columns
+    dem_width = 0.09
+    img_width = 0.09  # Width for each image
+    
+    # Horizontal positions
+    w_x = 0.05          # W band
+    theta_x = w_x + band_width + 0.015     # Theta band
+    dem_x = theta_x + band_width + 0.01   # DEM
+    img_x_start = dem_x + dem_width + 0.02  # Start of images
+    img_gap = 0.0005     # Tiny gap between images
+    
+    # Starting y position (from top)
+    start_y = 0.92
+    
+    # Store the last image objects for colorbars
+    last_w_im = None
+    last_theta_im = None
+    last_dem_im = None
+    
+    for i, test_idx in enumerate(selected_indices):
+        # Load data
+        images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor, w_tensor, theta_bar_tensor, lro_meta_tensor = test_dataset[test_idx]
+
+        
+        dem = target_tensor.squeeze().numpy()
+        w_band = w_tensor.squeeze().numpy()
+        theta_band = theta_bar_tensor.squeeze().numpy()
+        dem_num = test_idx
+        images = np.array([images_tensor[j].numpy() for j in range(n_images)])
+        
+        # Calculate per-row min/max if same_scale='row'
+        if same_scale == 'row':
+            row_img_min = images.min()
+            row_img_max = images.max()
+        
+        # Calculate y position for this row
+        y_pos = start_y - i * (row_height + row_spacing)
+        
+        # Column 0: W band
+        ax_w = fig.add_axes([w_x, y_pos - row_height, band_width, row_height])
+        im_w = ax_w.imshow(w_band, cmap='viridis', vmin=w_vmin, vmax=w_vmax, origin='lower')
+        ax_w.set_xticks([])
+        ax_w.set_yticks([])
+        if i == 0:
+            ax_w.set_title('W Band', fontsize=12, pad=5)
+        if i == 0:
+            ax_w.set_ylabel(f'Dataset {dem_num}', fontsize=11, rotation=90, labelpad=5)
+        else:
+            ax_w.set_ylabel(f'Dataset {dem_num}', fontsize=11, rotation=90, labelpad=5)
+        last_w_im = im_w
+        
+        # Column 1: Theta band
+        ax_theta = fig.add_axes([theta_x, y_pos - row_height, band_width, row_height])
+        im_theta = ax_theta.imshow(theta_band, cmap='plasma', vmin=theta_vmin, vmax=theta_vmax, origin='lower')
+        ax_theta.set_xticks([])
+        ax_theta.set_yticks([])
+        if i == 0:
+            ax_theta.set_title('Theta Band', fontsize=12, pad=5)
+        last_theta_im = im_theta
+        
+        # Column 2: DEM
+        ax_dem = fig.add_axes([dem_x, y_pos - row_height, dem_width, row_height])
+        im_dem = ax_dem.imshow(dem, cmap='terrain', vmin=dem_vmin, vmax=dem_vmax, origin='lower')
+        ax_dem.set_xticks([])
+        ax_dem.set_yticks([])
+        if i == 0:
+            ax_dem.set_title('DEM', fontsize=12, pad=5)
+        last_dem_im = im_dem
+        
+        # Columns 3-7: Images with different scaling options
+        for j in range(n_images):
+            img_x = img_x_start + j * (img_width + img_gap)
+            ax_img = fig.add_axes([img_x, y_pos - row_height, img_width, row_height])
+            
+            if same_scale == 'all':
+                # Use same scale for all images across all rows
+                ax_img.imshow(images[j], cmap='gray', vmin=img_vmin, vmax=img_vmax, origin='lower')
+            elif same_scale == 'row':
+                # Use same scale for all images in this row
+                ax_img.imshow(images[j], cmap='gray', vmin=row_img_min, vmax=row_img_max, origin='lower')
+            else:  # same_scale=False
+                # Use individual scale for each image
+                ax_img.imshow(images[j], cmap='gray', origin='lower')
+            
+            # Remove ticks and tick labels
+            ax_img.set_xticks([])
+            ax_img.set_yticks([])
+            
+            # Title only on first row
+            if i == 0:
+                ax_img.set_title(f'Img {j+1}', fontsize=12, pad=5)
+    
+    # Add colorbars spanning all rows
+    total_height = n_sets * row_height + (n_sets - 1) * row_spacing
+    bottom_y = start_y - total_height
+    
+    # Colorbar for W band
+    cbar_w_width = 0.006
+    cbar_w_x = w_x + band_width - 0.004
+    cbar_w_ax = fig.add_axes([cbar_w_x, bottom_y, cbar_w_width, total_height])
+    cbar_w = plt.colorbar(last_w_im, cax=cbar_w_ax)
+    cbar_w.ax.tick_params(labelsize=8)
+    
+    # Colorbar for Theta band
+    cbar_theta_width = 0.006
+    cbar_theta_x = theta_x + band_width - 0.004
+    cbar_theta_ax = fig.add_axes([cbar_theta_x, bottom_y, cbar_theta_width, total_height])
+    
+    # Convert theta to degrees for colorbar display
+    last_theta_im.set_array(np.degrees(last_theta_im.get_array()))
+    last_theta_im.set_clim(vmin=np.degrees(theta_vmin), vmax=np.degrees(theta_vmax))
+    
+    cbar_theta = plt.colorbar(last_theta_im, cax=cbar_theta_ax)
+    cbar_theta.ax.tick_params(labelsize=8)
+    
+    # Colorbar for DEM
+    cbar_dem_width = 0.006
+    cbar_dem_x = dem_x + dem_width - 0.004
+    cbar_dem_ax = fig.add_axes([cbar_dem_x, bottom_y, cbar_dem_width, total_height])
+    cbar_dem = plt.colorbar(last_dem_im, cax=cbar_dem_ax)
+    cbar_dem.ax.tick_params(labelsize=8)
+    
+    output_name = "data_summary_multi_band_test.pdf" if not use_train_set else "data_summary_multi_band_train.pdf"
+
+    # Save or show
+    if save_fig:
+        figures_dir = os.path.join(run_dir, 'figures')
+        os.makedirs(figures_dir, exist_ok=True)
+        output_path = os.path.join(figures_dir, output_name)
+        fig.savefig(output_path, format='pdf', bbox_inches='tight', dpi=150)
+        print(f"Figure saved to: {output_path}")
+
+    if return_fig:
+        return fig
+
+
 def plot_data(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False,
                    fig_path='data_grid.pdf', variant='random', 
                    same_scale=False, output_name='data_grid.pdf'):
@@ -812,6 +1051,8 @@ def extract_dataset_number(filename):
     return int(match.group(1)) if match else None
 
 
+
+
 import argparse
 
 if __name__ == "__main__":
@@ -824,20 +1065,31 @@ if __name__ == "__main__":
                       help="Use the training set for plotting instead of the test set.")
     args = args.parse_args()
 
-
-
     print("Plotting test set predictions...")
+
+    config = load_config_file(os.path.join("runs", args.run_dir, 'stats', 'config.ini'))
 
     if not os.path.exists(os.path.join("runs", args.run_dir, 'checkpoints', 'snapshot.pt')):
         #no training exists, only plot data
         print("No training snapshot found, plotting data only...")
-        plot_data_pt(run_dir=os.path.join("runs", args.run_dir),
-                        n_sets=5,
-                        variant=args.variant,  # 'first' or 'random'
-                        same_scale=False,  # False, 'row', or 'all'
-                        save_fig=True,
-                        return_fig=False,
-                        use_train_set = args.use_train_set)
+        if config["USE_MULTI_BAND"]:
+            print("Detected multi-band model, plotting multi-band data...")
+            plot_data_multi_band(run_dir=os.path.join("runs", args.run_dir),
+                                 n_sets=5,
+                                 variant=args.variant,  # 'first' or 'random'
+                                 same_scale=False,  # False, 'row', or 'all'
+                                 save_fig=True,
+                                 return_fig=False,
+                                 use_train_set = args.use_train_set)
+        else:
+            print("Detected single-band model, plotting single-band data...")
+            plot_data_pt(run_dir=os.path.join("runs", args.run_dir),
+                            n_sets=5,
+                            variant=args.variant,  # 'first' or 'random'
+                            same_scale=False,  # False, 'row', or 'all'
+                            save_fig=True,
+                            return_fig=False,
+                            use_train_set = args.use_train_set)
     else:
         print("Training snapshot found, plotting predictions...")
         plot_comprehensive_pt(run_dir=args.run_dir,

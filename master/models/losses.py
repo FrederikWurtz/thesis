@@ -5,17 +5,17 @@ import torch.nn.functional as F
 from master.render.dem_utils import DEM
 from master.render.camera import Camera
 from master.render.renderer import Renderer
-from master.render.hapke_model import HapkeModel
+from master.render.hapke_model import HapkeModel, FullHapkeModel
 
-def _render_shading_batched(dem_tensor_flat, meta_flat, camera, hapke_model, device):
+def _render_shading_batched(dem_tensor_flat, meta_flat, camera, hapke_model_or_params, device, debug=False):
     """
     Render shading for multiple DEMs and viewing angles in a batch.
-    This is a helper for parallel rendering across multiple work items.
     
     Args:
-        dem_tensor_flat: Flattened DEM tensor [N, H, W] where N = B*5 or B*K
+        dem_tensor_flat: Flattened DEM tensor [N, H, W] where N = B*5
         meta_flat: Flattened metadata [N, 5]
-        camera, hapke_model: Shared across all renders
+        camera: Shared camera across all renders
+        hapke_model_or_params: Either HapkeModel instance OR dict with {'w': tensor, 'theta_bar': tensor}
         device: torch device
         
     Returns:
@@ -25,11 +25,21 @@ def _render_shading_batched(dem_tensor_flat, meta_flat, camera, hapke_model, dev
     H, W = dem_tensor_flat.shape[1:]
     reflectance_flat = torch.zeros(N, H, W, dtype=dem_tensor_flat.dtype, device=device)
     
-    # Use torch.vmap concept - but implemented as loop since Renderer isn't fully vectorized
-    # Future: this could be actual vmap if Renderer is refactored
+    # Check if we have spatial parameters
+    is_spatial = isinstance(hapke_model_or_params, dict)
+    
     for i in range(N):
         dem_curr = dem_tensor_flat[i]
         dem_obj = DEM(dem_curr, cellsize=1, x0=0, y0=0)
+        
+        # Create model for this specific render
+        if is_spatial:
+            w_map = hapke_model_or_params['w'][i]  # [H, W]
+            theta_map = hapke_model_or_params['theta_bar'][i]  # [H, W]
+            hapke_model = FullHapkeModel(w=w_map, theta_bar=theta_map, debug=debug)
+        else:
+            hapke_model = hapke_model_or_params  # Reuse shared model
+        
         renderer = Renderer(dem_obj, hapke_model, camera)
         
         sun_az = float(meta_flat[i, 0].item())
@@ -46,7 +56,11 @@ def _render_shading_batched(dem_tensor_flat, meta_flat, camera, hapke_model, dev
             camera_distance_from_center=cam_dist,
             model="hapke"
         )
-        reflectance_flat[i] = renderer.reflectance_map
+        
+        refl_map = renderer.reflectance_map
+        if refl_map.dim() > 2:
+            refl_map = refl_map.squeeze()
+        reflectance_flat[i] = refl_map
     
     return reflectance_flat
 
@@ -110,6 +124,37 @@ def compute_reflectance_map_from_dem(dem_tensor, meta, device, camera_params, ha
     return reflectance_maps
 
 
+def compute_reflectance_map_from_dem_multi_band(dem_tensor, meta, device, camera_params, w_band, theta_band, debug=False):
+    """
+    Compute reflectance map with spatially-varying Hapke parameters.
+    """
+    B, _, H, W = dem_tensor.shape
+    
+    camera = Camera(
+        image_width=camera_params['image_width'],
+        image_height=camera_params['image_height'],
+        focal_length=camera_params['focal_length'],
+        device=device
+    )
+    
+    # Reshape DEMs and meta
+    dem_flat = dem_tensor[:, 0]  # [B, H, W]
+    dem_expanded = dem_flat.repeat_interleave(5, dim=0)  # [B*5, H, W]
+    meta_expanded = meta.reshape(B * 5, 5)  # [B*5, 5]
+    
+    # Expand w and theta bands to match
+    w_flat = w_band[:, 0].repeat_interleave(5, dim=0)  # [B*5, H, W]
+    theta_flat = theta_band[:, 0].repeat_interleave(5, dim=0)  # [B*5, H, W]
+    
+    # Pass spatial parameters as dict
+    hapke_params = {'w': w_flat, 'theta_bar': theta_flat}
+    
+    reflectance_flat = _render_shading_batched(dem_expanded, meta_expanded, camera, hapke_params, device, debug=debug)
+    
+    reflectance_maps = reflectance_flat.reshape(B, 5, H, W)
+    return reflectance_maps
+
+
 def compute_gradients(tensor):
     sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
                             dtype=tensor.dtype, device=tensor.device).view(1, 1, 3, 3)
@@ -163,6 +208,113 @@ def calculate_total_loss(outputs, targets, target_reflectance_maps, meta, hapke_
     
     if return_components:
         return loss_mse, loss_grad, loss_refl, total_loss
+    else:
+        return total_loss
+def calculate_total_loss_multi_band(dem_outputs, dem_targets, reflectance_map_targets, metas, w_outputs, w_targets, theta_outputs, theta_targets, device=None,
+                        config=None, return_components=False, debug = False):
+    """
+    Calculate total loss combining MSE, gradient loss, and reflectance map loss.
+    
+    Args:
+        dem_outputs: Predicted DEMs [B, 1, H, W]
+        dem_targets: Target DEMs [B, 1, H, W]
+        reflectance_map_targets: Ground truth reflectance maps [B, 5, H, W]
+        metas: Metadata tensor [B, 5, 5]
+        w_outputs: Albedo band tensors [B, 1, H, W]
+        w_targets: Albedo band tensors [B, 1, H, W]
+        theta_outputs: Phase function band tensors [B, 1, H, W]
+        theta_targets: Phase function band tensors [B, 1, H, W]
+        hapke_params: Hapke reflectance model parameters
+        device: torch device
+        camera_params: Dict with 'image_width', 'image_height', 'focal_length' from metadata
+        w_mse: Weight for MSE term (default: 1.0)
+        w_grad: Weight for gradient term (default: 1.0)
+        w_refl: Weight for reflectance map term (default: 1.0)
+        w_w: Weight for albedo consistency term (default: 1.0)
+        w_theta: Weight for phase function consistency term (default: 1.0)
+    Returns:
+        total_loss: Weighted sum of all loss components
+    """
+    if debug:
+        # Safety checks before normalization
+        print(f"🔍 DEM outputs - min: {dem_outputs.min():.6f}, max: {dem_outputs.max():.6f}, mean: {dem_outputs.mean():.6f}, has_nan: {torch.isnan(dem_outputs).any()}, has_inf: {torch.isinf(dem_outputs).any()}")
+        print(f"🔍 DEM targets - min: {dem_targets.min():.6f}, max: {dem_targets.max():.6f}, mean: {dem_targets.mean():.6f}, has_nan: {torch.isnan(dem_targets).any()}, has_inf: {torch.isinf(dem_targets).any()}")
+        print(f"🔍 W outputs - min: {w_outputs.min():.6f}, max: {w_outputs.max():.6f}, mean: {w_outputs.mean():.6f}, has_nan: {torch.isnan(w_outputs).any()}, has_inf: {torch.isinf(w_outputs).any()}")
+        print(f"🔍 W targets - min: {w_targets.min():.6f}, max: {w_targets.max():.6f}, mean: {w_targets.mean():.6f}, has_nan: {torch.isnan(w_targets).any()}, has_inf: {torch.isinf(w_targets).any()}")
+        print(f"🔍 Theta outputs - min: {theta_outputs.min():.6f}, max: {theta_outputs.max():.6f}, mean: {theta_outputs.mean():.6f}, has_nan: {torch.isnan(theta_outputs).any()}, has_inf: {torch.isinf(theta_outputs).any()}")
+        print(f"🔍 Theta targets - min: {theta_targets.min():.6f}, max: {theta_targets.max():.6f}, mean: {theta_targets.mean():.6f}, has_nan: {torch.isnan(theta_targets).any()}, has_inf: {torch.isinf(theta_targets).any()}")
+        
+        # Check normalization parameters
+        print(f"🔍 Normalization params - HEIGHT_NORM: {config['HEIGHT_NORMALIZATION']}, HEIGHT_NORM_PM: {config['HEIGHT_NORMALIZATION_PM']}")
+        print(f"🔍 W range: [{config['W_MIN']}, {config['W_MAX']}], Theta range: [{config['THETA_BAR_MIN']}, {config['THETA_BAR_MAX']}]")
+    
+    # Normalize DEMs
+    dem_outputs_norm = dem_outputs / config["HEIGHT_NORMALIZATION"] + config["HEIGHT_NORMALIZATION_PM"]
+    dem_targets_norm = dem_targets / config["HEIGHT_NORMALIZATION"] + config["HEIGHT_NORMALIZATION_PM"]
+    
+    if debug:
+        print(f"🔍 After DEM norm - outputs has_nan: {torch.isnan(dem_outputs_norm).any()}, targets has_nan: {torch.isnan(dem_targets_norm).any()}")
+
+    # Normalize w and theta to [0, 1] range
+    w_range = config["W_MAX"] - config["W_MIN"]
+    theta_range = config["THETA_BAR_MAX"] - config["THETA_BAR_MIN"]
+
+    if debug:
+        print(f"🔍 W range value: {w_range}, Theta range value: {theta_range}")
+    
+    w_outputs_norm = (w_outputs - config["W_MIN"]) / (config["W_MAX"] - config["W_MIN"] + 1e-8)
+    w_targets_norm = (w_targets - config["W_MIN"]) / (config["W_MAX"] - config["W_MIN"] + 1e-8)
+    theta_outputs_norm = (theta_outputs - config["THETA_BAR_MIN"]) / (config["THETA_BAR_MAX"] - config["THETA_BAR_MIN"] + 1e-8)
+    theta_targets_norm = (theta_targets - config["THETA_BAR_MIN"]) / (config["THETA_BAR_MAX"] - config["THETA_BAR_MIN"] + 1e-8)
+
+    if debug:
+        print(f"🔍 After W norm - outputs: min={w_outputs_norm.min():.6f}, max={w_outputs_norm.max():.6f}, has_nan: {torch.isnan(w_outputs_norm).any()}")
+        print(f"🔍 After Theta norm - outputs: min={theta_outputs_norm.min():.6f}, max={theta_outputs_norm.max():.6f}, has_nan: {torch.isnan(theta_outputs_norm).any()}")
+
+    # 1. MSE Loss - basic elevation accuracy
+    loss_mse = F.mse_loss(dem_outputs_norm, dem_targets_norm, reduction='mean')
+    if debug:
+        print(f"🔍 loss_mse: {loss_mse.item():.6f}, has_nan: {torch.isnan(loss_mse).any()}")
+    
+    # 2. Gradient Loss - captures steep slopes and terrain features
+    out_grad_mag = compute_gradients(dem_outputs_norm)
+    tgt_grad_mag = compute_gradients(dem_targets_norm)
+    if debug:
+        print(f"🔍 Gradients - out_grad has_nan: {torch.isnan(out_grad_mag).any()}, tgt_grad has_nan: {torch.isnan(tgt_grad_mag).any()}")
+    
+    loss_grad = F.mse_loss(out_grad_mag, tgt_grad_mag, reduction='mean')
+    if debug:
+        print(f"🔍 loss_grad: {loss_grad.item():.6f}, has_nan: {torch.isnan(loss_grad).any()}")
+    
+    # 3. Reflectance Map Loss - physics-based constraint
+    predicted_reflectance_maps = compute_reflectance_map_from_dem_multi_band(dem_outputs, metas, device, config["CAMERA_PARAMS"], w_band=w_outputs, theta_band=theta_outputs, debug=debug)
+    if debug:
+        print(f"🔍 Predicted reflectance - min: {predicted_reflectance_maps.min():.6f}, max: {predicted_reflectance_maps.max():.6f}, has_nan: {torch.isnan(predicted_reflectance_maps).any()}, has_inf: {torch.isinf(predicted_reflectance_maps).any()}")
+        print(f"🔍 Target reflectance - min: {reflectance_map_targets.min():.6f}, max: {reflectance_map_targets.max():.6f}, has_nan: {torch.isnan(reflectance_map_targets).any()}")
+    
+    loss_refl = F.mse_loss(predicted_reflectance_maps, reflectance_map_targets, reduction='mean')
+    if debug:
+        print(f"🔍 loss_refl: {loss_refl.item():.6f}, has_nan: {torch.isnan(loss_refl).any()}")
+
+    # 4. w_band Loss - albedo consistency
+    loss_w = F.mse_loss(w_outputs_norm, w_targets_norm, reduction='mean')
+    if debug:
+        print(f"🔍 loss_w: {loss_w.item():.6f}, has_nan: {torch.isnan(loss_w).any()}")
+    # 5. theta_band Loss - phase function consistency
+    loss_theta = F.mse_loss(theta_outputs_norm, theta_targets_norm, reduction='mean')
+    if debug:
+        print(f"🔍 loss_theta: {loss_theta.item():.6f}, has_nan: {torch.isnan(loss_theta).any()}")
+        
+    # Combine losses
+    total_loss = config["W_MSE"] * loss_mse + config["W_GRAD"] * loss_grad + config["W_REFL"] * loss_refl + config["W_W"] * loss_w + config["W_THETA"] * loss_theta 
+    if debug:
+        print(f"🔍 Weights - W_MSE: {config['W_MSE']}, W_GRAD: {config['W_GRAD']}, W_REFL: {config['W_REFL']}, W_W: {config['W_W']}, W_THETA: {config['W_THETA']}")
+        print(f"🔍 total_loss: {total_loss.item():.6f}, has_nan: {torch.isnan(total_loss).any()}")
+
+    
+    if return_components:
+        returned_components = [loss_mse, loss_grad, loss_refl, loss_w, loss_theta, total_loss]
+        return returned_components
     else:
         return total_loss
 

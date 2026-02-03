@@ -315,8 +315,8 @@ def plot_two_lro_metadata_distributions(data_dir1, data_folder1, data_dir2, data
     if not os.path.exists(moon_tif_downsampled):
         print(f"Generating downsampled DEM with factor {downsample_factor} for fast plotting...")
         generate_downsampled_DEM(moon_tif_file, moon_tif_downsampled, downsample_factor=downsample_factor)
-    
-    print(f"Downsampled DEM exists at {moon_tif_downsampled}")
+    else:
+        print(f"Downsampled DEM exists at {moon_tif_downsampled}")
 
     try:
         with rasterio.open(moon_tif_downsampled) as src:
@@ -351,7 +351,7 @@ def plot_two_lro_metadata_distributions(data_dir1, data_folder1, data_dir2, data
     for all_lro_meta, color, name in zip([all_lro_meta_1, all_lro_meta_2], ['red', 'blue'], [data_folder1, data_folder2]):
         # print(f"Plotting metadata for dataset: {name}")
         for meta in all_lro_meta:
-            print(f"Lat: {meta[0]}, Lon: {meta[1]}, Box Radius (m): {meta[2]}")
+            # print(f"Lat: {meta[0]}, Lon: {meta[1]}, Box Radius (m): {meta[2]}")
             lat_c = meta[0]
             lon_c = meta[1]
             box_radius_m = meta[2]
