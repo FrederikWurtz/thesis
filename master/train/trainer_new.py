@@ -1,13 +1,15 @@
+import sys
 import warnings
-
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
-from master.train.trainer_core import FluidDEMDataset, DEMDataset
+from master.data_sim.generator import generate_and_save_data_pooled_multi_gpu
+from master.train.trainer_core import FluidDEMDataset, DEMDataset, SemiFluidDEMDataset, is_main
 from master.train.train_utils import normalize_inputs
 import time
+import subprocess
 
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
@@ -29,29 +31,6 @@ warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._logging')
 warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.*')
 
-
-
-def is_main():
-    return int(os.environ["LOCAL_RANK"]) == 0 if "LOCAL_RANK" in os.environ else True
-
-def ddp_setup():
-    try:
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
-        # 🔥 Enable cuDNN autotuner for convolution optimization
-        torch.backends.cudnn.benchmark = True
-        print(f"DDP setup complete on GPU {local_rank}")
-        # Optional: Enable TF32 for Ampere GPUs (A100, RTX 3090, etc.)
-        if torch.cuda.get_device_capability()[0] >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        
-        # 🔥 Use TensorFloat32 for faster matmul on Ampere+ GPUs
-        torch.set_float32_matmul_precision('high')  # or 'medium' for even more speed
-        
-    except KeyError:
-        raise RuntimeError("LOCAL_RANK not found in environment variables. Please run this script using torch.distributed.launch or torchrun for multi-GPU training.")
 
 
 class Trainer_multiGPU:
@@ -478,7 +457,12 @@ class Trainer_multiGPU:
         return global_test_loss, global_ame
 
 def load_train_objs(config, run_path: str, epoch_shared=None):
-    train_set = FluidDEMDataset(config, epoch_shared=epoch_shared) # load your dataset
+    if config["USE_SEMIFLUID"]:
+        if is_main():
+            print("Using SemiFluidDEMDataset for training.")
+        train_set = SemiFluidDEMDataset(config, epoch_shared=epoch_shared) # load your dataset
+    else:
+        train_set = FluidDEMDataset(config, epoch_shared=epoch_shared) # load your dataset
     val_path = os.path.join(run_path, 'val') # load validation dataset
     val_files = list_pt_files(val_path)
     val_set = DEMDataset(val_files, config=config)
@@ -505,8 +489,7 @@ def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, 
             dataset,
             batch_size=batch_size,
             pin_memory=True,
-            shuffle=use_shuffle,
-            sampler=DistributedSampler(dataset),
+            sampler=DistributedSampler(dataset, shuffle=use_shuffle),
             num_workers=num_workers,
             prefetch_factor=prefetch_factor,
             persistent_workers=persistent_workers,  # 🔥 Keep workers alive between epochs
@@ -527,6 +510,22 @@ def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, 
 def set_global_epoch(epoch):
     global GLOBAL_EPOCH
     GLOBAL_EPOCH = epoch
+
+
+
+def generate_fluid_data(run_name: str, epoch: int):
+    print(f"[Rank0] Generating fluid data for epoch {epoch}...", flush=True)
+    cmd = [
+        sys.executable,
+        "generate_fluid_data.py",
+        "--run", run_name,
+        "--epoch", str(epoch),
+    ]
+    print(f"[Rank0] Spawning generator process: {' '.join(cmd)}", flush=True)
+    result = subprocess.run(cmd, check=True)
+    print(f"[Rank0] Generator finished with code {result.returncode}", flush=True)
+
+
 
 class Trainer_multiGPU_multi_band:
     def __init__(
@@ -554,14 +553,15 @@ class Trainer_multiGPU_multi_band:
         self.train_timings = []
         self.val_timings = []
         self.config = config
-        self.train_mean = train_mean
-        self.train_std = train_std
+        self.train_mean = train_mean.to(self.gpu_id)
+        self.train_std = train_std.to(self.gpu_id)
         self.model = DDP(self.model, device_ids=[self.gpu_id]) # First wrap model in DDP
-        if is_main():
-            print("🔥 About to compile model with torch.compile() - this may take 5-30 minutes on first run...")
-        self.model = torch.compile(self.model, mode='reduce-overhead')  # Then compile with torch.compile
-        if is_main():
-            print("✅ Model compilation complete!")
+        if torch.distributed.get_world_size() == 1:
+            print("🔥 About to compile model with torch.compile() on single GPU...")
+            self.model = torch.compile(self.model, mode='reduce-overhead')
+        else:
+            if is_main():
+                print("⚠️ Skipping torch.compile() in multi-GPU mode to avoid known compile issues on multiple GPUs.")
         self.dtype = torch.bfloat16 if self.config["USE_BF16"] else torch.float16
         self.use_amp = self.config["USE_AMP"]
         self.scaler = GradScaler('cuda') if (self.use_amp and self.dtype == torch.float16) else None
@@ -570,7 +570,7 @@ class Trainer_multiGPU_multi_band:
             if is_main():
                 print("Loading snapshot")
             self._load_snapshot(snapshot_path) # Then, after DDP wrapping, load snapshot if it exists
-        self.debug = self.config["DEBUG_MODE"]
+        self.debug = self.config["DEBUG"]
 
     def _save_snapshot(self, epoch):
         snapshot = {
@@ -648,6 +648,7 @@ class Trainer_multiGPU_multi_band:
 
     def _run_epoch(self, epoch, return_val=False):
         t0 = time.time()
+        
         if is_main() and self.debug:
             print(f"--- Epoch {epoch} start ---")
             check_params_for_nans(self.model, tag=f"epoch_{epoch}_start")
@@ -665,6 +666,9 @@ class Trainer_multiGPU_multi_band:
             data_load_time = 0.0
             compute_time = 0.0
 
+        # DEBUG: set to eval mode for testing
+        # self.model.eval()
+        
         # Set epoch for distributed sampler and dataset randomness, for reproducibility
         self.train_data.sampler.set_epoch(epoch)
 
@@ -716,14 +720,18 @@ class Trainer_multiGPU_multi_band:
         torch.distributed.all_reduce(total_samples_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of samples across GPUs
         
         # Compute true weighted average: total_loss / total_samples
-        global_avg_loss = epoch_loss_tensor.item() / total_samples_tensor.item()
+        # print(f"Debug: epoch_loss_tensor={epoch_loss_tensor.item():.10f}, total_samples_tensor={total_samples_tensor.item()}")
+        if not total_samples_tensor.item() == 0:
+            global_avg_loss = epoch_loss_tensor.item() / total_samples_tensor.item()
+        else:
+            global_avg_loss = 0  # or some default value, but this would indicate a problem
     
         # Store loss on main process
         if is_main():
             self.train_loss_history.append(global_avg_loss)
             total_time = time.time() - t0
             self.train_timings.append(total_time)
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {global_avg_loss:.2e} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s")
+            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {global_avg_loss:.2e} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s | Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         if return_val:
             return global_avg_loss
@@ -759,14 +767,14 @@ class Trainer_multiGPU_multi_band:
                         print(f"    min={t.min().item():.6e}, max={t.max().item():.6e}, mean={t.mean().item():.6e}")
                         raise RuntimeError(f"NaN/Inf i output {name}")
 
-            total_loss = calculate_total_loss_multi_band(
+            total_loss_list = calculate_total_loss_multi_band(
                 dem_outputs, dem_targets, reflectance_map_targets, metas, w_outputs, w_targets, theta_outputs, theta_targets,
                 device=device,
                 config=self.config,
                 return_components=True
             )
         
-        loss_mse, loss_grad, loss_refl, loss_w, loss_theta, total_loss = total_loss
+        loss_mse, loss_grad, loss_refl, loss_w, loss_theta, total_loss = total_loss_list
 
         if is_main() and self.debug:
             # Check loss component values
@@ -787,7 +795,6 @@ class Trainer_multiGPU_multi_band:
                         print(f"🚨 NaN/Inf i gradient for '{name}' FØR clipping")
                         print(f"    grad min={p.grad.min().item():.6e}, max={p.grad.max().item():.6e}, mean={p.grad.mean().item():.6e}")
                         raise RuntimeError(f"NaN/Inf i grad for {name}")
-
 
 
         # Clip gradients – dette returnerer norm FØR clipping
@@ -879,8 +886,8 @@ class Trainer_multiGPU_multi_band:
             metas = metas.to(self.gpu_id)
             reflectance_map_targets = reflectance_map_targets.to(self.gpu_id)
             dem_targets = dem_targets.to(self.gpu_id)
-            w_targets = w_targets.to(self.gpu_id).unsqueeze(1)
-            theta_targets = theta_targets.to(self.gpu_id).unsqueeze(1)
+            w_targets = w_targets.to(self.gpu_id)
+            theta_targets = theta_targets.to(self.gpu_id)
             images = normalize_inputs(images, self.train_mean, self.train_std)
             batch_size = images.size(0)
             
@@ -922,6 +929,7 @@ class Trainer_multiGPU_multi_band:
                 print(f"Warning: No validation samples found. Skipping validation.")
             return None
 
+        # print(f"Debug: val_loss_tensor={val_loss_tensor.item():.10f}, total_samples_tensor={total_samples_tensor.item()}")
         # Compute the true weighted average: total_val_loss / total_samples
         global_avg_val_loss = val_loss_tensor.item() / total_samples_tensor.item()
 
@@ -930,7 +938,7 @@ class Trainer_multiGPU_multi_band:
             self.val_loss_history.append(global_avg_val_loss)
             val_time = time.time() - t0
             self.val_timings.append(val_time)
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Val Loss: {global_avg_val_loss:.2e} | Samples: {global_total_samples} | Time: {val_time:.2f}s")
+            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Val Loss: {global_avg_val_loss:.2e} | Samples: {global_total_samples} | Time: {val_time:.2f}s | Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         self.model.train()  # Set back to training mode
         return global_avg_val_loss
@@ -953,7 +961,9 @@ class Trainer_multiGPU_multi_band:
         
         self.model.eval()  # Set to evaluation mode
         test_loss = 0.0
-        total_ame = 0.0
+        dem_total_ame = 0.0
+        w_total_ame = 0.0
+        theta_total_ame = 0.0
         total_samples = 0
         
         for images, reflectance_map_targets, dem_targets, metas, w_targets, theta_targets, lro_metas in data_loader:
@@ -980,21 +990,30 @@ class Trainer_multiGPU_multi_band:
                     return_components=False
                 )
             
-            # Calculate AME (Absolute Mean Error)
-            ame = torch.abs(outputs - targets).mean()
+            # Calculate AME (Absolute Mean Error) for DEM, w band, and theta band
+            dem_ame = torch.abs(dem_outputs - dem_targets).mean()
+            w_ame = torch.abs(w_outputs - w_targets).mean()
+            theta_ame = torch.abs(theta_outputs - theta_targets).mean()
             
+            # Accumulate losses and AMEs
             test_loss += total_loss.item() * batch_size
-            total_ame += ame.item() * batch_size
+            dem_total_ame += dem_ame.item() * batch_size
+            w_total_ame += w_ame.item() * batch_size
+            theta_total_ame += theta_ame.item() * batch_size
             total_samples += batch_size
         
         
         # Gather losses, AMEs, and sample counts from all GPUs
         test_loss_tensor = torch.tensor([test_loss], device=self.gpu_id)
-        ame_tensor = torch.tensor([total_ame], device=self.gpu_id)
+        dem_ame_tensor = torch.tensor([dem_total_ame], device=self.gpu_id)
+        w_ame_tensor = torch.tensor([w_total_ame], device=self.gpu_id)
+        theta_ame_tensor = torch.tensor([theta_total_ame], device=self.gpu_id)
         total_samples_tensor = torch.tensor([total_samples], device=self.gpu_id)
         
         torch.distributed.all_reduce(test_loss_tensor, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(ame_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(dem_ame_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(w_ame_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(theta_ame_tensor, op=torch.distributed.ReduceOp.SUM)
         torch.distributed.all_reduce(total_samples_tensor, op=torch.distributed.ReduceOp.SUM)
         
         # Check if no GPU has test samples
@@ -1006,14 +1025,17 @@ class Trainer_multiGPU_multi_band:
         
         # Compute global weighted averages
         global_test_loss = test_loss_tensor.item() / total_samples_tensor.item()
-        global_ame = ame_tensor.item() / total_samples_tensor.item()
+        global_dem_ame = dem_ame_tensor.item() / total_samples_tensor.item()
+        global_w_ame = w_ame_tensor.item() / total_samples_tensor.item()
+        global_theta_ame = theta_ame_tensor.item() / total_samples_tensor.item()
         
         if is_main():
             test_time = time.time() - t0
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Test Loss: {global_test_loss:.2e} | AME: {global_ame:.6f} | Samples: {global_total_samples} | Time: {test_time:.2f}s")
+            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Test Loss: {global_test_loss:.2e} | DEM AME: {global_dem_ame:.6f} | W AME: {global_w_ame:.6f} | Theta AME: {global_theta_ame:.6f} | Samples: {global_total_samples} | Time: {test_time:.2f}s")
         
+        # print(f"Debug: test_loss_tensor={test_loss_tensor.item():.10f}, total_samples_tensor={total_samples_tensor.item()}")
         self.model.train()  # Set back to training mode
-        return global_test_loss, global_ame
+        return global_test_loss, (global_dem_ame, global_w_ame, global_theta_ame)
 
 
 def check_params_for_nans(model, tag=""):
@@ -1279,6 +1301,6 @@ class Trainer_singleGPU:
         global_test_loss = test_loss / global_total_samples
         global_ame = total_ame / global_total_samples
         test_time = time.time() - t0
-        print(f"Epoch {epoch} | Test Loss: {global_test_loss:.2e} | AME: {global_ame:.6f} | Samples: {global_total_samples} | Time: {test_time:.2f}s")
+        print(f"Epoch {epoch} | Test Loss: {global_test_loss:.2e} | AME: {global_ame:.6f} | Samples: {global_total_samples} | Time: {test_time:.2f}s | Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         self.model.train()
         return global_test_loss, global_ame

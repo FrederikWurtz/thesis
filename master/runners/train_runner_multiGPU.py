@@ -16,7 +16,8 @@ warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.
 import torch
 
 from torch.distributed import destroy_process_group
-from master.train.trainer_new import Trainer_multiGPU, Trainer_multiGPU_multi_band, ddp_setup, load_train_objs, prepare_dataloader, is_main
+from master.train.trainer_new import Trainer_multiGPU, Trainer_multiGPU_multi_band
+from master.train.trainer_core import ddp_setup, load_train_objs, prepare_dataloader, is_main
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 from master.configs.config_utils import load_config_file
 
@@ -74,12 +75,13 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     # value for each process to share current epoch - otherwise the deterministic randomness will not be set correctly!
     EPOCH_SHARED = multiprocessing.Value('i', 0)  # 'i' means integer
 
-    train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path, epoch_shared=EPOCH_SHARED)
+    train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path, epoch_shared=EPOCH_SHARED) 
     
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
                                       num_workers=config["NUM_WORKERS_DATALOADER"], 
                                       prefetch_factor=config["PREFETCH_FACTOR"],
-                                      use_shuffle=False)
+                                      use_shuffle=True
+                                      )
                                       
     
     val_loader = prepare_dataloader(val_set, config["BATCH_SIZE"], 
@@ -93,7 +95,8 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
                                      use_shuffle=False)
 
     if config["USE_MULTI_BAND"]:
-        print("Using multi-band model for training...")
+        if is_main():
+            print("Using multi-band model for training...")
         trainer = Trainer_multiGPU_multi_band(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
     else:
         trainer = Trainer_multiGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
@@ -108,7 +111,12 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     try:
         trainer.train(config["EPOCHS"])
     finally:
-            torch.distributed.destroy_process_group()
+        torch.distributed.destroy_process_group()
+    
+    if config["USE_SEMIFLUID"] and config["TOTAL_EPOCHS"] > config["EPOCHS"]:
+        # We are doing semi-fluid training and have not yet reached total epochs
+        return # Exit to allow outer loop to regenerate data and continue training
+        
 
     # Skip testing if profiling
     if config.get("SKIP_TEST", False):

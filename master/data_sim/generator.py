@@ -578,13 +578,14 @@ def _generate_with_threading_optimized(n_dems, n_gpus, max_workers, images_dir, 
 
 
 def generate_and_save_data_pooled_multi_gpu(config: dict = None,
-                                  images_dir: str = None,
-                                  n_dems: int = None):
+                                            images_dir: str = None,
+                                            n_dems: int = None,
+                                            verbose: bool = True,
+                                            use_cpu_fallback: bool = False,
+                                            n_gpus = None):
     """
     Optimized multi-GPU data generation with automatic tuning.
-    """
-    import time
-    
+    """    
     if config is None:
         raise ValueError("config must be provided")
     if images_dir is None:
@@ -593,10 +594,11 @@ def generate_and_save_data_pooled_multi_gpu(config: dict = None,
         raise ValueError("n_dems must be provided")
 
     dem_size = config.get('DEM_SIZE', 512)
-    
-    if torch.cuda.is_available() or torch.backends.mps.is_available():
+    print(f"Use CPU fallback: {use_cpu_fallback}")
+    if not use_cpu_fallback and (torch.cuda.is_available() or torch.backends.mps.is_available()):
         if torch.backends.mps.is_available():
-            print("MPS detected: Forcing single-threaded data generation due to MPS multiprocessing/threading incompatibility.")
+            if verbose:
+                print("MPS detected: Forcing single-threaded data generation due to MPS multiprocessing/threading incompatibility.")
             for dem_idx in range(n_dems):
                 # Call the single-threaded data generation function directly
                 if config["USE_LRO_DEMS"]:
@@ -615,32 +617,36 @@ def generate_and_save_data_pooled_multi_gpu(config: dict = None,
                         path=os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt"),
                         config=config
                     )
-            print(f"Finished generating {n_dems} DEMs (single-threaded, MPS mode).")
+            if verbose:
+                print(f"Finished generating {n_dems} DEMs (single-threaded, MPS mode).")
             return
         else:
-            print("CUDA device detected and available.")
-            n_gpus = torch.cuda.device_count()
+            if verbose:
+                print("CUDA detected: Using multi-GPU data generation.")
+        # Determine number of GPUs
+            n_gpus = n_gpus if n_gpus is not None else torch.cuda.device_count()
         
         # Optimal configuration based on DEM size
         if dem_size < 512:
-            workers_per_gpu = 8
+            workers_per_gpu = 32
             use_multiprocessing = False
         elif dem_size < 1024:
-            workers_per_gpu = 4
+            workers_per_gpu = 32
             use_multiprocessing = False
         else:
-            workers_per_gpu = 8
+            workers_per_gpu = 32
             use_multiprocessing = True
         
         max_workers = n_gpus * workers_per_gpu
         
-        print(f"\n{'='*60}")
-        print(f"Creating {n_dems} DEMs (size: {dem_size}x{dem_size})")
-        print(f"Using {max_workers} workers across {n_gpus} GPU(s)")
-        print(f"Workers per GPU: {workers_per_gpu}")
-        print(f"Mode: {'Multiprocessing' if use_multiprocessing else 'Threading'}")
-        print(f"Images per DEM: {config['IMAGES_PER_DEM']}")
-        print(f"{'='*60}\n")
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Creating {n_dems} DEMs (size: {dem_size}x{dem_size})")
+            print(f"Using {max_workers} workers across {n_gpus} GPU(s)")
+            print(f"Workers per GPU: {workers_per_gpu}")
+            print(f"Mode: {'Multiprocessing' if use_multiprocessing else 'Threading'}")
+            print(f"Images per DEM: {config['IMAGES_PER_DEM']}")
+            print(f"{'='*60}\n")
         
         t_start = time.perf_counter()
         
@@ -658,50 +664,80 @@ def generate_and_save_data_pooled_multi_gpu(config: dict = None,
         
         n_success = sum(results)
         
-        print(f"\n{'='*60}")
-        print(f"Generation Complete")
-        print(f"{'='*60}")
-        print(f"Successfully created: {n_success}/{n_dems} DEMs")
-        print(f"Total time: {elapsed:.2f} seconds")
-        print(f"Time per DEM: {elapsed/n_dems:.2f} seconds")
-        print(f"Throughput: {n_dems/elapsed:.2f} DEMs/second")
-        print(f"{'='*60}\n")
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Generation Complete")
+            print(f"{'='*60}")
+            print(f"Successfully created: {n_success}/{n_dems} DEMs")
+            print(f"Total time: {elapsed:.2f} seconds")
+            print(f"Time per DEM: {elapsed/n_dems:.2f} seconds")
+            print(f"Throughput: {n_dems/elapsed:.2f} DEMs/second")
+            print(f"{'='*60}\n")
         
     else:
-        # CPU fallback
-        print(f"\n{'='*60}")
-        print(f"Creating {n_dems} DEMs using CPU")
-        print(f"Using {config['NUM_WORKERS']} workers")
-        print(f"{'='*60}\n")
+        print("No GPU detected or CPU fallback forced: Using CPU for data generation.")
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Creating {n_dems} DEMs using CPU (no multiprocessing)")
+            print(f"{'='*60}\n")
         
         t_start = time.perf_counter()
-        
-        all_args = []
+
+        n_success = 0
         for dem_idx in range(n_dems):
             filename = os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
-            all_args.append((filename, config))
-        
-        # Use spawn method for consistency
-        import multiprocessing as mp
-        ctx = mp.get_context('spawn')
-        with ctx.Pool(processes=config["NUM_WORKERS"]) as pool:
-            results = list(tqdm(
-                pool.imap_unordered(generate_and_save_worker_friendly, all_args, chunksize=1),
-                total=n_dems,
-                desc="Generating DEMs"
-            ))
-        
+            ok = generate_and_save_worker_friendly((filename, config))
+            if ok:
+                n_success += 1
+
         t_end = time.perf_counter()
         elapsed = t_end - t_start
+
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Successfully created: {n_success}/{n_dems} DEMs")
+            print(f"Total time: {elapsed:.2f} seconds")
+            print(f"Time per DEM: {elapsed/n_dems:.2f} seconds")
+            print(f"Throughput: {n_dems/elapsed:.2f} DEMs/second")
+            print(f"{'='*60}\n")
+
+        # print("No GPU detected or CPU fallback forced: Using CPU for data generation.")
+        # if verbose:
+        #     # CPU fallback
+        #     print(f"\n{'='*60}")
+        #     print(f"Creating {n_dems} DEMs using CPU")
+        #     print(f"Using {config['NUM_WORKERS']} workers")
+        #     print(f"{'='*60}\n")
         
-        n_success = sum(1 for r in results if r)
+        # t_start = time.perf_counter()
         
-        print(f"\n{'='*60}")
-        print(f"Successfully created: {n_success}/{n_dems} DEMs")
-        print(f"Total time: {elapsed:.2f} seconds")
-        print(f"Time per DEM: {elapsed/n_dems:.2f} seconds")
-        print(f"Throughput: {n_dems/elapsed:.2f} DEMs/second")
-        print(f"{'='*60}\n")
+        # all_args = []
+        # for dem_idx in range(n_dems):
+        #     filename = os.path.join(images_dir, f"dataset_{dem_idx:04d}.pt")
+        #     all_args.append((filename, config))
+        
+        # # Use spawn method for consistency
+        # import multiprocessing as mp
+        # ctx = mp.get_context('spawn')
+        # with ctx.Pool(processes=config["NUM_WORKERS"]) as pool:
+        #     results = list(tqdm(
+        #         pool.imap_unordered(generate_and_save_worker_friendly, all_args, chunksize=1),
+        #         total=n_dems,
+        #         desc="Generating DEMs"
+        #     ))
+        
+        # t_end = time.perf_counter()
+        # elapsed = t_end - t_start
+        
+        # n_success = sum(1 for r in results if r)
+        
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Successfully created: {n_success}/{n_dems} DEMs")
+            print(f"Total time: {elapsed:.2f} seconds")
+            print(f"Time per DEM: {elapsed/n_dems:.2f} seconds")
+            print(f"Throughput: {n_dems/elapsed:.2f} DEMs/second")
+            print(f"{'='*60}\n")
 
 
 def _get_sets_of_suncam_values(manual_suncam_pars=None, manual_sun_az_pm=None, manual_sun_el_pm=None,

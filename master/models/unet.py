@@ -35,17 +35,50 @@ class FiLMLayer(nn.Module):
         return gamma * x + beta
 
 
+
 class DoubleConv(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, out_ch, norm="group", num_groups=8):
         super().__init__()
+
+        if norm == "batch":
+            norm_layer1 = nn.BatchNorm2d(out_ch)
+            norm_layer2 = nn.BatchNorm2d(out_ch)
+        elif norm == "group":
+            # Sørg for at num_groups dividerer out_ch
+            assert out_ch % num_groups == 0, \
+                f"out_ch={out_ch} skal være delelig med num_groups={num_groups} for GroupNorm"
+            norm_layer1 = nn.GroupNorm(num_groups, out_ch)
+            norm_layer2 = nn.GroupNorm(num_groups, out_ch)
+        elif norm == "instance":
+            norm_layer1 = nn.InstanceNorm2d(out_ch, affine=True)
+            norm_layer2 = nn.InstanceNorm2d(out_ch, affine=True)
+        elif norm is None:
+            norm_layer1 = nn.Identity()
+            norm_layer2 = nn.Identity()
+        else:
+            raise ValueError(f"Ukendt norm-type: {norm}")
+
         self.block = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            norm_layer1,
             nn.ReLU(inplace=True),
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            norm_layer2,
             nn.ReLU(inplace=True),
         )
+
+
+# class DoubleConv(nn.Module):
+#     def __init__(self, in_ch, out_ch):
+#         super().__init__()
+#         self.block = nn.Sequential(
+#             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+#             nn.BatchNorm2d(out_ch),
+#             nn.ReLU(inplace=True),
+#             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+#             nn.BatchNorm2d(out_ch),
+#             nn.ReLU(inplace=True),
+#         )
 
     def forward(self, x):
         return self.block(x)
@@ -53,7 +86,7 @@ class DoubleConv(nn.Module):
 
 class UNet(nn.Module):
     def __init__(self, in_channels=None, out_channels=1, features=(64, 128, 256, 512), 
-                 meta_dim=5, meta_hidden=64, meta_out=128, upsample_factor=4, w_range=None, theta_range=None):
+                 meta_dim=5, meta_hidden=64, meta_out=128, upsample_factor=4, w_range=None, theta_range=None, norm="batch", num_groups=8):
         super().__init__()
         self.upsample_factor = upsample_factor
         self.w_range = w_range
@@ -62,10 +95,10 @@ class UNet(nn.Module):
         self.pools = nn.ModuleList()
         ch = in_channels
         for f in features:
-            self.encs.append(DoubleConv(ch, f))
+            self.encs.append(DoubleConv(ch, f, norm=norm, num_groups=num_groups))
             self.pools.append(nn.MaxPool2d(2))
             ch = f
-        self.bottleneck_conv = DoubleConv(features[-1], features[-1] * 2)
+        self.bottleneck_conv = DoubleConv(features[-1], features[-1] * 2, norm=norm, num_groups=num_groups)
         self.meta_encoder = MetaEncoder(meta_dim=meta_dim, hidden_dim=meta_hidden, out_dim=meta_out)
         self.film = FiLMLayer(feature_channels=features[-1] * 2, cond_dim=meta_out)
         self.upconvs = nn.ModuleList()
@@ -73,7 +106,7 @@ class UNet(nn.Module):
         ch = features[-1] * 2
         for f in reversed(features):
             self.upconvs.append(nn.ConvTranspose2d(ch, f, kernel_size=2, stride=2))
-            self.decs.append(DoubleConv(ch, f))
+            self.decs.append(DoubleConv(ch, f, norm=norm, num_groups=num_groups))
             ch = f
         self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
         self.final_upsample = nn.Upsample(scale_factor=upsample_factor, mode='bilinear', align_corners=False)

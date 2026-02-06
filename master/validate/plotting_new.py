@@ -473,6 +473,1020 @@ def plot_comprehensive_pt(
         return fig
 
 
+def plot_comprehensive_multi_band(
+    run_dir=None,
+    n_test_sets=5,
+    figsize=(11*3, 6*3),
+    return_fig=False,
+    save_fig=True,
+    same_scale=False,
+    variant='first',
+    use_train_set=False,
+    filename=None,
+    test_on_separate_data=False
+):
+    sup_dir = "runs/"
+    config = load_config_file(os.path.join(sup_dir, run_dir, 'stats', 'config.ini'))
+    if not config.get("USE_MULTI_BAND"):
+        raise ValueError("plot_comprehensive_multi_band requires a multi-band run directory.")
+
+    snapshot_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'snapshot.pt')
+    train_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'train_losses.csv')
+    val_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'val_losses.csv')
+    input_stats_path = os.path.join(sup_dir, run_dir, 'stats', 'input_stats.ini')
+    train_timings_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'train_timings.csv')
+    val_timings_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'val_timings.csv')
+    if not test_on_separate_data:
+        test_results_path = os.path.join(sup_dir, run_dir, 'stats', 'test_results.ini')
+    else:
+        test_results_path = os.path.join(sup_dir, run_dir, 'stats', 'alt_test_results.ini')
+    equipment_info_path = os.path.join(sup_dir, run_dir, 'stats', 'equipment_info.ini')
+
+    checkpoint = load_checkpoint(snapshot_path, map_location='cpu')
+    train_data = np.genfromtxt(train_losses_path, delimiter=',', skip_header=1)
+    val_data = np.genfromtxt(val_losses_path, delimiter=',', skip_header=1)
+
+    if train_data.ndim == 1:
+        train_data = train_data.reshape(1, -1)
+    if val_data.ndim == 1:
+        val_data = val_data.reshape(1, -1)
+
+    train_epochs = train_data[:, 0].astype(int).tolist()
+    train_losses = train_data[:, 1].tolist()
+    val_epochs = val_data[:, 0].astype(int).tolist()
+    val_losses = val_data[:, 1].tolist()
+    # check for extreme outliers in first 10 data points 
+    first_10_val_losses = val_losses[:10]
+    mean_first_10 = np.mean(first_10_val_losses)
+    for i, loss in enumerate(first_10_val_losses):
+        if loss > 5 * mean_first_10:
+            print(f"Warning: Extreme outlier, more than 5 times the mean of first 10 epochs detected in validation loss at epoch {val_epochs[i]}: {loss}. Removing from validation losses.")
+            val_losses.pop(i)
+            val_epochs.pop(i)
+    
+    input_stats = read_file_from_ini(input_stats_path, ftype=dict)
+
+    if os.path.exists(train_timings_path):
+        train_timings_data = np.genfromtxt(train_timings_path, delimiter=',', skip_header=1)
+        val_timings_data = np.genfromtxt(val_timings_path, delimiter=',', skip_header=1)
+
+        if train_timings_data.ndim == 1:
+            train_timings_data = train_timings_data.reshape(1, -1)
+        if val_timings_data.ndim == 1:
+            val_timings_data = val_timings_data.reshape(1, -1)
+
+        avg_train_time_per_epoch = np.mean(train_timings_data[:, 1])
+        avg_val_time_per_epoch = np.mean(val_timings_data[:, 1])
+        if os.path.exists(test_results_path):
+            test_results = read_file_from_ini(test_results_path, ftype=dict)
+        else:
+            raise FileNotFoundError(f"Found training snapshot, but no test results file found at '{test_results_path}'. Please run testing first.")
+        equipment_info = read_file_from_ini(equipment_info_path, ftype=dict)
+        n_gpus = int(equipment_info.get('NUM_GPUS', ['1'])[0])
+    else:
+        test_results = {"TEST_LOSS": 0.0, "TEST_AME": 0.0}
+        avg_train_time_per_epoch = 0.0
+        avg_val_time_per_epoch = 0.0
+        n_gpus = 1
+
+    total_time_logged = False
+    total_time_path = os.path.join(sup_dir, run_dir, 'stats', 'total_time.ini')
+    if os.path.exists(total_time_path):
+        total_time_logged = True
+        timing_info = read_file_from_ini(total_time_path, ftype=dict)
+        total_time_seconds = float(timing_info["TOTAL_TIME_SECONDS"])
+        total_time_hours = float(timing_info["TOTAL_TIME_HRS"])
+        total_time_minutes = float(timing_info["TOTAL_TIME_MINUTES"])
+
+    print(f"Use train set: {use_train_set}")
+    print(f"Use separate test data: {test_on_separate_data}")
+    if use_train_set and test_on_separate_data:
+        raise ValueError("Cannot use both training set and separate test data simultaneously.")
+
+    if not use_train_set and not test_on_separate_data:
+        test_dir = os.path.join(sup_dir, run_dir, 'test')
+        if not os.path.isdir(test_dir):
+            raise FileNotFoundError(f"No test directory found at '{test_dir}'")
+        candidate_files = sorted(glob.glob(os.path.join(test_dir, '*.pt')))
+        if len(candidate_files) == 0:
+            raise FileNotFoundError(f"Found '{test_dir}' but no .pt files were present.")
+        test_dataset = DEMDataset(candidate_files, config=config)
+    elif use_train_set:
+        run_path = os.path.join(sup_dir, run_dir)
+        train_set = FluidDEMDataset(config=config)
+        test_dataset = train_set
+    else:
+        alt_test_dir = os.path.join(sup_dir, run_dir, 'alt_test')
+        candidate_files = sorted(glob.glob(os.path.join(alt_test_dir, '*.pt')))
+        if len(candidate_files) == 0:
+            raise FileNotFoundError(f"No .pt files found in alternate test directory '{alt_test_dir}'.")
+        test_dataset = DEMDataset(candidate_files, config=config)
+
+    model = UNet(
+        in_channels=config["IMAGES_PER_DEM"],
+        out_channels=3,
+        w_range=(config["W_MIN"], config["W_MAX"]),
+        theta_range=(config["THETA_BAR_MIN"], config["THETA_BAR_MAX"]),
+    )
+    model.load_state_dict(checkpoint['MODEL_STATE'])
+    model.eval()
+
+    train_mean = torch.tensor(input_stats['MEAN'], dtype=torch.float32)
+    train_std = torch.tensor(input_stats['STD'], dtype=torch.float32)
+
+    if train_mean.ndim == 0:
+        train_mean_view = train_mean.view(1, 1, 1, 1)
+    elif train_mean.ndim == 1:
+        train_mean_view = train_mean.view(1, -1, 1, 1)
+    else:
+        train_mean_view = train_mean
+
+    if train_std.ndim == 0:
+        train_std_view = train_std.view(1, 1, 1, 1)
+    elif train_std.ndim == 1:
+        train_std_view = train_std.view(1, -1, 1, 1)
+    else:
+        train_std_view = train_std
+
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+    model.to(device)
+
+    print(f"Selecting {n_test_sets} test sets using variant: {variant}")
+    available_indices = list(range(len(test_dataset)))
+    if len(available_indices) == 0:
+        raise ValueError("No samples available in the selected dataset.")
+
+    if variant == 'first':
+        selected_indices = list(range(min(n_test_sets, len(test_dataset))))
+    elif variant == 'random':
+        selected_indices = sorted(random.sample(available_indices, min(n_test_sets, len(test_dataset))))
+        print("Selected test set indices:", selected_indices)
+    else:
+        raise ValueError(f"Unknown variant: {variant}. Use 'first' or 'random'.")
+
+    all_dem_targets = []
+    all_dem_preds = []
+    all_w_targets = []
+    all_w_preds = []
+    all_theta_targets = []
+    all_theta_preds = []
+    all_images_norm = []
+    index_labels = []
+
+    for test_idx in selected_indices:
+        sample = test_dataset[test_idx]
+        if len(sample) == 7:
+            images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor, w_tensor, theta_tensor, _ = sample
+        else:
+            images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor, w_tensor, theta_tensor = sample
+
+        images_tensor = images_tensor.float()
+        meta_tensor = meta_tensor.float()
+        target_tensor = target_tensor.float()
+        w_tensor = w_tensor.float()
+        theta_tensor = theta_tensor.float()
+
+        images_batch = images_tensor.unsqueeze(0)
+        images_norm = normalize_inputs(images_batch, train_mean_view, train_std_view)
+        meta_batch = meta_tensor.unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            outputs = model(images_norm.to(device), meta_batch, target_size=target_tensor.shape[-2:])
+
+        outputs_np = outputs.squeeze(0).cpu().numpy()
+        dem_pred = outputs_np[0]
+        w_pred = outputs_np[1]
+        theta_pred = outputs_np[2]
+
+        dem_target = target_tensor.squeeze().numpy()
+        w_target = w_tensor.squeeze().numpy()
+        theta_target = theta_tensor.squeeze().numpy()
+
+        all_dem_targets.append(dem_target)
+        all_dem_preds.append(dem_pred)
+        all_w_targets.append(w_target)
+        all_w_preds.append(w_pred)
+        all_theta_targets.append(theta_target)
+        all_theta_preds.append(theta_pred)
+        all_images_norm.append(images_norm.squeeze(0).cpu().numpy())
+        index_labels.append(test_idx)
+
+    if len(selected_indices) == 0:
+        raise ValueError("No test indices selected for plotting.")
+
+    global_dem_min = min(min(d.min() for d in all_dem_targets), min(d.min() for d in all_dem_preds))
+    global_dem_max = max(max(d.max() for d in all_dem_targets), max(d.max() for d in all_dem_preds))
+    global_w_min = min(min(w.min() for w in all_w_targets), min(w.min() for w in all_w_preds))
+    global_w_max = max(max(w.max() for w in all_w_targets), max(w.max() for w in all_w_preds))
+    global_theta_min = min(min(t.min() for t in all_theta_targets), min(t.min() for t in all_theta_preds))
+    global_theta_max = max(max(t.max() for t in all_theta_targets), max(t.max() for t in all_theta_preds))
+
+    if same_scale == 'all':
+        global_img_min = min(img.min() for img in all_images_norm)
+        global_img_max = max(img.max() for img in all_images_norm)
+    else:
+        global_img_min = None
+        global_img_max = None
+
+    fig = plt.figure(figsize=figsize)
+
+    # Top row layout
+    loss_start_x = 0.10
+    loss_width = 0.44
+    loss_height = 0.25
+    loss_start_y = 0.88
+
+    ax_loss = fig.add_axes([loss_start_x, loss_start_y, loss_width, loss_height])
+    ax_loss.plot(train_epochs, train_losses, label='Training Loss', linewidth=2)
+    ax_loss.plot(val_epochs, val_losses, label='Validation Loss', linewidth=2)
+    ax_loss.set_yscale('log')
+    ax_loss.set_xlabel('Epoch', fontsize=12)
+    ax_loss.set_ylabel('Loss', fontsize=12)
+    ax_loss.set_title('Training and Validation Loss', fontsize=14, pad=14)
+    ax_loss.legend(fontsize=10, loc='lower left')
+    ax_loss.grid(True, alpha=0.3)
+
+    from matplotlib.ticker import MaxNLocator
+    ax_loss.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    info_width = 0.12
+    info_height = 0.25
+    info_gap_h = 0.0001
+    info_start_x = loss_start_x + loss_width + 0.005
+    info_start_y = loss_start_y
+    fontsize_textbox = 16
+    
+    theta_min_rad = float(config["THETA_BAR_MIN"])
+    theta_max_rad = float(config["THETA_BAR_MAX"])
+    theta_min_deg = np.degrees(theta_min_rad)
+    theta_max_deg = np.degrees(theta_max_rad)
+
+    infobox_entries = [
+        (
+            "Multi-band UNet\n"
+            f"Epochs trained: {int(checkpoint.get('EPOCHS_RUN', 'N/A'))}\n"
+            f"Test Loss: {float(test_results['TEST_LOSS']):.3f}\n"
+            f"Test DEM AME: {float(test_results['DEM_AME']):.3f}\n"
+            f"Test W AME: {float(test_results['W_AME']):.3f}\n"
+            f"Test Theta AME: {float(test_results['THETA_AME']):.3f}\n"
+            f"LR: {float(config['LR']):.2e}",
+            dict(boxstyle='round', facecolor='lightblue', alpha=0.3),
+        ),
+        (
+            f"Total Epochs: {checkpoint.get('EPOCHS_RUN', 'N/A')}\n"
+            f"Train Time Avg.: \n"
+            f"{avg_train_time_per_epoch:.2f} s/epoch\n"
+            f"Val Time Avg.: \n"
+            f"{avg_val_time_per_epoch:.2f} s/epoch\n"
+            f"Number GPUs: {n_gpus}",
+            dict(boxstyle='round', facecolor='lightgreen', alpha=0.3),
+        ),
+        (
+            "Multi-band Config\n"
+            f"Albedo:\n"
+            f"w: {float(config['W_MIN']):.3f}–{float(config['W_MAX']):.3f}\n"
+            f"w blobs: r={config['W_BLOB_RADIUS_PX']} px, ρ={float(config['W_BLOB_DENSITY']):.2f}\n"
+            f"Macroscopic Roughness:\n"
+            rf"$\bar{{\theta}}$: {theta_min_rad:.1f}–{theta_max_rad:.1f} rad" "\n"
+            rf"$\bar{{\theta}}$: {theta_min_deg:.1f}–{theta_max_deg:.1f}°" "\n"
+            rf"$\bar{{\theta}}$ blobs: r={config['THETA_BAR_BLOB_RADIUS_PX']} px, ρ={float(config['THETA_BAR_BLOB_DENSITY']):.2f}",
+            dict(boxstyle='round', facecolor='lavender', alpha=0.3),
+        ),
+    ]
+
+        
+    if not config["USE_SEMIFLUID"]: 
+        infobox_entries.append(
+            (
+            "Training Config\n"
+            f"Batch Size: {config['BATCH_SIZE']}\n"
+            f"Save every: {config['SAVE_EVERY']} epochs\n"
+            f"Use semifluid: {config['USE_SEMIFLUID']}\n",
+            dict(boxstyle='round', facecolor='lightyellow', alpha=0.3)
+            )
+    )
+    else:  
+        infobox_entries.append(
+            (
+                f"Training Config\n"
+                f"Batch Size: {config['BATCH_SIZE']}\n"
+                f"Save every: {config['SAVE_EVERY']} epochs\n"
+                f"Use semifluid: {config['USE_SEMIFLUID']}\n"
+                f"New data every: {config['NEW_FLUID_DATA_EVERY']} epochs\n",
+                dict(boxstyle='round', facecolor='lightyellow', alpha=0.3)
+            )
+        )
+        
+    if total_time_logged:
+        infobox_entries.append(
+            (
+                f"Total Train Time:\n"
+                f"{total_time_hours:.1f} h {total_time_minutes:.1f} m\n"
+                f"{total_time_seconds:.1f} s total",
+                dict(boxstyle='round', facecolor='lightyellow', alpha=0.3),
+            )
+        )
+
+    for idx, (text, bbox_kwargs) in enumerate(infobox_entries):
+        ax_box = fig.add_axes([info_start_x + idx * (info_width + info_gap_h), info_start_y, info_width, info_height])
+        ax_box.axis('off')
+        ax_box.text(
+            0.05,
+            0.95,
+            text,
+            transform=ax_box.transAxes,
+            fontsize=fontsize_textbox,
+            verticalalignment='top',
+            family='monospace',
+            bbox=bbox_kwargs,
+        )
+
+    # Data rows layout (5 datasets by default)
+    row_height = 0.13
+    row_spacing = 0.012
+    start_y = 0.83
+
+    band_width = 0.075
+    band_gap = 0.002
+    images_width = 0.070
+    images_gap = 0.005
+    start_x = 0.06
+    
+    color_bar_extra_space = 0.03
+    space_before_color_bar = 0.009
+
+    band_positions = []
+    current_x = start_x
+    for _ in range(6):
+        band_positions.append(current_x)
+        current_x += band_width + band_gap
+        if _ in [1, 3, 5]:  # After predicted w and predicted theta
+            current_x += color_bar_extra_space
+    current_x += 0.005 # Extra gap before images
+
+    image_positions = []
+    for _ in range(5):
+        image_positions.append(current_x)
+        current_x += images_width + images_gap
+
+    last_w_im = None
+    last_theta_im = None
+    last_dem_im = None
+
+    for row_idx, test_idx in enumerate(selected_indices):
+        dem_target = all_dem_targets[row_idx]
+        dem_pred = all_dem_preds[row_idx]
+        w_target = all_w_targets[row_idx]
+        w_pred = all_w_preds[row_idx]
+        theta_target = all_theta_targets[row_idx]
+        theta_pred = all_theta_preds[row_idx]
+        images_norm = all_images_norm[row_idx]
+
+        if same_scale == 'row':
+            row_img_min = images_norm.min()
+            row_img_max = images_norm.max()
+
+        y_pos = (start_y - row_height) - row_idx * (row_height + row_spacing)
+
+        ax_gt_w = fig.add_axes([band_positions[0], y_pos, band_width, row_height])
+        ax_gt_w.imshow(w_target, cmap='viridis', origin='lower', vmin=global_w_min, vmax=global_w_max)
+        ax_gt_w.set_xticks([])
+        ax_gt_w.set_yticks([])
+        if row_idx == 0:
+            ax_gt_w.set_title('GT w', fontsize=12, pad=5)
+        ax_gt_w.set_ylabel(f'Set {index_labels[row_idx]}', fontsize=11, rotation=90, labelpad=5)
+
+        ax_pred_w = fig.add_axes([band_positions[1], y_pos, band_width, row_height])
+        last_w_im = ax_pred_w.imshow(w_pred, cmap='viridis', origin='lower', vmin=global_w_min, vmax=global_w_max)
+        ax_pred_w.set_xticks([])
+        ax_pred_w.set_yticks([])
+        if row_idx == 0:
+            ax_pred_w.set_title('Pred w', fontsize=12, pad=5)
+
+        ax_gt_theta = fig.add_axes([band_positions[2], y_pos, band_width, row_height])
+        ax_gt_theta.imshow(theta_target, cmap='plasma', origin='lower', vmin=global_theta_min, vmax=global_theta_max)
+        ax_gt_theta.set_xticks([])
+        ax_gt_theta.set_yticks([])
+        if row_idx == 0:
+            ax_gt_theta.set_title('GT theta', fontsize=12, pad=5)
+
+        ax_pred_theta = fig.add_axes([band_positions[3], y_pos, band_width, row_height])
+        last_theta_im = ax_pred_theta.imshow(theta_pred, cmap='plasma', origin='lower', vmin=global_theta_min, vmax=global_theta_max)
+        ax_pred_theta.set_xticks([])
+        ax_pred_theta.set_yticks([])
+        if row_idx == 0:
+            ax_pred_theta.set_title('Pred theta', fontsize=12, pad=5)
+
+        ax_gt_dem = fig.add_axes([band_positions[4], y_pos, band_width, row_height])
+        ax_gt_dem.imshow(dem_target, cmap='terrain', origin='lower', vmin=global_dem_min, vmax=global_dem_max)
+        ax_gt_dem.set_xticks([])
+        ax_gt_dem.set_yticks([])
+        if row_idx == 0:
+            ax_gt_dem.set_title('GT DEM', fontsize=12, pad=5)
+
+        ax_pred_dem = fig.add_axes([band_positions[5], y_pos, band_width, row_height])
+        last_dem_im = ax_pred_dem.imshow(dem_pred, cmap='terrain', origin='lower', vmin=global_dem_min, vmax=global_dem_max)
+        ax_pred_dem.set_xticks([])
+        ax_pred_dem.set_yticks([])
+        if row_idx == 0:
+            ax_pred_dem.set_title('Pred DEM', fontsize=12, pad=5)
+
+        for img_idx, img_x in enumerate(image_positions):
+            ax_img = fig.add_axes([img_x, y_pos, images_width, row_height])
+
+            if same_scale == 'all':
+                ax_img.imshow(images_norm[img_idx], cmap='gray', origin='lower', vmin=global_img_min, vmax=global_img_max)
+            elif same_scale == 'row':
+                ax_img.imshow(images_norm[img_idx], cmap='gray', origin='lower', vmin=row_img_min, vmax=row_img_max)
+            else:
+                ax_img.imshow(images_norm[img_idx], cmap='gray', origin='lower')
+
+            ax_img.set_xticks([])
+            ax_img.set_yticks([])
+            if row_idx == 0:
+                ax_img.set_title(f'Img {img_idx+1}', fontsize=12, pad=5)
+
+    n_rows = len(selected_indices)
+    total_height = n_rows * row_height + max(0, (n_rows - 1)) * row_spacing
+    bottom_y = (start_y - row_height) - max(0, (n_rows - 1)) * (row_height + row_spacing)
+
+    if last_w_im is not None:
+        cbar_w_ax = fig.add_axes([band_positions[1] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
+        cbar_w = plt.colorbar(last_w_im, cax=cbar_w_ax)
+        cbar_w.ax.tick_params(labelsize=10)
+        cbar_w.set_label('w', fontsize=10)
+
+    if last_theta_im is not None:
+        cbar_theta_ax = fig.add_axes([band_positions[3] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
+        cbar_theta = plt.colorbar(last_theta_im, cax=cbar_theta_ax)
+        cbar_theta.ax.tick_params(labelsize=10)
+        cbar_theta.set_label('theta (rad)', fontsize=10)
+
+    if last_dem_im is not None:
+        cbar_dem_ax = fig.add_axes([band_positions[5] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
+        cbar_dem = plt.colorbar(last_dem_im, cax=cbar_dem_ax)
+        cbar_dem.ax.tick_params(labelsize=10)
+        cbar_dem.set_label('DEM (m)', fontsize=10)
+
+    if save_fig:
+        figures_dir = os.path.join(sup_dir, run_dir, 'figures')
+        os.makedirs(figures_dir, exist_ok=True)
+        output_path = os.path.join(figures_dir, filename if filename is not None else 'comprehensive_plot_multi_band.pdf')
+        fig.savefig(output_path, format='pdf', bbox_inches='tight', dpi=150)
+        print(f"Figure saved to: {output_path}")
+
+    if return_fig:
+        return fig
+
+
+def plot_comprehensive_multi_band_with_dif(
+    run_dir=None,
+    n_test_sets=5,
+    figsize=(14*3, 6*3),
+    return_fig=False,
+    save_fig=True,
+    same_scale=False,
+    variant='first',
+    use_train_set=False,
+    filename=None,
+    test_on_separate_data=False
+):
+    sup_dir = "runs/"
+    config = load_config_file(os.path.join(sup_dir, run_dir, 'stats', 'config.ini'))
+    if not config.get("USE_MULTI_BAND"):
+        raise ValueError("plot_comprehensive_multi_band_with_dif requires a multi-band run directory.")
+
+    snapshot_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'snapshot.pt')
+    train_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'train_losses.csv')
+    val_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'val_losses.csv')
+    input_stats_path = os.path.join(sup_dir, run_dir, 'stats', 'input_stats.ini')
+    train_timings_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'train_timings.csv')
+    val_timings_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'val_timings.csv')
+    if not test_on_separate_data:
+        test_results_path = os.path.join(sup_dir, run_dir, 'stats', 'test_results.ini')
+    else:
+        test_results_path = os.path.join(sup_dir, run_dir, 'stats', 'alt_test_results.ini')
+    equipment_info_path = os.path.join(sup_dir, run_dir, 'stats', 'equipment_info.ini')
+
+    checkpoint = load_checkpoint(snapshot_path, map_location='cpu')
+    train_data = np.genfromtxt(train_losses_path, delimiter=',', skip_header=1)
+    val_data = np.genfromtxt(val_losses_path, delimiter=',', skip_header=1)
+
+    if train_data.ndim == 1:
+        train_data = train_data.reshape(1, -1)
+    if val_data.ndim == 1:
+        val_data = val_data.reshape(1, -1)
+
+    train_epochs = train_data[:, 0].astype(int).tolist()
+    train_losses = train_data[:, 1].tolist()
+    val_epochs = val_data[:, 0].astype(int).tolist()
+    val_losses = val_data[:, 1].tolist()
+    # check for extreme outliers in first 10 data points 
+    first_10_val_losses = val_losses[:10]
+    mean_first_10 = np.mean(first_10_val_losses)
+    for i, loss in enumerate(first_10_val_losses):
+        if loss > 5 * mean_first_10:
+            print(f"Warning: Extreme outlier, more than 5 times the mean of first 10 epochs detected in validation loss at epoch {val_epochs[i]}: {loss}. Removing from validation losses.")
+            val_losses.pop(i)
+            val_epochs.pop(i)
+    
+    input_stats = read_file_from_ini(input_stats_path, ftype=dict)
+
+    if os.path.exists(train_timings_path):
+        train_timings_data = np.genfromtxt(train_timings_path, delimiter=',', skip_header=1)
+        val_timings_data = np.genfromtxt(val_timings_path, delimiter=',', skip_header=1)
+
+        if train_timings_data.ndim == 1:
+            train_timings_data = train_timings_data.reshape(1, -1)
+        if val_timings_data.ndim == 1:
+            val_timings_data = val_timings_data.reshape(1, -1)
+
+        avg_train_time_per_epoch = np.mean(train_timings_data[:, 1])
+        avg_val_time_per_epoch = np.mean(val_timings_data[:, 1])
+        if os.path.exists(test_results_path):
+            test_results = read_file_from_ini(test_results_path, ftype=dict)
+        else:
+            raise FileNotFoundError(f"Found training snapshot, but no test results file found at '{test_results_path}'. Please run testing first.")
+        equipment_info = read_file_from_ini(equipment_info_path, ftype=dict)
+        n_gpus = int(equipment_info.get('NUM_GPUS', ['1'])[0])
+    else:
+        test_results = {"TEST_LOSS": 0.0, "TEST_AME": 0.0}
+        avg_train_time_per_epoch = 0.0
+        avg_val_time_per_epoch = 0.0
+        n_gpus = 1
+
+    total_time_logged = False
+    total_time_path = os.path.join(sup_dir, run_dir, 'stats', 'total_time.ini')
+    if os.path.exists(total_time_path):
+        total_time_logged = True
+        timing_info = read_file_from_ini(total_time_path, ftype=dict)
+        total_time_seconds = float(timing_info["TOTAL_TIME_SECONDS"])
+        total_time_hours = float(timing_info["TOTAL_TIME_HRS"])
+        total_time_minutes = float(timing_info["TOTAL_TIME_MINUTES"])
+
+    print(f"Use train set: {use_train_set}")
+    print(f"Use separate test data: {test_on_separate_data}")
+    if use_train_set and test_on_separate_data:
+        raise ValueError("Cannot use both training set and separate test data simultaneously.")
+
+    if not use_train_set and not test_on_separate_data:
+        test_dir = os.path.join(sup_dir, run_dir, 'test')
+        if not os.path.isdir(test_dir):
+            raise FileNotFoundError(f"No test directory found at '{test_dir}'")
+        candidate_files = sorted(glob.glob(os.path.join(test_dir, '*.pt')))
+        if len(candidate_files) == 0:
+            raise FileNotFoundError(f"Found '{test_dir}' but no .pt files were present.")
+        test_dataset = DEMDataset(candidate_files, config=config)
+    elif use_train_set:
+        run_path = os.path.join(sup_dir, run_dir)
+        train_set = FluidDEMDataset(config=config)
+        test_dataset = train_set
+    else:
+        alt_test_dir = os.path.join(sup_dir, run_dir, 'alt_test')
+        candidate_files = sorted(glob.glob(os.path.join(alt_test_dir, '*.pt')))
+        if len(candidate_files) == 0:
+            raise FileNotFoundError(f"No .pt files found in alternate test directory '{alt_test_dir}'.")
+        test_dataset = DEMDataset(candidate_files, config=config)
+
+    model = UNet(
+        in_channels=config["IMAGES_PER_DEM"],
+        out_channels=3,
+        w_range=(config["W_MIN"], config["W_MAX"]),
+        theta_range=(config["THETA_BAR_MIN"], config["THETA_BAR_MAX"]),
+    )
+    model.load_state_dict(checkpoint['MODEL_STATE'])
+    model.eval()
+
+    train_mean = torch.tensor(input_stats['MEAN'], dtype=torch.float32)
+    train_std = torch.tensor(input_stats['STD'], dtype=torch.float32)
+
+    if train_mean.ndim == 0:
+        train_mean_view = train_mean.view(1, 1, 1, 1)
+    elif train_mean.ndim == 1:
+        train_mean_view = train_mean.view(1, -1, 1, 1)
+    else:
+        train_mean_view = train_mean
+
+    if train_std.ndim == 0:
+        train_std_view = train_std.view(1, 1, 1, 1)
+    elif train_std.ndim == 1:
+        train_std_view = train_std.view(1, -1, 1, 1)
+    else:
+        train_std_view = train_std
+
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+    model.to(device)
+
+    print(f"Selecting {n_test_sets} test sets using variant: {variant}")
+    available_indices = list(range(len(test_dataset)))
+    if len(available_indices) == 0:
+        raise ValueError("No samples available in the selected dataset.")
+
+    if variant == 'first':
+        selected_indices = list(range(min(n_test_sets, len(test_dataset))))
+    elif variant == 'random':
+        selected_indices = sorted(random.sample(available_indices, min(n_test_sets, len(test_dataset))))
+        print("Selected test set indices:", selected_indices)
+    else:
+        raise ValueError(f"Unknown variant: {variant}. Use 'first' or 'random'.")
+
+    all_dem_targets = []
+    all_dem_preds = []
+    all_w_targets = []
+    all_w_preds = []
+    all_theta_targets = []
+    all_theta_preds = []
+    all_images_norm = []
+    index_labels = []
+
+    for test_idx in selected_indices:
+        sample = test_dataset[test_idx]
+        if len(sample) == 7:
+            images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor, w_tensor, theta_tensor, _ = sample
+        else:
+            images_tensor, reflectance_maps_tensor, target_tensor, meta_tensor, w_tensor, theta_tensor = sample
+
+        images_tensor = images_tensor.float()
+        meta_tensor = meta_tensor.float()
+        target_tensor = target_tensor.float()
+        w_tensor = w_tensor.float()
+        theta_tensor = theta_tensor.float()
+
+        images_batch = images_tensor.unsqueeze(0)
+        images_norm = normalize_inputs(images_batch, train_mean_view, train_std_view)
+        meta_batch = meta_tensor.unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            outputs = model(images_norm.to(device), meta_batch, target_size=target_tensor.shape[-2:])
+
+        outputs_np = outputs.squeeze(0).cpu().numpy()
+        dem_pred = outputs_np[0]
+        w_pred = outputs_np[1]
+        theta_pred = outputs_np[2]
+
+        dem_target = target_tensor.squeeze().numpy()
+        w_target = w_tensor.squeeze().numpy()
+        theta_target = theta_tensor.squeeze().numpy()
+
+        all_dem_targets.append(dem_target)
+        all_dem_preds.append(dem_pred)
+        all_w_targets.append(w_target)
+        all_w_preds.append(w_pred)
+        all_theta_targets.append(theta_target)
+        all_theta_preds.append(theta_pred)
+        all_images_norm.append(images_norm.squeeze(0).cpu().numpy())
+        index_labels.append(test_idx)
+
+    if len(selected_indices) == 0:
+        raise ValueError("No test indices selected for plotting.")
+
+    global_dem_min = min(min(d.min() for d in all_dem_targets), min(d.min() for d in all_dem_preds))
+    global_dem_max = max(max(d.max() for d in all_dem_targets), max(d.max() for d in all_dem_preds))
+    global_w_min = min(min(w.min() for w in all_w_targets), min(w.min() for w in all_w_preds))
+    global_w_max = max(max(w.max() for w in all_w_targets), max(w.max() for w in all_w_preds))
+    global_theta_min = min(min(t.min() for t in all_theta_targets), min(t.min() for t in all_theta_preds))
+    global_theta_max = max(max(t.max() for t in all_theta_targets), max(t.max() for t in all_theta_preds))
+
+    # Compute difference min/max for consistent coloring of difference maps
+    all_dem_diffs = [gt - pred for gt, pred in zip(all_dem_targets, all_dem_preds)]
+    all_w_diffs = [gt - pred for gt, pred in zip(all_w_targets, all_w_preds)]
+    all_theta_diffs = [gt - pred for gt, pred in zip(all_theta_targets, all_theta_preds)]
+    
+    global_dem_dif_min = min(d.min() for d in all_dem_diffs)
+    global_dem_dif_max = max(d.max() for d in all_dem_diffs)
+    global_w_dif_min = min(d.min() for d in all_w_diffs)
+    global_w_dif_max = max(d.max() for d in all_w_diffs)
+    global_theta_dif_min = min(d.min() for d in all_theta_diffs)
+    global_theta_dif_max = max(d.max() for d in all_theta_diffs)
+
+    if same_scale == 'all':
+        global_img_min = min(img.min() for img in all_images_norm)
+        global_img_max = max(img.max() for img in all_images_norm)
+    else:
+        global_img_min = None
+        global_img_max = None
+
+    fig = plt.figure(figsize=figsize)
+
+    # Top row layout
+    loss_start_x = 0.08
+    loss_width = 0.6
+    loss_height = 0.2
+    loss_start_y = 0.88
+
+    ax_loss = fig.add_axes([loss_start_x, loss_start_y, loss_width, loss_height])
+    ax_loss.plot(train_epochs, train_losses, label='Training Loss', linewidth=2)
+    ax_loss.plot(val_epochs, val_losses, label='Validation Loss', linewidth=2)
+    ax_loss.set_yscale('log')
+    ax_loss.set_xlabel('Epoch', fontsize=12)
+    ax_loss.set_ylabel('Loss', fontsize=12)
+    ax_loss.set_title('Training and Validation Loss', fontsize=14, pad=14)
+    ax_loss.legend(fontsize=10, loc='lower left')
+    ax_loss.grid(True, alpha=0.3)
+
+    from matplotlib.ticker import MaxNLocator
+    ax_loss.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    info_width = 0.1
+    info_height = 0.2
+    info_gap_h = 0.0001
+    info_start_x = loss_start_x + loss_width + 0.005
+    info_start_y = loss_start_y
+    fontsize_textbox = 16
+    
+    theta_min_rad = float(config["THETA_BAR_MIN"])
+    theta_max_rad = float(config["THETA_BAR_MAX"])
+    theta_min_deg = np.degrees(theta_min_rad)
+    theta_max_deg = np.degrees(theta_max_rad)
+
+    infobox_entries = [
+        (
+            "Multi-band UNet\n"
+            f"Epochs trained: {int(checkpoint.get('EPOCHS_RUN', 'N/A'))}\n"
+            f"Test Loss: {float(test_results['TEST_LOSS']):.3f}\n"
+            f"Test DEM AME: {float(test_results['DEM_AME']):.3f}\n"
+            f"Test W AME: {float(test_results['W_AME']):.3f}\n"
+            f"Test Theta AME: {float(test_results['THETA_AME']):.3f}\n"
+            f"LR: {float(config['LR']):.2e}",
+            dict(boxstyle='round', facecolor='lightblue', alpha=0.3),
+        ),
+        (
+            f"Total Epochs: {checkpoint.get('EPOCHS_RUN', 'N/A')}\n"
+            f"Train Time Avg.: \n"
+            f"{avg_train_time_per_epoch:.2f} s/epoch\n"
+            f"Val Time Avg.: \n"
+            f"{avg_val_time_per_epoch:.2f} s/epoch\n"
+            f"Number GPUs: {n_gpus}",
+            dict(boxstyle='round', facecolor='lightgreen', alpha=0.3),
+        ),
+        (
+            "Multi-band Config\n"
+            f"Albedo:\n"
+            f"w: {float(config['W_MIN']):.3f}–{float(config['W_MAX']):.3f}\n"
+            f"w blobs: r={config['W_BLOB_RADIUS_PX']} px, ρ={float(config['W_BLOB_DENSITY']):.2f}\n"
+            f"Macroscopic Roughness:\n"
+            rf"$\bar{{\theta}}$: {theta_min_rad:.1f}–{theta_max_rad:.1f} rad" "\n"
+            rf"$\bar{{\theta}}$: {theta_min_deg:.1f}–{theta_max_deg:.1f}°" "\n"
+            rf"$\bar{{\theta}}$ blobs: r={config['THETA_BAR_BLOB_RADIUS_PX']} px, ρ={float(config['THETA_BAR_BLOB_DENSITY']):.2f}",
+            dict(boxstyle='round', facecolor='lavender', alpha=0.3),
+        ),
+    ]
+
+        
+    if not config["USE_SEMIFLUID"]: 
+        infobox_entries.append(  
+                    (
+                    "Training Config\n"
+                    f"Batch Size: {config['BATCH_SIZE']}\n"
+                    f"Save every: {config['SAVE_EVERY']} epochs\n"
+                    f"Use semifluid: {config['USE_SEMIFLUID']}\n",
+                    dict(boxstyle='round', facecolor='lightyellow', alpha=0.3)
+                    )
+    )
+    else:  
+        infobox_entries.append(
+            (
+                f"Training Config\n"
+                f"Batch Size: {config['BATCH_SIZE']}\n"
+                f"Save every: {config['SAVE_EVERY']} epochs\n"
+                f"Use semifluid: {config['USE_SEMIFLUID']}\n"
+                f"New data every: {config['NEW_FLUID_DATA_EVERY']} epochs\n",
+                dict(boxstyle='round', facecolor='lightyellow', alpha=0.3)
+            )
+        )
+        
+    if total_time_logged:
+        infobox_entries.append(
+            (
+                f"Total Train Time:\n"
+                f"{total_time_hours:.1f} h {total_time_minutes:.1f} m\n"
+                f"{total_time_seconds:.1f} s total",
+                dict(boxstyle='round', facecolor='lightyellow', alpha=0.3),
+            )
+        )
+
+    for idx, (text, bbox_kwargs) in enumerate(infobox_entries):
+        ax_box = fig.add_axes([info_start_x + idx * (info_width + info_gap_h), info_start_y, info_width, info_height])
+        ax_box.axis('off')
+        ax_box.text(
+            0.05,
+            0.95,
+            text,
+            transform=ax_box.transAxes,
+            fontsize=fontsize_textbox,
+            verticalalignment='top',
+            family='monospace',
+            bbox=bbox_kwargs,
+        )
+
+    # Data rows layout (5 datasets by default)
+    row_height = 0.13
+    row_spacing = 0.012
+    start_y = 0.83
+
+    band_width = 0.065  # Slightly smaller to fit 9 bands (6 original + 3 diff)
+    band_gap = 0.002
+    images_width = 0.060
+    images_gap = 0.005
+    start_x = 0.04
+    
+    color_bar_extra_space = 0.025
+    space_before_color_bar = 0.009
+
+    # Update band positions to include 9 bands (GT W, Pred W, Diff W, GT Theta, Pred Theta, Diff Theta, GT DEM, Pred DEM, Diff DEM)
+    band_positions = []
+    current_x = start_x
+    for _ in range(9):
+        band_positions.append(current_x)
+        current_x += band_width + band_gap
+        if _ in [1, 2, 4, 5, 7, 8]:  # After pred and after diff
+            current_x += color_bar_extra_space
+    current_x += 0.005 # Extra gap before images
+
+    image_positions = []
+    for _ in range(5):
+        image_positions.append(current_x)
+        current_x += images_width + images_gap
+
+    last_w_im = None
+    last_theta_im = None
+    last_dem_im = None
+    last_w_dif_im = None
+    last_theta_dif_im = None
+    last_dem_dif_im = None
+
+    for row_idx, test_idx in enumerate(selected_indices):
+        dem_target = all_dem_targets[row_idx]
+        dem_pred = all_dem_preds[row_idx]
+        w_target = all_w_targets[row_idx]
+        w_pred = all_w_preds[row_idx]
+        theta_target = all_theta_targets[row_idx]
+        theta_pred = all_theta_preds[row_idx]
+        images_norm = all_images_norm[row_idx]
+        
+        # Compute differences
+        dem_dif = dem_target - dem_pred
+        w_dif = w_target - w_pred
+        theta_dif = theta_target - theta_pred
+
+        if same_scale == 'row':
+            row_img_min = images_norm.min()
+            row_img_max = images_norm.max()
+
+        y_pos = (start_y - row_height) - row_idx * (row_height + row_spacing)
+
+        # GT W
+        ax_gt_w = fig.add_axes([band_positions[0], y_pos, band_width, row_height])
+        ax_gt_w.imshow(w_target, cmap='viridis', origin='lower', vmin=global_w_min, vmax=global_w_max)
+        ax_gt_w.set_xticks([])
+        ax_gt_w.set_yticks([])
+        if row_idx == 0:
+            ax_gt_w.set_title('GT w', fontsize=12, pad=5)
+        ax_gt_w.set_ylabel(f'Set {index_labels[row_idx]}', fontsize=11, rotation=90, labelpad=5)
+
+        # Pred W
+        ax_pred_w = fig.add_axes([band_positions[1], y_pos, band_width, row_height])
+        last_w_im = ax_pred_w.imshow(w_pred, cmap='viridis', origin='lower', vmin=global_w_min, vmax=global_w_max)
+        ax_pred_w.set_xticks([])
+        ax_pred_w.set_yticks([])
+        if row_idx == 0:
+            ax_pred_w.set_title('Pred w', fontsize=12, pad=5)
+
+        # Diff W (GT - Pred)
+        ax_dif_w = fig.add_axes([band_positions[2], y_pos, band_width, row_height])
+        last_w_dif_im = ax_dif_w.imshow(w_dif, cmap='RdBu_r', origin='lower', vmin=global_w_dif_min, vmax=global_w_dif_max)
+        ax_dif_w.set_xticks([])
+        ax_dif_w.set_yticks([])
+        if row_idx == 0:
+            ax_dif_w.set_title('GT-Pred w', fontsize=12, pad=5)
+
+        # GT Theta
+        ax_gt_theta = fig.add_axes([band_positions[3], y_pos, band_width, row_height])
+        ax_gt_theta.imshow(theta_target, cmap='plasma', origin='lower', vmin=global_theta_min, vmax=global_theta_max)
+        ax_gt_theta.set_xticks([])
+        ax_gt_theta.set_yticks([])
+        if row_idx == 0:
+            ax_gt_theta.set_title('GT theta', fontsize=12, pad=5)
+
+        # Pred Theta
+        ax_pred_theta = fig.add_axes([band_positions[4], y_pos, band_width, row_height])
+        last_theta_im = ax_pred_theta.imshow(theta_pred, cmap='plasma', origin='lower', vmin=global_theta_min, vmax=global_theta_max)
+        ax_pred_theta.set_xticks([])
+        ax_pred_theta.set_yticks([])
+        if row_idx == 0:
+            ax_pred_theta.set_title('Pred theta', fontsize=12, pad=5)
+
+        # Diff Theta (GT - Pred)
+        ax_dif_theta = fig.add_axes([band_positions[5], y_pos, band_width, row_height])
+        last_theta_dif_im = ax_dif_theta.imshow(theta_dif, cmap='RdBu_r', origin='lower', vmin=global_theta_dif_min, vmax=global_theta_dif_max)
+        ax_dif_theta.set_xticks([])
+        ax_dif_theta.set_yticks([])
+        if row_idx == 0:
+            ax_dif_theta.set_title('GT-Pred theta', fontsize=12, pad=5)
+
+        # GT DEM
+        ax_gt_dem = fig.add_axes([band_positions[6], y_pos, band_width, row_height])
+        ax_gt_dem.imshow(dem_target, cmap='terrain', origin='lower', vmin=global_dem_min, vmax=global_dem_max)
+        ax_gt_dem.set_xticks([])
+        ax_gt_dem.set_yticks([])
+        if row_idx == 0:
+            ax_gt_dem.set_title('GT DEM', fontsize=12, pad=5)
+
+        # Pred DEM
+        ax_pred_dem = fig.add_axes([band_positions[7], y_pos, band_width, row_height])
+        last_dem_im = ax_pred_dem.imshow(dem_pred, cmap='terrain', origin='lower', vmin=global_dem_min, vmax=global_dem_max)
+        ax_pred_dem.set_xticks([])
+        ax_pred_dem.set_yticks([])
+        if row_idx == 0:
+            ax_pred_dem.set_title('Pred DEM', fontsize=12, pad=5)
+
+        # Diff DEM (GT - Pred)
+        ax_dif_dem = fig.add_axes([band_positions[8], y_pos, band_width, row_height])
+        last_dem_dif_im = ax_dif_dem.imshow(dem_dif, cmap='RdBu_r', origin='lower', vmin=global_dem_dif_min, vmax=global_dem_dif_max)
+        ax_dif_dem.set_xticks([])
+        ax_dif_dem.set_yticks([])
+        if row_idx == 0:
+            ax_dif_dem.set_title('GT-Pred DEM', fontsize=12, pad=5)
+
+        # Plot input images
+        for img_idx, img_x in enumerate(image_positions):
+            ax_img = fig.add_axes([img_x, y_pos, images_width, row_height])
+
+            if same_scale == 'all':
+                ax_img.imshow(images_norm[img_idx], cmap='gray', origin='lower', vmin=global_img_min, vmax=global_img_max)
+            elif same_scale == 'row':
+                ax_img.imshow(images_norm[img_idx], cmap='gray', origin='lower', vmin=row_img_min, vmax=row_img_max)
+            else:
+                ax_img.imshow(images_norm[img_idx], cmap='gray', origin='lower')
+
+            ax_img.set_xticks([])
+            ax_img.set_yticks([])
+            if row_idx == 0:
+                ax_img.set_title(f'Img {img_idx+1}', fontsize=12, pad=5)
+
+    n_rows = len(selected_indices)
+    total_height = n_rows * row_height + max(0, (n_rows - 1)) * row_spacing
+    bottom_y = (start_y - row_height) - max(0, (n_rows - 1)) * (row_height + row_spacing)
+
+    # Colorbars for GT/Pred (same as original)
+    if last_w_im is not None:
+        cbar_w_ax = fig.add_axes([band_positions[1] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
+        cbar_w = plt.colorbar(last_w_im, cax=cbar_w_ax)
+        cbar_w.ax.tick_params(labelsize=10)
+        cbar_w.set_label('w', fontsize=10)
+
+    if last_theta_im is not None:
+        cbar_theta_ax = fig.add_axes([band_positions[4] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
+        cbar_theta = plt.colorbar(last_theta_im, cax=cbar_theta_ax)
+        cbar_theta.ax.tick_params(labelsize=10)
+        cbar_theta.set_label('theta (rad)', fontsize=10)
+
+    if last_dem_im is not None:
+        cbar_dem_ax = fig.add_axes([band_positions[7] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
+        cbar_dem = plt.colorbar(last_dem_im, cax=cbar_dem_ax)
+        cbar_dem.ax.tick_params(labelsize=10)
+        cbar_dem.set_label('DEM (m)', fontsize=10)
+
+    # Colorbars for differences
+    if last_w_dif_im is not None:
+        cbar_w_dif_ax = fig.add_axes([band_positions[2] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
+        cbar_w_dif = plt.colorbar(last_w_dif_im, cax=cbar_w_dif_ax)
+        cbar_w_dif.ax.tick_params(labelsize=10)
+        cbar_w_dif.set_label('Δw', fontsize=10)
+
+    if last_theta_dif_im is not None:
+        cbar_theta_dif_ax = fig.add_axes([band_positions[5] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
+        cbar_theta_dif = plt.colorbar(last_theta_dif_im, cax=cbar_theta_dif_ax)
+        cbar_theta_dif.ax.tick_params(labelsize=10)
+        cbar_theta_dif.set_label('Δtheta (rad)', fontsize=10)
+
+    if last_dem_dif_im is not None:
+        cbar_dem_dif_ax = fig.add_axes([band_positions[8] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
+        cbar_dem_dif = plt.colorbar(last_dem_dif_im, cax=cbar_dem_dif_ax)
+        cbar_dem_dif.ax.tick_params(labelsize=10)
+        cbar_dem_dif.set_label('ΔDEM (m)', fontsize=10)
+
+    if save_fig:
+        figures_dir = os.path.join(sup_dir, run_dir, 'figures')
+        os.makedirs(figures_dir, exist_ok=True)
+        output_path = os.path.join(figures_dir, filename if filename is not None else 'comprehensive_plot_multi_band_with_dif.pdf')
+        fig.savefig(output_path, format='pdf', bbox_inches='tight', dpi=150)
+        print(f"Figure saved to: {output_path}")
+
+    if return_fig:
+        return fig
+
+
 def plot_data_pt(run_dir, n_sets=5, n_images=5, save_fig=True, return_fig=False, same_scale=False, variant='random', use_train_set = False):
     """
     Plot DEMs and images from .pt files (PyTorch format).
@@ -866,8 +1880,8 @@ def plot_data_multi_band(run_dir, n_sets=5, n_images=5, save_fig=True, return_fi
     cbar_theta_ax = fig.add_axes([cbar_theta_x, bottom_y, cbar_theta_width, total_height])
     
     # Convert theta to degrees for colorbar display
-    last_theta_im.set_array(np.degrees(last_theta_im.get_array()))
-    last_theta_im.set_clim(vmin=np.degrees(theta_vmin), vmax=np.degrees(theta_vmax))
+    last_theta_im.set_array(last_theta_im.get_array())
+    last_theta_im.set_clim(vmin=theta_vmin, vmax=theta_vmax)
     
     cbar_theta = plt.colorbar(last_theta_im, cax=cbar_theta_ax)
     cbar_theta.ax.tick_params(labelsize=8)
@@ -1057,24 +2071,33 @@ import argparse
 
 if __name__ == "__main__":
     args = argparse.ArgumentParser(description="Plot comprehensive test set predictions for a trained UNet model.")
-    args.add_argument('--run_dir', type=str, required=True,
+    args.add_argument('run_dir', nargs="?" , type=str,
+                    help='Directory of the trained model run containing stats and checkpoints.')
+    args.add_argument('--run_dir', type=str, required=False, dest='run_dir_flag',
                       help='Directory of the trained model run containing stats and checkpoints.')
     args.add_argument('--variant', type=str, default='first',
                       help="Variant for selecting test sets: 'first' or 'random'.")
     args.add_argument('--use_train_set', action='store_true',
                       help="Use the training set for plotting instead of the test set.")
+    args.add_argument('--test_on_separate_data', action='store_true',
+                      help="Test on a separate dataset if available.")
+    args.add_argument('--diff', action='store_true',
+                      help="Include difference images in the plot.")
     args = args.parse_args()
+    
+    # Support both positional and flag-based arguments
+    run_dir = args.run_dir_flag or args.run_dir
 
     print("Plotting test set predictions...")
 
-    config = load_config_file(os.path.join("runs", args.run_dir, 'stats', 'config.ini'))
+    config = load_config_file(os.path.join("runs", run_dir, 'stats', 'config.ini'))
 
-    if not os.path.exists(os.path.join("runs", args.run_dir, 'checkpoints', 'snapshot.pt')):
+    if not os.path.exists(os.path.join("runs", run_dir, 'checkpoints', 'snapshot.pt')):
         #no training exists, only plot data
         print("No training snapshot found, plotting data only...")
         if config["USE_MULTI_BAND"]:
             print("Detected multi-band model, plotting multi-band data...")
-            plot_data_multi_band(run_dir=os.path.join("runs", args.run_dir),
+            plot_data_multi_band(run_dir=os.path.join("runs", run_dir),
                                  n_sets=5,
                                  variant=args.variant,  # 'first' or 'random'
                                  same_scale=False,  # False, 'row', or 'all'
@@ -1083,7 +2106,7 @@ if __name__ == "__main__":
                                  use_train_set = args.use_train_set)
         else:
             print("Detected single-band model, plotting single-band data...")
-            plot_data_pt(run_dir=os.path.join("runs", args.run_dir),
+            plot_data_pt(run_dir=os.path.join("runs", run_dir),
                             n_sets=5,
                             variant=args.variant,  # 'first' or 'random'
                             same_scale=False,  # False, 'row', or 'all'
@@ -1091,13 +2114,49 @@ if __name__ == "__main__":
                             return_fig=False,
                             use_train_set = args.use_train_set)
     else:
+        filename = "comprehensive"
+        if not args.use_train_set:
+            filename += "_testset"
+        if args.use_train_set:
+            filename += "_trainset"
+        if args.test_on_separate_data:
+            filename += "_alt"
+        if args.variant == 'first':
+            filename += "_first"
+        if args.variant == 'random':
+            filename += "_random"
+        if args.diff:
+            filename += "_with_diff"
+        filename += ".pdf"
+        print(f"Output filename: {filename}")
         print("Training snapshot found, plotting predictions...")
-        plot_comprehensive_pt(run_dir=args.run_dir,
-                            n_test_sets=5,
-                            variant=args.variant,  # 'first' or 'random'
-                            same_scale=False,  # False, 'row', or 'all'
-                            figsize=(15, 10),
-                            save_fig=True,
-                            return_fig=False,
-                            use_train_set = args.use_train_set
-                            )
+        print(f"Config USE_MULTI_BAND: {config['USE_MULTI_BAND']}")
+        if config["USE_MULTI_BAND"]:
+            if args.diff:
+                print("Difference images will be included in the plot.")
+                plot_comprehensive_multi_band_with_dif(run_dir=run_dir,
+                                n_test_sets=5,
+                                variant=args.variant,
+                                same_scale=False,
+                                save_fig=True,
+                                return_fig=False,
+                                use_train_set=args.use_train_set)
+            else:
+                print("Detected multi-band model, plotting multi-band predictions...")
+                plot_comprehensive_multi_band(run_dir=run_dir,
+                                            n_test_sets=5,
+                                            variant=args.variant,
+                                            same_scale=False,
+                                            save_fig=True,
+                                            return_fig=False,
+                                            use_train_set=args.use_train_set)
+        else:
+            print("Detected single-band model, plotting single-band predictions...")
+            plot_comprehensive_pt(run_dir=run_dir,
+                                  n_test_sets=5,
+                                  variant=args.variant,
+                                  same_scale=False,
+                                  figsize=(15, 10),
+                                  save_fig=True,
+                                  return_fig=False,
+                                  use_train_set=args.use_train_set)

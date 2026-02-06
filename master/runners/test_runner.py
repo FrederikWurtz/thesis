@@ -18,7 +18,8 @@ warnings.filterwarnings('ignore', category=UserWarning, module='torch._logging')
 warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.*')
 
 from torch.distributed import destroy_process_group
-from master.train.trainer_new import Trainer_multiGPU, Trainer_singleGPU, ddp_setup, load_train_objs, prepare_dataloader, is_main
+from master.train.trainer_new import Trainer_multiGPU, Trainer_multiGPU_multi_band, Trainer_singleGPU
+from master.train.trainer_core import ddp_setup, load_train_objs, prepare_dataloader, is_main
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 from master.configs.config_utils import load_config_file
 
@@ -47,8 +48,8 @@ def main(run_dir: str, test_on_separate_data: bool):
 
     mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
     input_stats = read_file_from_ini(mean_std_path)
-    train_mean = torch.tensor([float(input_stats['MEAN'][i]) for i in range(len(input_stats['MEAN']))])
-    train_std = torch.tensor([float(input_stats['STD'][i]) for i in range(len(input_stats['STD']))])
+    train_mean = torch.tensor(float(input_stats["MEAN"]))
+    train_std = torch.tensor([float(input_stats["STD"])])   
 
     train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path)
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
@@ -89,7 +90,11 @@ def main(run_dir: str, test_on_separate_data: bool):
             
     
     if use_multiGPU:
-        trainer = Trainer_multiGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader, test_loader)
+        if config["USE_MULTI_BAND"]:
+            trainer = Trainer_multiGPU_multi_band(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader, test_loader)
+        else:
+            trainer = Trainer_multiGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader, test_loader)
+            
         if is_main():
             print("Starting testing...")
     else:
@@ -98,14 +103,26 @@ def main(run_dir: str, test_on_separate_data: bool):
 
     global_test_loss, global_ame = trainer.test()
     
-    if is_main():
-        test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
-        if test_on_separate_data:
-            test_loss_dir = os.path.join(run_path, 'stats', 'alt_test_results.ini')
-        save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_AME': float(global_ame)}, test_loss_dir)
-        print(f"Test Loss: {global_test_loss:.2e}, Test AME: {global_ame:.6f}")
-        print("Test results saved.")
-        print("Cleaning up...")
+    if config["USE_MULTI_BAND"]:
+        dem_ame, w_ame, theta_ame = global_ame
+        if is_main():
+            test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
+            if test_on_separate_data:
+                test_loss_dir = os.path.join(run_path, 'stats', 'alt_test_results.ini')
+            save_file_as_ini({'TEST_LOSS': float(global_test_loss), 
+                              'DEM_AME': float(dem_ame), 
+                              'W_AME': float(w_ame), 
+                              'THETA_AME': float(theta_ame)}, test_loss_dir)
+            print("Test results saved.")
+            print("Cleaning up...")
+    else:
+        if is_main():
+            test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
+            if test_on_separate_data:
+                test_loss_dir = os.path.join(run_path, 'stats', 'alt_test_results.ini')
+            save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_AME': float(global_ame)}, test_loss_dir)
+            print("Test results saved.")
+            print("Cleaning up...")
 
     if use_multiGPU:
         destroy_process_group()

@@ -2,7 +2,7 @@ from master.configs.config_utils import load_config_file, create_folder_structur
 from master.data_sim.generator import generate_and_save_data_pooled_multi_gpu
 from master.train.trainer_core import DEMDataset
 from master.data_sim.dataset_io import list_pt_files
-from master.train.train_utils import compute_input_stats, round_list
+from master.train.train_utils import compute_input_stats
 from master.train.checkpoints import save_file_as_ini
 
 from torch.utils.data import DataLoader
@@ -12,6 +12,8 @@ import argparse
 import numpy as np
 import torch
 import subprocess
+import gc
+import sys
 
 
 
@@ -59,6 +61,8 @@ def _parse_args(argv=None):
 
 def main(argv=None):
     args = _parse_args(argv)
+    if args.run_dir is None and args.run_dir_flag is None:
+        raise ValueError("Run directory must be specified either as a positional argument or with --run_dir flag.")
     run_dir = args.run_dir_flag or args.run_dir
     config = load_config_file() # load default config
     config["RUN_DIR"] = run_dir
@@ -164,9 +168,9 @@ def main(argv=None):
             torch.manual_seed(base_seed - 1) # -1 to differ from training seed
             np.random.seed((base_seed - 1) % (2**32 - 1)) # -1 to differ from training seed
             # create validation files
-            config["USE_SEPARATE_VALTEST_PARS"] = True  # ensure separate val/test params
-            print(f"Using alternative val/test parameters: {config['USE_SEPARATE_VALTEST_PARS']}")
+            print(f"Using alternative val/test parameters for validation: {config['USE_SEPARATE_VALTEST_PARS']}")
             generate_and_save_data_pooled_multi_gpu(config, images_dir=val_path, n_dems=config["FLUID_VAL_DEMS"])
+            gc.collect() # free up memory
             # also calculate and save mean reflectance map over validation set
             val_files = list_pt_files(val_path)
             val_ds = DEMDataset(val_files, config=config)
@@ -182,38 +186,37 @@ def main(argv=None):
             torch.manual_seed(base_seed - 10) # -10 to differ from training seed
             np.random.seed((base_seed - 10) % (2**32 - 1)) # -10 to differ from training seed
             generate_and_save_data_pooled_multi_gpu(config, images_dir=test_path, n_dems=config["FLUID_TEST_DEMS"])
+            gc.collect() # free up memory
             print("Dataset generation complete.\n")
 
             mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
             save_file_as_ini({'MEAN': train_mean, 'STD': train_std}, mean_std_path)
 
             # plot LRO sampling distributions for val and test sets
-            config["USE_SEPARATE_VALTEST_PARS"] = False  # reset to default for training data generation
-            print(f"Using alternative val/test parameters: {config['USE_SEPARATE_VALTEST_PARS']}")
+            # ensure "USE_SEPARATE_VALTEST_PARS" is False, as we now want to use training set parameters
+            config["USE_SEPARATE_VALTEST_PARS"] = False
+            print(f"Using alternative val/test parameters for training: {config['USE_SEPARATE_VALTEST_PARS']}")
             # reset seeds for training data generation - only used to plot LRO sampling distributions
             torch.manual_seed(base_seed) 
             np.random.seed(base_seed % (2**32 - 1))
-            train_path = os.path.join(run_path, 'train')
+            train_path = os.path.join(run_path, 'train_temp')
             os.makedirs(train_path, exist_ok=True)
             generate_and_save_data_pooled_multi_gpu(config, images_dir=train_path, n_dems=config["FLUID_TRAIN_DEMS"])
+            gc.collect() # free up memory
 
-            import sys
             env = os.environ.copy()
             cmd = [
                 sys.executable,
                 "master/validate/plot_lro_sampling.py",
                 run_dir,
                 "val",
-                "train"
+                "train_temp"
             ]
             subprocess.run(cmd, env=env)
 
         elif args.skip_data_gen:
             pass  # skip data generation as per user request
 
-    config["SAVE_LRO_METAS"] = False  
-    print("SAVE_LRO_METAS set to:", end=" ")
-    print(config["SAVE_LRO_METAS"])
     config_path = os.path.join(run_path, 'stats', 'config.ini')
     save_file_as_ini(config, config_path) # save final config to run directory
 
