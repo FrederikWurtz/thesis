@@ -2,6 +2,38 @@ import numpy as np
 import torch
 import math
 
+
+class LambertianModel:
+    def __init__(self, w=0.5):
+        """
+        Initialize the LambertianModel with given parameters.
+
+        Parameters:
+        w (float): Albedo (0 < w < 1).
+        """
+        self.name = "lambertian"
+        self.w = w
+
+    def radiance_factor(self, mu0, mu):
+        """
+        Compute the radiance factor (I/F) using the Lambertian model.
+
+        Parameters:
+        mu0 (float or torch.Tensor): Cosine of the incidence angle.
+        mu (float or torch.Tensor): Cosine of the emission angle.
+
+        Returns:
+        float or torch.Tensor: Radiance factor (I/F).
+        """
+        if not isinstance(mu0, torch.Tensor):
+            mu0 = torch.tensor(mu0, dtype=torch.float32)
+        if not isinstance(mu, torch.Tensor):
+            mu = torch.tensor(mu, dtype=torch.float32)
+
+        # Radiance factor for Lambertian is simply w/π * cos(incidence)
+        R = self.w / math.pi * mu0
+        return torch.where((mu0 > 0) & (mu > 0), R, torch.zeros_like(R))
+
 class HapkeModel:
     def __init__(self, w=0.5, B0=0.5, h=0.1, phase_fun="hg", xi=0.2):
         """
@@ -19,6 +51,7 @@ class HapkeModel:
         self.h = h
         self.phase_fun = phase_fun
         self.xi = xi
+        self.name = "simplehapke"
 
     def _H_function(self, mu):
         """
@@ -345,6 +378,7 @@ class FullHapkeModel:
         self.eps = 1e-12
 
         self.debug = debug
+        self.name = "fullhapke"
 
 
     # ------------------ helper ------------------

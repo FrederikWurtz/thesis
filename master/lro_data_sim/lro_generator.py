@@ -102,9 +102,12 @@ def generate_and_return_lro_data(config: dict = None, device: str = "cpu"):
         return images, reflectance_maps, dem_tensor, metas, lro_meta
 
 
-def generate_and_return_lro_dem(config: dict = None):
+def generate_and_return_lro_dem(config: dict = None, file_location: str = None):
 
-    dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
+    if file_location is not None:
+        dem_path = file_location
+    else:
+        dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
 
     lat, lon, box_radius, height_norm = get_lat_lon_radius_height(config)    
     dem_array, metadata = extract_local_dem_subset(
@@ -133,6 +136,7 @@ def generate_and_return_lro_dem(config: dict = None):
     device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
 
     desired_pixel_size = (config["LRO_DEM_SIZE"], config["LRO_DEM_SIZE"])  # (H, W)
+    print(f"Resampling DEM to {desired_pixel_size} using device: {device}")
     dem_resampled = resample_dem_torch(masked.filled(0), desired_pixel_size, device=device)
 
     # normalize heights

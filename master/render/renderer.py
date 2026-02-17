@@ -29,7 +29,7 @@ class Renderer:
         self._last_camera_pos = None
         self.target = None
 
-    def render_shading(self, sun_az_deg, sun_el_deg, camera_az_deg, camera_el_deg, camera_distance_from_center, model="hapke"):
+    def render_shading(self, sun_az_deg, sun_el_deg, camera_az_deg, camera_el_deg, camera_distance_from_center):
         """
         Render surface shading with shadows using specified reflectance model.
         
@@ -74,16 +74,17 @@ class Renderer:
         # Compute incidence and emission angles
         mu = (normals_flat * view_vectors).sum(dim=1).reshape(self.dem.dem.shape)
         mu0 = (normals_flat * sun_vec).sum(dim=1).reshape(self.dem.dem.shape)
-        
+                
         # Lambertian model (early return)
-        if model.lower() == "lambertian":
+        if self.model.name == "lambertian":
+            print("Using Lambertian model - no shadows, reflectance = cos(incidence)")
             R = self.model.w / torch.pi * mu0
             self.rendered_shading = torch.where((mu0 > 0) & (mu > 0), R, torch.zeros_like(R))
             self.reflectance_map = self.rendered_shading
             return
         
-        if model.lower() != "hapke":
-            raise ValueError("Unknown model. Use 'hapke' or 'lambertian'.")
+        if self.model.name != "simplehapke" and self.model.name != "fullhapke":
+            raise ValueError("Unknown model. Use 'HapkeModel' or 'FullHapkeModel' or 'LambertianModel'.")
         
         # Hapke model: compute phase angle
         cos_g = (view_vectors * sun_vec).sum(dim=1)
