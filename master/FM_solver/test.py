@@ -245,7 +245,7 @@ def main():
     #     gt_dem=dem,
     #     scale_down_factor=40,
     #     sigma_smooth=5,
-    #     max_slope_prior=10,
+    #     max_slope_deviation_prior=10,
     #     noise_fraction_brightness=0.1,
     #     sigma_data=0.01,
     #     sigma_m=20.0,
@@ -260,11 +260,10 @@ def main():
         sun_el=SUN_EL,
         gt_dem=dem,
         scale_down_factor=40,
-        sigma_smooth=5,
-        max_slope_prior=10,
+        sigma_smooth=10,
+        max_slope_deviation_prior=40,
         noise_fraction_brightness=0.1,
-        sigma_data=0.01,
-        sigma_m=20.0,
+        sigma_M=300,
         pixel_size=cellsize,
         debug=True  # Enable comprehensive debug output
     )
@@ -301,6 +300,8 @@ def main():
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"\n✓ Saved: {save_path}")
+
+    
 
     # =============================================================================
     # STEP 7: Estimate Normals and Albedo
@@ -661,7 +662,7 @@ def main():
     print("-" * 80)
 
     # Use tuned regularization for stable updates
-    M_update = solver.compute_model_update()
+    M_update = solver.compute_model_update(use_iterative_solver=False)
 
     print("-" * 80)
     print("DEM update computed successfully")
@@ -672,42 +673,90 @@ def main():
     print(f"  Mean: {M_update.mean():.4f}")
     print(f"  Std: {M_update.std():.4f}")
 
-    dem_initial = solver.dem_prior
+    dem_initial = solver.dem_prior_initial
 
-    # Compute updated DEM (additive update applied to full prior; interior filled, border zero)
-    M_updated = solver.dem_prior + M_update
+    # Has already been updated in-place by the solver, so this is just for reference
+    M_updated = solver.dem_prior
 
     # Save DEM update visualization
     fig, axes = plt.subplots(2, 2, figsize=(14, 14))
+    
+    # Use consistent color scale for DEMs based on max range across all DEMs for better visual comparison
+    vmin = min(solver.gt_dem.min(), dem_initial.min(), M_updated.min())
+    vmax = max(solver.gt_dem.max(), dem_initial.max(), M_updated.max())
 
-    im = axes[0, 0].imshow(solver.dem_prior, cmap='terrain', origin='lower')
+    im = axes[0, 0].imshow(solver.dem_prior_initial, cmap='terrain', origin='lower', vmin=vmin, vmax=vmax)
     axes[0, 0].set_title('Prior DEM', pad=15, fontsize=12)
     fig.colorbar(im, ax=axes[0, 0], label='Elevation (m)')
     ax_format(axes[0, 0])
 
-    im = axes[0, 1].imshow(M_update, cmap='bwr', origin='lower')
+    im = axes[0, 1].imshow(M_update, cmap='bwr', origin='lower' )
     axes[0, 1].set_title(f'DEM Update\n(Full, border zero)', pad=15, fontsize=12)
     fig.colorbar(im, ax=axes[0, 1], label='Update (m)')
     ax_format(axes[0, 1])
 
-    im = axes[1, 0].imshow(M_updated, cmap='terrain', origin='lower')
+    im = axes[1, 0].imshow(M_updated, cmap='terrain', origin='lower', vmin=vmin, vmax=vmax)
     axes[1, 0].set_title('Updated DEM\n(Prior + Update)', pad=15, fontsize=12)
     fig.colorbar(im, ax=axes[1, 0], label='Elevation (m)')
     ax_format(axes[1, 0])
 
     # Compare with ground truth interior
     gt_interior = solver.gt_dem[1:-1, 1:-1]
-    im = axes[1, 1].imshow(gt_interior, cmap='terrain', origin='lower')
+    im = axes[1, 1].imshow(gt_interior, cmap='terrain', origin='lower', vmin=vmin, vmax=vmax)
     axes[1, 1].set_title('Ground Truth DEM\n(Interior for Comparison)', pad=15, fontsize=12)
     fig.colorbar(im, ax=axes[1, 1], label='Elevation (m)')
     ax_format(axes[1, 1])
-
-    fig.suptitle("DEM Update Process", fontsize=14)
+    
+    RMSE_updated = np.sqrt(np.mean((gt_interior - M_updated[1:-1, 1:-1])**2))
+    mae_updated = np.mean(np.abs(gt_interior - M_updated[1:-1, 1:-1]))
+    RMSE_initial = np.sqrt(np.mean((gt_interior - dem_initial[1:-1, 1:-1])**2))
+    mae_initial = np.mean(np.abs(gt_interior - dem_initial[1:-1, 1:-1]))
+    change_RMSE = RMSE_initial - RMSE_updated
+    change_MAE = mae_initial - mae_updated
+    
+    fig.suptitle(f"DEM Update Process.\n"
+            f"RMSE: {RMSE_updated:.4f} m (total change: {change_RMSE:.4f} m, {-100*(change_RMSE/RMSE_initial if RMSE_initial > 0 else 0):.1f}\%)\n"
+            f"MAE:  {mae_updated:.4f} m (total change: {change_MAE:.4f} m, {-100*(change_MAE/mae_initial if mae_initial > 0 else 0):.1f}\%)",
+            fontsize=14)
     fig.tight_layout()
     save_path = os.path.join(FIGURES_DIR, '07_dem_update_process.png')
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"✓ Saved: {save_path}")
+    
+    
+    # make plot of the elevation residual after update, next to slope residuals North-south and East-West to see if there are any patterns in the residuals that might indicate over/under-smoothing or bias in certain directions. This can help diagnose if the update is improving the DEM in a balanced way or if it's introducing new artifacts.
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # Elevation residual
+    elevation_residual = gt_interior - M_updated[1:-1, 1:-1]
+    im = axes[0].imshow(elevation_residual, cmap='bwr', origin='lower')
+    axes[0].set_title('Elevation Residual\n(GT - Updated)', pad=15, fontsize=12)
+    fig.colorbar(im, ax=axes[0], label='Residual (m)')
+    ax_format(axes[0])
+    
+    # Slope residuals
+    normals_gt = solver.compute_surface_normals(gt_interior, cellsize=1)
+    normals_updated = solver.compute_surface_normals(M_updated[1:-1, 1:-1], cellsize=1)
+    slope_residuals = normals_gt - normals_updated
+
+    im = axes[1].imshow(slope_residuals[:, :, 0], cmap='bwr', origin='lower')
+    axes[1].set_title('Slope Residuals (North)', pad=15, fontsize=12)
+    fig.colorbar(im, ax=axes[1], label='Residual (rad)')
+    ax_format(axes[1])
+
+    im = axes[2].imshow(slope_residuals[:, :, 1], cmap='bwr', origin='lower')
+    axes[2].set_title('Slope Residuals (East)', pad=15, fontsize=12)
+    fig.colorbar(im, ax=axes[2], label='Residual (rad)')
+    ax_format(axes[2])
+
+    fig.suptitle("DEM Residual Analysis", fontsize=14)
+    fig.tight_layout()
+    save_path = os.path.join(FIGURES_DIR, '09_dem_residual_analysis.png')
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✓ Saved: {save_path}")
+
 
     # =============================================================================
     # STEP 9: Final Comparison and Error Analysis
@@ -717,8 +766,8 @@ def main():
     print("=" * 80)
 
     # Compute errors
-    error_prior = gt_interior - solver.dem_prior[1:-1, 1:-1]
-    error_updated = gt_interior - M_updated[1:-1, 1:-1]
+    error_prior = gt_interior - solver.dem_prior_initial[1:-1, 1:-1]
+    error_updated = gt_interior - solver.dem_prior[1:-1, 1:-1]
 
     rmse_prior = np.sqrt(np.mean(error_prior**2))
     rmse_updated = np.sqrt(np.mean(error_updated**2))
@@ -760,91 +809,109 @@ def main():
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"✓ Saved: {save_path}")
-
-
-    # now iterate a few more times to see if we can get further improvement
-    print("\nIterating additional DEM updates to observe convergence...")
-    n_additional_iters = 100
-    rmse_history = [rmse_prior, rmse_updated]
-    mae_history = [mae_prior, mae_updated]
     
-    M_update_total = M_update.copy()  # Keep track of total update applied
+
+    # # investigate what sigma M might be for a realistic update by looking at the distribution of the prior error
+    # sigma_M_realistic = np.std(solver.dem_prior_initial - solver.gt_dem)
+    # print(f"\nEstimated realistic sigma_M based on prior error distribution: {sigma_M_realistic:.4f} m")
+
+    # # now iterate a few more times to see if we can get further improvement
+    # print("\nIterating additional DEM updates to observe convergence...")
+    # n_additional_iters = 100
+    # rmse_history = [rmse_prior, rmse_updated]
+    # mae_history = [mae_prior, mae_updated]
     
-    solver.debug = False  # Disable debug for faster iterations
+    # M_update_total = M_update.copy()  # Keep track of total update applied
     
-    for i in range(n_additional_iters):
-        print(f"\nIteration {i+1}/{n_additional_iters}...")
-        solver.dem_prior = M_updated  # Update prior for next iteration
-        M_update = solver.compute_model_update()
-        M_update_total += M_update  # Accumulate total update
-        M_updated = solver.dem_prior + M_update
-        
-        error_updated = gt_interior - M_updated[1:-1, 1:-1]
-        rmse_updated = np.sqrt(np.mean(error_updated**2))
-        mae_updated = np.mean(np.abs(error_updated))
-        
-        # calculate improvement from previous iteration in percentage terms
-        rmse_improvement = rmse_history[-1] - rmse_updated
-        mae_improvement = mae_history[-1] - mae_updated
-        rmse_improvement_pct = 100 * (rmse_improvement / rmse_history[-1]) if rmse_history[-1] > 0 else 0
-        mae_improvement_pct = 100 * (mae_improvement / mae_history[-1]) if mae_history[-1] > 0 else 0
-        
-        rmse_history.append(rmse_updated)
-        mae_history.append(mae_updated)
-        
-        print(f"  Updated DEM RMSE: {rmse_updated:.4f} m (change: {rmse_improvement:.4f} m, {-rmse_improvement_pct:+.1f}%)")
-        print(f"  Updated DEM MAE:  {mae_updated:.4f} m (change: {mae_improvement:.4f} m, {-mae_improvement_pct:+.1f}%)")
-
-    # Save DEM update visualization
-    fig, axes = plt.subplots(2, 2, figsize=(14, 14))
-
-    im = axes[0, 0].imshow(dem_initial, cmap='terrain', origin='lower')
-    axes[0, 0].set_title('Prior DEM', pad=15, fontsize=12)
-    fig.colorbar(im, ax=axes[0, 0], label='Elevation (m)')
-    ax_format(axes[0, 0])
-
-    im = axes[0, 1].imshow(M_update_total, cmap='bwr', origin='lower')
-    axes[0, 1].set_title(f'DEM Total Update\n(Full, border zero)', pad=15, fontsize=12)
-    fig.colorbar(im, ax=axes[0, 1], label='Update (m)')
-    ax_format(axes[0, 1])
-
-    im = axes[1, 0].imshow(M_updated, cmap='terrain', origin='lower')
-    axes[1, 0].set_title('Updated DEM\n(Prior + Update)', pad=15, fontsize=12)
-    fig.colorbar(im, ax=axes[1, 0], label='Elevation (m)')
-    ax_format(axes[1, 0])
-
-    # Compare with ground truth interior
-    gt_interior = solver.gt_dem[1:-1, 1:-1]
-    im = axes[1, 1].imshow(gt_interior, cmap='terrain', origin='lower')
-    axes[1, 1].set_title('Ground Truth DEM\n(Interior for Comparison)', pad=15, fontsize=12)
-    fig.colorbar(im, ax=axes[1, 1], label='Elevation (m)')
-    ax_format(axes[1, 1])
-
-    fig.suptitle(f"DEM Update Process after {i+1} iterations", fontsize=14)
-    fig.tight_layout()
-    save_path = os.path.join(FIGURES_DIR, '09_dem_after_n_updates.png')
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"✓ Saved: {save_path}")
+    # solver.debug = False  # Disable debug for faster iterations
     
-    # print total change in RMSE and RMA from appended history
-    print(f"\nFinal DEM Error after {i+1} iterations:")
-    print(f"  RMSE: {rmse_history[-1]:.4f} m (total change: {rmse_history[0] - rmse_history[-1]:.4f} m, {-100*(rmse_history[0] - rmse_history[-1])/rmse_history[0]:.1f}%)")
-    print(f"  MAE:  {mae_history[-1]:.4f} m (total change: {mae_history[0] - mae_history[-1]:.4f} m, {-100*(mae_history[0] - mae_history[-1])/mae_history[0]:.1f}%)")
-    # also plot the RMSE and MAE history over iterations
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(rmse_history, label='RMSE', marker='o')
-    ax.plot(mae_history, label='MAE', marker='o')
-    ax.set_xlabel('Iteration', fontsize=11)
-    ax.set_ylabel('Error (m)', fontsize=11)
-    ax.set_title('DEM Error History over Iterations', fontsize=12)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    save_path = os.path.join(FIGURES_DIR, '10_dem_error_history.png')
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"✓ Saved: {save_path}")
+    # for i in range(n_additional_iters):
+    #     print(f"\nIteration {i+1}/{n_additional_iters}...")
+    #     solver.dem_prior = M_updated  # Update prior for next iteration
+    #     M_update = solver.compute_model_update(use_iterative_solver=True)
+    #     # already added in-place by the solver, so just update the reference
+    #     M_updated = solver.dem_prior  # Accumulate total update
+  
+        
+    #     error_updated = gt_interior - M_updated[1:-1, 1:-1]
+    #     rmse_updated = np.sqrt(np.mean(error_updated**2))
+    #     mae_updated = np.mean(np.abs(error_updated))
+        
+    #     # calculate improvement from previous iteration in percentage terms
+    #     rmse_improvement = rmse_history[-1] - rmse_updated
+    #     mae_improvement = mae_history[-1] - mae_updated
+    #     rmse_improvement_pct = 100 * (rmse_improvement / rmse_history[-1]) if rmse_history[-1] > 0 else 0
+    #     mae_improvement_pct = 100 * (mae_improvement / mae_history[-1]) if mae_history[-1] > 0 else 0
+        
+    #     rmse_history.append(rmse_updated)
+    #     mae_history.append(mae_updated)
+        
+    #     print(f"  Updated DEM RMSE: {rmse_updated:.4f} m (change: {rmse_improvement:.4f} m, {-rmse_improvement_pct:+.1f}%)")
+    #     print(f"  Updated DEM MAE:  {mae_updated:.4f} m (change: {mae_improvement:.4f} m, {-mae_improvement_pct:+.1f}%)")
+        
+    #     conv_crit = 1e-5  # Convergence criterion for improvement
+    #     if mae_improvement < conv_crit:
+    #         print(f"Convergence achieved after {i+1} iterations.")
+    #         break
+
+    # # Save DEM update visualization
+    # fig, axes = plt.subplots(2, 2, figsize=(14, 14))
+
+    # # use same vmin/vmax for all DEMs for consistent comparison
+    # vmin_dem = min(solver.dem_prior.min(), M_updated.min(), gt_interior.min())
+    # vmax_dem = max(solver.dem_prior.max(), M_updated.max(), gt_interior.max())
+
+    # im = axes[0, 0].imshow(dem_initial, cmap='terrain', origin='lower', vmin=vmin_dem, vmax=vmax_dem)
+    # axes[0, 0].set_title('Prior DEM', pad=15, fontsize=12)
+    # fig.colorbar(im, ax=axes[0, 0], label='Elevation (m)')
+    # ax_format(axes[0, 0])
+
+    # im = axes[0, 1].imshow(M_update_total, cmap='bwr', origin='lower')
+    # axes[0, 1].set_title(f'DEM Total Update\n(Full, border zero)', pad=15, fontsize=12)
+    # fig.colorbar(im, ax=axes[0, 1], label='Update (m)')
+    # ax_format(axes[0, 1])
+
+    # im = axes[1, 0].imshow(M_updated, cmap='terrain', origin='lower', vmin=vmin_dem, vmax=vmax_dem)
+    # axes[1, 0].set_title('Updated DEM\n(Prior + Update)', pad=15, fontsize=12)
+    # fig.colorbar(im, ax=axes[1, 0], label='Elevation (m)')
+    # ax_format(axes[1, 0])
+
+    # # Compare with ground truth interior
+    # gt_interior = solver.gt_dem[1:-1, 1:-1]
+    # im = axes[1, 1].imshow(gt_interior, cmap='terrain', origin='lower', vmin=vmin_dem, vmax=vmax_dem)
+    # axes[1, 1].set_title('Ground Truth DEM\n(Interior for Comparison)', pad=15, fontsize=12)
+    # fig.colorbar(im, ax=axes[1, 1], label='Elevation (m)')
+    # ax_format(axes[1, 1])
+
+    # fig.suptitle(f"DEM Update Process after {i+1} iterations.\n"
+    #             f"RMSE: {rmse_history[-1]:.4f} m (total change: {rmse_history[0] - rmse_history[-1]:.4f} m, {-100*(rmse_history[0] - rmse_history[-1])/rmse_history[0]:.1f}\%)\n"
+    #             f"MAE:  {mae_history[-1]:.4f} m (total change: {mae_history[0] - mae_history[-1]:.4f} m, {-100*(mae_history[0] - mae_history[-1])/mae_history[0]:.1f}\%)",
+    #             fontsize=14)
+
+    # fig.tight_layout()
+    # save_path = os.path.join(FIGURES_DIR, '09_dem_after_n_updates.png')
+    # fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    # plt.close(fig)
+    # print(f"✓ Saved: {save_path}")
+    
+    # # print total change in RMSE and RMA from appended history
+    # print(f"\nFinal DEM Error after {i+1} iterations:")
+    # print(f"  RMSE: {rmse_history[-1]:.4f} m (total change: {rmse_history[0] - rmse_history[-1]:.4f} m, {-100*(rmse_history[0] - rmse_history[-1])/rmse_history[0]:.1f}%)")
+    # print(f"  MAE:  {mae_history[-1]:.4f} m (total change: {mae_history[0] - mae_history[-1]:.4f} m, {-100*(mae_history[0] - mae_history[-1])/mae_history[0]:.1f}%)")
+    # # also plot the RMSE and MAE history over iterations
+    # fig, ax = plt.subplots(figsize=(10, 6))
+    # ax.plot(rmse_history, label='RMSE', marker='o')
+    # ax.plot(mae_history, label='MAE', marker='o')
+    # ax.set_xlabel('Iteration', fontsize=11)
+    # ax.set_ylabel('Error (m)', fontsize=11)
+    # ax.set_title('DEM Error History over Iterations', fontsize=12)
+    # ax.grid(True, alpha=0.3)
+    # ax.legend()
+    # fig.tight_layout()
+    # save_path = os.path.join(FIGURES_DIR, '10_dem_error_history.png')
+    # fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    # plt.close(fig)
+    # print(f"✓ Saved: {save_path}")
 
     
     

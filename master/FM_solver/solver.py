@@ -62,8 +62,8 @@ class FMSolver:
         Downsampling factor for prior DEM. Default 40.
     sigma_smooth : float, optional
         Gaussian smoothing sigma for prior DEM. If None, uses scale_down_factor / 2.
-    max_slope_prior : float, optional
-        Maximum expected surface slope in degrees. Used for prior covariance. Default 70.
+    max_slope_deviation_prior : float, optional
+        Maximum expected surface slope deviation in degrees. Used for prior covariance. Default 30.
     noise_fraction_brightness : float, optional
         Brightness noise as fraction of max reflectance. Default 0.05.
     debug : bool, optional
@@ -74,8 +74,8 @@ class FMSolver:
         Standard deviation of the prior model (in elevation units). Default 1.0.
     """
     
-    def __init__(self, reflectance_maps, sun_azs, sun_el, gt_dem, scale_down_factor=40, sigma_smooth=None, max_slope_prior=70, 
-                 noise_fraction_brightness=0.05, pixel_size=1.0, debug=False, sigma_data=1.0, sigma_m = 1.0, cellsize=1):
+    def __init__(self, reflectance_maps, sun_azs, sun_el, gt_dem, scale_down_factor=40, sigma_smooth=None, max_slope_deviation_prior=30, 
+                 noise_fraction_brightness=0.05, pixel_size=1.0, debug=False, sigma_M = 1.0, cellsize=1.0):
         self.debug = debug
         self._debug_print("="*70)
         self._debug_print("Initializing FMSolver")
@@ -116,19 +116,22 @@ class FMSolver:
         self.dy = float(pixel_size)
         
         # Set up Bayesian priors
-        self.set_covariance_priors(max_slope=max_slope_prior)
-        self.set_covariance_brightness(reflectance_maps_np, noise_fraction=noise_fraction_brightness)
-        
         # Create smoothed prior DEM
         self.dem_lower, self.dem_prior = self.compute_prior_dem(
             self.gt_dem, 
             scale_down_factor=scale_down_factor, 
-            smooth_sigma=sigma_smooth
+            smooth_sigma_px=sigma_smooth
         )
+        self.dem_prior_initial = self.dem_prior.copy()  # Store the initial downscaled DEM for reference
+        
+        self.dem_prior_normals = self.compute_surface_normals(self.dem_prior, self.cellsize)  # Precompute normals from prior DEM for covariance setup
+        
+        self.set_covariance_priors(max_slope_deviation=max_slope_deviation_prior)
+        self.set_covariance_brightness(reflectance_maps_np, noise_fraction=noise_fraction_brightness)
+        
 
         # Vals for finite difference regularization
-        self.sigma_data = sigma_data
-        self.sigma_m = sigma_m
+        self.sigma_M = sigma_M
         
         # Cached photometric estimates (normals/albedo)
         self.normals_est = None
@@ -198,35 +201,105 @@ class FMSolver:
         
         self.sun_normals = sun_vecs
         return self.sun_normals
-
-
     
-    def set_covariance_priors(self, max_slope=10):
-        """
-        Set covariance matrix for normal vector prior.
+    # def set_covariance_priors(self, max_slope_deviation=10):
+    #     """
+    #     Set covariance matrix for normal vector prior.
         
-        Assumes Gaussian prior centered at zero slope (vertical normal)
-        with standard deviation corresponding to max_slope.
+    #     Assumes Gaussian prior centered at zero slope (vertical normal)
+    #     with standard deviation corresponding to max_slope.
         
-        Parameters
-        ----------
-        max_slope : float
-            Maximum expected surface slope in degrees.
-        """
-        self._debug_print("\n--- Setting Normal Prior Covariance ---")
+    #     Parameters
+    #     ----------
+    #     max_slope_deviation : float
+    #         Maximum expected surface slope deviation in degrees.
+    #     """
+    #     self._debug_print("\n--- Setting Normal Prior Covariance ---")
         
-        slope_variance_rad = np.deg2rad(max_slope) ** 2
-        covariance_prior = np.eye(3) * slope_variance_rad  # shape (3, 3)
-        covariance_prior[2, 2] = 1e-4  # Very low variance for nz to enforce unit constraint
+    #     slope_variance_rad = np.deg2rad(max_slope_deviation) ** 2
+    #     covariance_prior = np.eye(3) * slope_variance_rad  # shape (3, 3)
+    #     covariance_prior[2, 2] = 1e-4  # Very low variance for nz
         
-        self._debug_print(f"Max expected slope: {max_slope}°")
-        self._debug_print(f"Slope variance (rad²): {slope_variance_rad:.6f}")
-        self._debug_print(f"Slope std dev (rad): {np.sqrt(slope_variance_rad):.6f}")
-        self._debug_print(f"Slope std dev (deg): {np.sqrt(slope_variance_rad) * 180 / np.pi:.2f}°")
-        self._debug_print(f"nz variance (unit constraint): {covariance_prior[2, 2]:.6e}")
+    #     self._debug_print(f"Max expected slope deviation: {max_slope_deviation}°")
+    #     self._debug_print(f"Slope variance (rad²): {slope_variance_rad:.6f}")
+    #     self._debug_print(f"Slope std dev (rad): {np.sqrt(slope_variance_rad):.6f}")
+    #     self._debug_print(f"Slope std dev (deg): {np.sqrt(slope_variance_rad) * 180 / np.pi:.2f}°")
         
-        self.covariance_prior = covariance_prior
-        self.covariance_prior_T = covariance_prior.T  # Precompute transpose
+    #     # covariance_prior is (3,3) - but they will later be distinct for each pixel, so expand to (N,3,3) with same values for all pixels
+    #     covariance_prior_full = np.tile(covariance_prior, (self.reflectance_maps_vectors.shape[0], 1, 1))  # shape (N, 3, 3)
+    #     print(f"Covariance prior shape after tiling: {covariance_prior_full.shape}")
+        
+    #     self.covariance_prior = covariance_prior_full
+    #     self.covariance_prior_T = covariance_prior_full.transpose(0, 2, 1)  # Precompute transpose 
+    
+    # def set_covariance_priors(self, max_slope=10, scale_down_factor=2):
+        
+    #     print("\n--- Setting Normal Prior Covariance with Rotation ---")
+    #     # 1) Lokal varians
+    #     theta = np.deg2rad(max_slope / scale_down_factor)
+    #     sigma_theta2 = theta**2
+    #     sigma_parallel2 = theta**4  # meget lille, stabilt valg
+
+    #     Cov_local = np.diag([sigma_theta2, sigma_theta2, sigma_parallel2])
+
+    #     # 2) Normaliser prior-normals
+    #     n_p = self.dem_prior_normals.reshape(-1, 3)
+    #     n_p = n_p / (np.linalg.norm(n_p, axis=1, keepdims=True) + 1e-12)
+
+    #     # 3) Find rotationsmatricer, vectoriseret
+    #     e3 = np.array([0.0, 0.0, 1.0])
+    #     v = np.cross(np.tile(e3, (len(n_p), 1)), n_p)
+    #     s = np.linalg.norm(v, axis=1, keepdims=True)
+    #     c = np.dot(e3, n_p.T).T  # shape (N,1)
+
+    #     # Skalér vektoriseret krydsproduktmatrix
+    #     vx = np.zeros((len(n_p), 3, 3))
+    #     vx[:,0,1] = -v[:,2]
+    #     vx[:,0,2] =  v[:,1]
+    #     vx[:,1,0] =  v[:,2]
+    #     vx[:,1,2] = -v[:,0]
+    #     vx[:,2,0] = -v[:,1]
+    #     vx[:,2,1] =  v[:,0]
+
+    #     R = np.eye(3)[None,:,:] + vx + np.einsum(
+    #         'nij,njk->nik',
+    #         vx,
+    #         vx
+    #     ) * ((1 - c) / (s**2 + 1e-15))[:,None,None]
+
+    #     # Hvis parallelt → brug identitet
+    #     parallel = (s[:,0] < 1e-12)
+    #     R[parallel,:,:] = np.eye(3)
+
+    #     # 4) Rotér lokal kovarians → global
+    #     covariance_prior_full = R @ Cov_local @ R.transpose(0,2,1)
+
+    #     self.covariance_prior = covariance_prior_full
+    #     self.covariance_prior_T = covariance_prior_full.transpose(0,2,1)
+    #     print(f"Covariance prior shape after rotation: {covariance_prior_full.shape}")
+    
+    def set_covariance_priors(self, max_slope_deviation=10, scale_down_factor=2):
+        
+        self._debug_print("\n--- Setting Normal Prior Covariance with Rotation ---")
+        theta = np.deg2rad(max_slope_deviation / scale_down_factor)
+        sigma_theta2 = theta**2
+        sigma_parallel2 = theta**4
+
+        n_p = self.dem_prior_normals.reshape(-1, 3)
+        n_p = n_p / (np.linalg.norm(n_p, axis=1, keepdims=True) + 1e-12)
+
+        I = np.eye(3)[None,:,:]
+        outer = n_p[:, :, None] @ n_p[:, None, :]
+
+        covariance_prior_full = (
+            sigma_theta2 * (I - outer)
+            + sigma_parallel2 * outer
+        )
+
+        self.covariance_prior = covariance_prior_full
+        self.covariance_prior_T = covariance_prior_full.transpose(0,2,1)
+        self._debug_print(f"Covariance prior shape after rotation: {covariance_prior_full.shape}")
+
         
 
     def set_covariance_brightness(self, reflectance_maps, noise_fraction=0.1):
@@ -261,9 +334,8 @@ class FMSolver:
         
         self.brightness_covariance = np.eye(self.K) * brightness_variance
 
-        
 
-    def compute_prior_dem(self, gt_dem, scale_down_factor=40, smooth_sigma=None):
+    def compute_prior_dem(self, gt_dem, scale_down_factor=40, smooth_sigma_px=5):
         """
         Create a smoothed, upscaled low-resolution prior DEM.
         
@@ -278,8 +350,8 @@ class FMSolver:
             Ground truth DEM.
         scale_down_factor : int
             Downsampling factor.
-        smooth_sigma : float, optional
-            Gaussian smoothing sigma. If None, uses scale_down_factor / 2.
+        smooth_sigma_px : float, optional
+            Gaussian smoothing sigma in pixels.
         
         Returns
         -------
@@ -293,8 +365,7 @@ class FMSolver:
         self._debug_print(f"Original elevation range: [{gt_dem.min():.2f}, {gt_dem.max():.2f}]")
         self._debug_print(f"Scale down factor: {scale_down_factor}")
         
-        # smooth_sigma is in pixels (original convention); report the physical scale
-        smooth_sigma_px = smooth_sigma if smooth_sigma is not None else (scale_down_factor / 2.0)
+        # smooth_sigma_px is in pixels (original convention); report the physical scale
         smooth_sigma_m = smooth_sigma_px * self.dx
         self._debug_print(
             f"Smoothing sigma: {smooth_sigma_px:.2f} px ({smooth_sigma_m:.2f} m @ dx={self.dx:.4f} m)"
@@ -410,7 +481,6 @@ class FMSolver:
         self.nz = nz / norm
         
         normals = torch.stack([self.nx, self.ny, self.nz], dim=-1)  # shape (H, W, 3)
-        self.dem_prior_normals = normals.cpu().numpy()  # Cache as numpy array for later use
         return normals.cpu().numpy()
 
     def _get_normal_from_dem_pixel(self, dem, pixel_id):
@@ -429,6 +499,21 @@ class FMSolver:
 
         y, x = divmod(pixel_id, W)
         return cached[y, x]
+    
+    def update_covariance_prior_normals(self, new_covariance):
+        """
+        Update the covariance matrix for the normal prior and invalidate cached estimates.
+        
+        Parameters
+        ----------
+        new_covariance : np.ndarray, shape (N, 3, 3)
+            New covariance matrix for the normal prior.
+        """
+        self._debug_print("\n--- Updating Normal Prior Covariance ---")
+        self._debug_print(f"New covariance shape:\n{new_covariance.shape}")
+        
+        self.covariance_prior = new_covariance
+        self.covariance_prior_T = new_covariance.transpose(0, 2, 1)  # Update transpose as well
     
     
     def estimate_normal_and_albedo(self, n_iters=3, device=None):
@@ -481,7 +566,8 @@ class FMSolver:
             delta_dev = torch.from_numpy(self.reflectance_maps_vectors).to(device=target_device, dtype=dtype)  # (N, K)
             S_dev = torch.from_numpy(self.sun_normals).to(device=target_device, dtype=dtype)  # (K, 3) sun direction vectors
         
-            C_n_inv_dev = torch.from_numpy(np.linalg.inv(self.covariance_prior)).to(device=target_device, dtype=dtype)  # (3, 3)
+            # if run first time C_n is (3,3), same for all pixels - otherwise it is (N,3,3) and different for each pixel; we need the inverse for the linear system, so precompute that
+            C_n_inv_dev = torch.from_numpy(np.linalg.inv(self.covariance_prior)).to(device=target_device, dtype=dtype)  # (N, 3, 3)
             C_delta_inv_dev = torch.from_numpy(np.linalg.inv(self.brightness_covariance)).to(device=target_device, dtype=dtype)  # (K, K)
 
             # Build prior normals in batch using cached numpy computation
@@ -495,25 +581,23 @@ class FMSolver:
                 self._debug_print(f"Sun normal {i}: [{self.sun_normals[i, 0]:+.4f}, {self.sun_normals[i, 1]:+.4f}, {self.sun_normals[i, 2]:+.4f}]")
             self._debug_print(f"n_prior_np shape: {n_prior_np.shape}")
 
+            # H, W, _ = n_prior_np.shape
+            # N = H * W # number of pixels
+            # S = self.sun_normals  # (K,3)
+            # delta = self.reflectance_maps_vectors  # (N,K) number of pixels x number of sun directions
 
-
-            H, W, _ = n_prior_np.shape
-            N = H * W # number of pixels
-            S = self.sun_normals  # (K,3)
-            delta = self.reflectance_maps_vectors  # (N,K) number of pixels x number of sun directions
-
-            n_flat = n_prior_np.reshape(N, 3)      # (N,3) number of pixels x 3 components (nx, ny, nz)
-            Sn = n_flat @ S.T                      # (N,K) predicted reflectance at each pixel for each sun direction based on prior normals. 
-                                                   #  Sun normal multiplied with pixel normal gives cosine of angle between them, which is proportional to reflectance in Lambertian model.
+            # n_flat = n_prior_np.reshape(N, 3)      # (N,3) number of pixels x 3 components (nx, ny, nz)
+            # Sn = n_flat @ S.T                      # (N,K) predicted reflectance at each pixel for each sun direction based on prior normals. 
+            #                                        #  Sun normal multiplied with pixel normal gives cosine of angle between them, which is proportional to reflectance in Lambertian model.
             
 
-            eps = 1e-6
-            ratio = delta / (Sn + eps)             # (N,K) ratio of observed to predicted reflectance based on prior normals; should be close to 1 if prior is good
+            # eps = 1e-6
+            # ratio = delta / (Sn + eps)             # (N,K) ratio of observed to predicted reflectance based on prior normals; should be close to 1 if prior is good
 
-            print("Lambert test (delta / (S n_prior)):")
-            for k in range(S.shape[0]):
-                r_k = ratio[:, k]
-                print(f"  k={k}: min={r_k.min():.4f}, max={r_k.max():.4f}, mean={r_k.mean():.4f}, std={r_k.std():.4f}")
+            # print("Lambert test (delta / (S n_prior)):")
+            # for k in range(S.shape[0]):
+            #     r_k = ratio[:, k]
+            #     print(f"  k={k}: min={r_k.min():.4f}, max={r_k.max():.4f}, mean={r_k.mean():.4f}, std={r_k.std():.4f}")
 
 
             # # Tjek at N stemmer
@@ -534,10 +618,18 @@ class FMSolver:
             n_dev = n_prior_dev.reshape(N_pixels, 3) # (N,3) number of pixels x 3 components (nx, ny, nz); initialized to prior normals; will be updated iteratively
 
             # Precompute shared terms
-            ST_Cinv = S_dev.T @ C_delta_inv_dev  # (3, K)
-            A_mat = ST_Cinv @ S_dev  # (3, 3)
+            ST_C_del_inv = S_dev.T @ C_delta_inv_dev  # (3, K)
+            A_mat = ST_C_del_inv @ S_dev  # (3, 3) S^T C_delta^-1 S, used in the linear system for normal update
             delta_C = delta_dev @ C_delta_inv_dev  # (N, K)
-            n_prior_term = (n_prior_dev.reshape(N_pixels, 3) @ C_n_inv_dev.T)  # (N, 3)
+            
+            # Hvis C_n_inv_dev er (N,3,3), brug batch-matmul:
+            # n_prior_C_n_inv[i] = C_n_inv[i] @ n_prior[i]
+            n_prior_flat = n_prior_dev.reshape(N_pixels, 3)  # (N,3)
+            n_prior_C_n_inv = torch.bmm(
+                C_n_inv_dev,                 # (N,3,3)
+                n_prior_flat.unsqueeze(-1)   # (N,3,1)
+            ).squeeze(-1)                    # (N,3)
+
 
             # def compute_albedo(curr_n):
             #     Sn = curr_n @ S_dev.T  # (N, K)
@@ -566,11 +658,17 @@ class FMSolver:
             
             
             # Iterative refinement (batched)
-            albedo = compute_albedo(n_dev)
+            albedo = compute_albedo(n_dev) # shape (N,)
+            
             for _ in range(n_iters):
                 # Build per-pixel linear systems
-                M_batch = C_n_inv_dev.unsqueeze(0) + (albedo ** 2).unsqueeze(-1).unsqueeze(-1) * A_mat.unsqueeze(0)
-                rhs_batch = (albedo.unsqueeze(-1) * (delta_dev @ ST_Cinv.T)) + n_prior_term
+                # M_i = a_i^2 * A_mat + C_n_inv_i, where A_mat is S^T C_delta^-1 S 
+                M_batch = (albedo ** 2).view(N_pixels, 1, 1) * A_mat + C_n_inv_dev  # (N,3,3)    
+                               
+                # rhs_i = a_i * S^T C_delta^-1 δ_i + C_n_inv_i n_prior_i
+                data_term = (ST_C_del_inv @ delta_dev.T).T           # (N,3)
+                rhs_batch = albedo.view(N_pixels, 1) * data_term + n_prior_C_n_inv  # (N,3)
+
 
                 n_raw = torch.linalg.solve(M_batch, rhs_batch.unsqueeze(-1)).squeeze(-1) # This sets up eq. (9) in Fernandes & Mosegaard (2022) as a linear system M n = rhs for each pixel, where M is the combined precision matrix of the prior and data terms, and rhs is the combined influence of the observed reflectance and the prior normal. We solve for n (the normal vector) using torch.linalg.solve, which is efficient for small systems.
                 n_norm = torch.linalg.norm(n_raw, dim=1, keepdim=True).clamp(min=1e-12)
@@ -578,19 +676,24 @@ class FMSolver:
 
                 albedo = compute_albedo(n_dev)
 
-            return n_dev, albedo
+            # Also compute updated covariance matrix after estimation
+            updated_covariance_prior_normals = torch.linalg.inv((albedo ** 2).unsqueeze(-1).unsqueeze(-1) * A_mat + C_n_inv_dev.unsqueeze(0)) # (N, 3, 3) eq. (10) in Fernandes & Mosegaard (2022)
+            
+            return n_dev, albedo, updated_covariance_prior_normals
+        
 
         # Run estimation with fallback to CPU if the selected device fails
         try:
-            n_out, albedo_out = run_estimation(compute_device)
+            n_out, albedo_out, C_n_updated = run_estimation(compute_device)
         except Exception as e:
             self._debug_print(f"Compute on {compute_device} failed ({e}); falling back to CPU")
             compute_device = torch.device("cpu")
-            n_out, albedo_out = run_estimation(compute_device)
+            n_out, albedo_out, C_n_updated = run_estimation(compute_device)
 
         # Move results back to CPU numpy and cache
         normals_np = n_out.reshape(H, W, 3).detach().cpu().numpy()
         albedos_np = albedo_out.reshape(H, W).detach().cpu().numpy()
+        cov_np = C_n_updated.detach().cpu().numpy().squeeze()  # shape (N, 3, 3)
 
         # Debug statistics
         self._debug_print("\n--- Estimation Statistics ---")
@@ -614,8 +717,8 @@ class FMSolver:
         # Cache and return
         self.normals_est = normals_np
         self.albedo_est = albedos_np
+        self.update_covariance_prior_normals(cov_np)  # Update the covariance prior with the new estimates
         self.estimation_device = str(compute_device)
-
 
         self.prior_has_been_updated = False  # Reset flag after having updated estimates based on current prior
 
@@ -713,14 +816,11 @@ class FMSolver:
         self._debug_print("="*70)
         
         H, W = self.dem_prior.shape
-        H_int, W_int = H - 2, W - 2  # Interior region (avoid edges)
+        n_int = 1 # Number of pixels to remove from each edge for interior region; should match the gradient computation method (e.g., central differences require n_int=1)
+        H_int, W_int = H - 2*n_int, W - 2*n_int  # Interior region (avoid edges)
         
         self._debug_print(f"Full DEM shape: ({H}, {W})")
         self._debug_print(f"Interior region: ({H_int}, {W_int})")
-        sigma_data_eff = self.sigma_data
-        sigma_m_eff = self.sigma_m
-        self._debug_print(f"Sigma_data: {sigma_data_eff:.6f}")
-        self._debug_print(f"Sigma_m: {sigma_m_eff:.2f}")
         
         # Build finite difference operators
         self._debug_print("\nBuilding finite difference operators...")
@@ -735,6 +835,25 @@ class FMSolver:
         # Estimate normals and albedo from reflectance
         self._debug_print("\nEstimating normals from photometry...")
         normals_est, albedo_est = self.estimate_normal_and_albedo(n_iters=3)
+        
+        C_n = self.covariance_prior  # (N, 3, 3) covariance of normal estimates; should have been updated in estimate_normal_and_albedo
+        # reshape til (H, W, 3, 3)
+        C_n = C_n.reshape(H, W, 3, 3)
+
+
+        # Vi arbejder kun på interior: Use H_int and W_int to index into the center region of the normal estimates and their covariance
+        n_center   = normals_est[n_int:-n_int, n_int:-n_int, :]      # (H_int, W_int, 3)
+        C_n_center = C_n[n_int:-n_int, n_int:-n_int, :, :]          # (H_int, W_int, 3, 3)
+
+        n3_center = n_center[..., 2]                  # (H_int, W_int)
+        n3_sq_inv = 1.0 / (np.maximum(n3_center, 1e-12)**2)  # (H_int, W_int)
+
+        # top-left 2x2 blok af C_n
+        C_n_2x2 = C_n_center[..., 0:2, 0:2]           # (H_int, W_int, 2, 2)
+
+        # Eq. (16): C_r = (1 / n3^2) * C_n^{(2x2)}
+        C_r = n3_sq_inv[..., None, None] * C_n_2x2    # (H_int, W_int, 2, 2)
+
         
         # Convert normals to gradients
         self._debug_print("\nConverting normals to gradients...")
@@ -766,31 +885,211 @@ class FMSolver:
         df_dx_prior_center = df_dx_prior[1:-1, :]  # (H-2, W-2)
         df_dy_prior_center = df_dy_prior[:, 1:-1]  # (H-2, W-2)
         
-        self._debug_print("\nInterior gradient shapes (should all be same):")
-        self._debug_print(f"  df/dx estimated: {df_dx_est_center.shape}")
-        self._debug_print(f"  df/dy estimated: {df_dy_est_center.shape}")
-        self._debug_print(f"  df/dx prior:     {df_dx_prior_center.shape}")
-        self._debug_print(f"  df/dy prior:     {df_dy_prior_center.shape}")
+        # self._debug_print("\nInterior gradient shapes (should all be same):")
+        # self._debug_print(f"  df/dx estimated: {df_dx_est_center.shape}")
+        # self._debug_print(f"  df/dy estimated: {df_dy_est_center.shape}")
+        # self._debug_print(f"  df/dx prior:     {df_dx_prior_center.shape}")
+        # self._debug_print(f"  df/dy prior:     {df_dy_prior_center.shape}")
         
         # Compute gradient residuals
-        self._debug_print("\n--- Gradient Residual Assignment ---")
-        self._debug_print("Coordinate system: x=East, y=North")
-        self._debug_print("G operates on rows (North-South, y-direction)")
-        self._debug_print("G' operates on columns (East-West, x-direction)")
-        self._debug_print("")
-        self._debug_print("From Fernandes & Mosegaard (2022):")
-        self._debug_print("  X provides NS (North-South) slope information")
-        self._debug_print("  Y provides EW (East-West) slope information")
-        self._debug_print("  GM = X  (G operates in NS direction)")
-        self._debug_print("  MG^T = Y  (G^T operates in EW direction)")
-        self._debug_print("")
-        self._debug_print("Therefore in Sylvester equation A @ M + M @ B = C:")
-        self._debug_print("  A = G^T @ G    (NS operator)")
-        self._debug_print("  B = G'^T @ G'  (EW operator, G' ≈ G^T for square DEMs)")
-        self._debug_print("  C = G^T @ Delta_X + Delta_Y @ G'")
-        self._debug_print("  where Delta_X contains NS info (df/dy residuals)")
-        self._debug_print("        Delta_Y contains EW info (df/dx residuals)")
-        self._debug_print("")
+        # self._debug_print("\n--- Gradient Residual Assignment ---")
+        # self._debug_print("Coordinate system: x=East, y=North")
+        # self._debug_print("G operates on rows (North-South, y-direction)")
+        # self._debug_print("G' operates on columns (East-West, x-direction)")
+        # self._debug_print("")
+        # self._debug_print("From Fernandes & Mosegaard (2022):")
+        # self._debug_print("  X provides NS (North-South) slope information")
+        # self._debug_print("  Y provides EW (East-West) slope information")
+        # self._debug_print("  GM = X  (G operates in NS direction)")
+        # self._debug_print("  MG^T = Y  (G^T operates in EW direction)")
+        # self._debug_print("")
+        # self._debug_print("Therefore in Sylvester equation A @ M + M @ B = C:")
+        # self._debug_print("  A = G^T @ G    (NS operator)")
+        # self._debug_print("  B = G'^T @ G'  (EW operator, G' ≈ G^T for square DEMs)")
+        # self._debug_print("  C = G^T @ Delta_X + Delta_Y @ G'")
+        # self._debug_print("  where Delta_X contains NS info (df/dy residuals)")
+        # self._debug_print("        Delta_Y contains EW info (df/dx residuals)")
+        # self._debug_print("")
+        
+        # Differences between photometric estimates and prior gradients
+        dfdx_residuals = df_dx_est_center - df_dx_prior_center
+        dfdy_residuals = df_dy_est_center - df_dy_prior_center
+
+        # Assign gradient residuals per paper's notation:
+        # Delta_X contains NS (North-South) information → df/dy residuals
+        # Delta_Y contains EW (East-West) information → df/dx residuals
+        # This matches: X = NS slopes, Y = EW slopes
+        # Delta_X = dfdy_residuals  # NS information (df/dy)
+        # Delta_Y = dfdx_residuals  # EW information (df/dx)
+        
+        
+        # Now for the whitening part:
+        
+        # Flatten gradientresidualer -> (N_int, 2)
+        r_vec = np.stack([
+            dfdx_residuals.reshape(-1),   # df/dx
+            dfdy_residuals.reshape(-1)    # df/dy
+        ], axis=1)                        # (N_int, 2)
+
+        # Flatten C_r -> (N_int, 2, 2)
+        C_r_flat = C_r.reshape(-1, 2, 2)
+        
+        
+        device = self._select_device()  # Use same device selection logic as before
+        dtype  = torch.float32
+
+        C_r_dev = torch.from_numpy(C_r_flat).to(device=device, dtype=dtype)     # (N_int, 2, 2)
+        r_dev   = torch.from_numpy(r_vec).to(device=device, dtype=dtype)        # (N_int, 2)
+
+        # Lille jitter for numerisk stabilitet
+        eye2 = torch.eye(2, device=device, dtype=dtype).unsqueeze(0)            # (1,2,2)
+        C_r_dev = C_r_dev + 1e-10 * eye2
+
+        # Cholesky: C_r = L L^T
+        L = torch.linalg.cholesky(C_r_dev)                                      # (N_int, 2, 2)
+
+        # Whiten: L * r_white = r  => r_white = L^{-1} r
+        r_dev_vec = r_dev.unsqueeze(-1)                                         # (N_int, 2, 1)
+        r_white = torch.linalg.solve(L, r_dev_vec).squeeze(-1)                  # (N_int, 2)
+
+        r_white_np = r_white.cpu().numpy()                                      # (N_int, 2)
+
+        dfdx_residuals_white = r_white_np[:, 0].reshape(H_int, W_int)
+        dfdy_residuals_white = r_white_np[:, 1].reshape(H_int, W_int)
+        
+        Delta_X = dfdy_residuals_white   # NS-info (df/dy), som før
+        Delta_Y = dfdx_residuals_white   # EW-info (df/dx), som før    
+        
+        # self._debug_print("Gradient residual assignment:")
+        # self._debug_print(f"  Delta_X = df/dy residuals (NS info): range [{Delta_X.min():.4f}, {Delta_X.max():.4f}] mean/std {Delta_X.mean():+.4f}/{Delta_X.std():.4f}")
+        # self._debug_print(f"  Delta_Y = df/dx residuals (EW info): range [{Delta_Y.min():.4f}, {Delta_Y.max():.4f}] mean/std {Delta_Y.mean():+.4f}/{Delta_Y.std():.4f}")
+        # self._debug_print("")
+        
+        # Having whitened the residuals, we can now set sigma_data_eff to 1 for the Sylvester equation, since the whitening has normalized the data term to have unit covariance. The model uncertainty sigma_m_eff can be adjusted relative to this as needed.
+        sigma_data_eff = 1.0
+        
+        eps_sq = sigma_data_eff**2 / self.sigma_M**2
+
+        # check that whitening has worked as intended by verifying that the covariance of the whitened residuals is close to identity
+        cov_white = np.cov(r_white_np, rowvar=False)  # (2, 2)
+        self._debug_print("\nCovariance of whitened residuals (should be close to identity):")
+        self._debug_print(cov_white)
+
+        # Construct Sylvester matrices following Fernandes & Mosegaard (2022):
+        # A @ M + M @ B = C
+        # where C = G^T @ Delta_X + Delta_Y @ G'
+        # Delta_X contains NS (df/dy) info, Delta_Y contains EW (df/dx) info
+        # self._debug_print("\nConstructing matrices...")
+        A = G.T @ G + eps_sq * np.eye(H_int)
+        B = Gp.T @ Gp # + eps_sq * np.eye(W_int) # They do not do this in the paper, but it helps with conditioning and is consistent with their regularization discussion
+        C = G.T @ Delta_X + Delta_Y @ Gp
+        
+        self._debug_print(f"  A shape: {A.shape}, condition number: {np.linalg.cond(A):.2e}")
+        self._debug_print(f"  B shape: {B.shape}, condition number: {np.linalg.cond(B):.2e}")
+        self._debug_print(f"  C shape: {C.shape}, range: [{C.min():.4f}, {C.max():.4f}]")
+        
+        self._debug_print("="*70)
+        
+        
+        # ---------------------------------------------------------------------
+        # SANITY CHECK: Whitening Diagnostics
+        # ---------------------------------------------------------------------
+
+        self._debug_print("\n----------------- WHITENING SANITY CHECK -----------------")
+
+        # 1) Kovarians før global rescale
+        cov_before = np.cov(r_white_np, rowvar=False)
+        std_before = np.sqrt(np.diag(cov_before))
+        mean_before = np.mean(r_white_np, axis=0)
+
+        self._debug_print("Covariance BEFORE global rescale:")
+        self._debug_print(cov_before)
+        self._debug_print(f"Std BEFORE: {std_before}")
+        self._debug_print(f"Mean BEFORE: {mean_before}")
+
+        # 2) Global rescale
+        scale = np.mean(np.diag(cov_before))  # typisk ~0.005–0.01 i dit eksempel
+        r_white_np_rescaled = r_white_np / np.sqrt(scale)
+
+        # 3) Kovarians efter rescale
+        cov_after = np.cov(r_white_np_rescaled, rowvar=False)
+        std_after = np.sqrt(np.diag(cov_after))
+        mean_after = np.mean(r_white_np_rescaled, axis=0)
+
+        self._debug_print("\nCovariance AFTER global rescale (should be close to identity):")
+        self._debug_print(cov_after)
+        self._debug_print(f"Std AFTER: {std_after}")
+        self._debug_print(f"Mean AFTER: {mean_after}")
+
+        self._debug_print("-----------------------------------------------------------\n")
+
+        
+        return A, B, C
+    
+    def construct_sylvester_matrices_no_whitening(self):
+        print("Using unwhitened residuals for Sylvester equation construction")
+        H, W = self.dem_prior.shape
+        n_int = 1 # Number of pixels to remove from each edge for interior region; should match the gradient computation method (e.g., central differences require n_int=1)
+        H_int, W_int = H - 2*n_int, W - 2*n_int  # Interior region (avoid edges)
+        
+        self._debug_print(f"Full DEM shape: ({H}, {W})")
+        self._debug_print(f"Interior region: ({H_int}, {W_int})")
+        
+        # Build finite difference operators
+        G_raw  = build_G(H_int)  # Vertical differences (rows/North-South)
+        Gp_raw = build_G_prime(W_int)  # Horizontal differences (columns/East-West)
+        # Scale operators by physical spacing so gradients are in meters
+        G  = G_raw / self.dy
+        Gp = Gp_raw / self.dx
+
+        
+        # Estimate normals and albedo from reflectance
+        normals_est, albedo_est = self.estimate_normal_and_albedo(n_iters=3)
+        
+        # Convert normals to gradients
+        df_dx_est, df_dy_est = gradients_to_dfdx_dfdy(normals_est)
+        
+
+        
+        # Compute prior gradients from smoothed DEM (respect physical spacing)
+        # Note: dem_prior[:, 2:] - dem_prior[:, :-2] is forward-backward diff
+        # Central difference: (f[i+1] - f[i-1]) / 2
+        df_dx_prior = (self.dem_prior[:, 2:] - self.dem_prior[:, :-2]) / (2 * self.dx)  # (H, W-2)
+        df_dy_prior = (self.dem_prior[2:, :] - self.dem_prior[:-2, :]) / (2 * self.dy)  # (H-2, W)
+
+        
+        # Crop estimated and prior gradients to interior region
+        df_dx_est_center = df_dx_est[1:-1, 1:-1]  # (H-2, W-2)
+        df_dy_est_center = df_dy_est[1:-1, 1:-1]  # (H-2, W-2)
+        
+        df_dx_prior_center = df_dx_prior[1:-1, :]  # (H-2, W-2)
+        df_dy_prior_center = df_dy_prior[:, 1:-1]  # (H-2, W-2)
+        
+        # self._debug_print("\nInterior gradient shapes (should all be same):")
+        # self._debug_print(f"  df/dx estimated: {df_dx_est_center.shape}")
+        # self._debug_print(f"  df/dy estimated: {df_dy_est_center.shape}")
+        # self._debug_print(f"  df/dx prior:     {df_dx_prior_center.shape}")
+        # self._debug_print(f"  df/dy prior:     {df_dy_prior_center.shape}")
+        
+        # Compute gradient residuals
+        # self._debug_print("\n--- Gradient Residual Assignment ---")
+        # self._debug_print("Coordinate system: x=East, y=North")
+        # self._debug_print("G operates on rows (North-South, y-direction)")
+        # self._debug_print("G' operates on columns (East-West, x-direction)")
+        # self._debug_print("")
+        # self._debug_print("From Fernandes & Mosegaard (2022):")
+        # self._debug_print("  X provides NS (North-South) slope information")
+        # self._debug_print("  Y provides EW (East-West) slope information")
+        # self._debug_print("  GM = X  (G operates in NS direction)")
+        # self._debug_print("  MG^T = Y  (G^T operates in EW direction)")
+        # self._debug_print("")
+        # self._debug_print("Therefore in Sylvester equation A @ M + M @ B = C:")
+        # self._debug_print("  A = G^T @ G    (NS operator)")
+        # self._debug_print("  B = G'^T @ G'  (EW operator, G' ≈ G^T for square DEMs)")
+        # self._debug_print("  C = G^T @ Delta_X + Delta_Y @ G'")
+        # self._debug_print("  where Delta_X contains NS info (df/dy residuals)")
+        # self._debug_print("        Delta_Y contains EW info (df/dx residuals)")
+        # self._debug_print("")
         
         # Differences between photometric estimates and prior gradients
         dfdx_residuals = df_dx_est_center - df_dx_prior_center
@@ -803,30 +1102,18 @@ class FMSolver:
         Delta_X = dfdy_residuals  # NS information (df/dy)
         Delta_Y = dfdx_residuals  # EW information (df/dx)
         
-        self._debug_print("Gradient residual assignment:")
-        self._debug_print(f"  Delta_X = df/dy residuals (NS info): range [{Delta_X.min():.4f}, {Delta_X.max():.4f}] mean/std {Delta_X.mean():+.4f}/{Delta_X.std():.4f}")
-        self._debug_print(f"  Delta_Y = df/dx residuals (EW info): range [{Delta_Y.min():.4f}, {Delta_Y.max():.4f}] mean/std {Delta_Y.mean():+.4f}/{Delta_Y.std():.4f}")
-        self._debug_print("")
-        eps_sq = sigma_data_eff**2 / sigma_m_eff**2
-        self._debug_print(f"Regularization parameter eps²: {eps_sq:.6e}")
         
-        # Construct Sylvester matrices following Fernandes & Mosegaard (2022):
-        # A @ M + M @ B = C
-        # where C = G^T @ Delta_X + Delta_Y @ G'
-        # Delta_X contains NS (df/dy) info, Delta_Y contains EW (df/dx) info
-        self._debug_print("\nConstructing matrices...")
+        # Having whitened the residuals, we can now set sigma_data_eff to 1 for the Sylvester equation, since the whitening has normalized the data term to have unit covariance. The model uncertainty sigma_m_eff can be adjusted relative to this as needed.
+        sigma_data_eff=0.01
+        sigma_m_eff=20.0
+        
+        eps_sq = np.power(sigma_data_eff, 2) / np.power(sigma_m_eff, 2)
+
         A = G.T @ G + eps_sq * np.eye(H_int)
         B = Gp.T @ Gp # + eps_sq * np.eye(W_int) # They do not do this in the paper, but it helps with conditioning and is consistent with their regularization discussion
         C = G.T @ Delta_X + Delta_Y @ Gp
         
-        self._debug_print(f"  A shape: {A.shape}, condition number: {np.linalg.cond(A):.2e}")
-        self._debug_print(f"  B shape: {B.shape}, condition number: {np.linalg.cond(B):.2e}")
-        self._debug_print(f"  C shape: {C.shape}, range: [{C.min():.4f}, {C.max():.4f}]")
-        
-        self._debug_print("="*70)
-        
         return A, B, C
-    
     
     def solve_sylvester_eq(self, A, B, C):
         """
@@ -865,7 +1152,7 @@ class FMSolver:
         
         return X
     
-    def compute_model_update(self):
+    def compute_model_update(self, use_iterative_solver=False):
         """
         Compute DEM update using Sylvester equation.
         
@@ -884,8 +1171,12 @@ class FMSolver:
         M_update_full : np.ndarray
             DEM elevation corrections with same shape as DEM (zeros on 1-pixel border).
         """
-        A, B, C = self.construct_sylvester_matrices()
-        M_update_interior = self.solve_sylvester_eq(A, B, C)
+        if use_iterative_solver:
+            A, B, C = self.construct_sylvester_matrices_no_whitening()
+            M_update_interior = self.solve_sylvester_eq(A, B, C)
+        else:
+            A, B, C = self.construct_sylvester_matrices()
+            M_update_interior = self.solve_sylvester_eq(A, B, C)
 
         # Embed interior update into full-sized array
         M_update_full = np.zeros_like(self.dem_prior)
