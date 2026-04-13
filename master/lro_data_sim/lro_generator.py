@@ -102,7 +102,7 @@ def generate_and_return_lro_data(config: dict = None, device: str = "cpu"):
         return images, reflectance_maps, dem_tensor, metas, lro_meta
 
 
-def generate_and_return_lro_dem(config: dict = None, file_location: str = None):
+def generate_and_return_lro_dem(config: dict = None, file_location: str = None, box_radius_override: float = None):
 
     if file_location is not None:
         dem_path = file_location
@@ -110,6 +110,8 @@ def generate_and_return_lro_dem(config: dict = None, file_location: str = None):
         dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
 
     lat, lon, box_radius, height_norm = get_lat_lon_radius_height(config)    
+    if box_radius_override is not None:
+        box_radius = box_radius_override
     dem_array, metadata = extract_local_dem_subset(
                                                     dem_path=dem_path,
                                                     center_lat_deg=lat,

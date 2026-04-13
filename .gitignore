@@ -36,6 +36,7 @@ master/lro_data_sim/*.tif
 master/tests/figures/
 master/visual/
 master/figures*/
+/Marslab
 
 
 # PyInstaller

@@ -1,26 +1,44 @@
 """UNet model and FiLM/Meta encoder building blocks."""
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+# class MetaEncoder(nn.Module):
+#     def __init__(self, meta_dim=5, hidden_dim=64, out_dim=128):
+#         super().__init__()
+#         self.mlp = nn.Sequential(
+#             nn.Linear(meta_dim, hidden_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(hidden_dim, out_dim),
+#             nn.ReLU(inplace=True)
+#         )
+
+#     def forward(self, meta):
+#         B, N, D = meta.shape
+#         meta_flat = meta.view(B * N, D)
+#         encoded = self.mlp(meta_flat)
+#         encoded = encoded.view(B, N, -1)
+#         return encoded.mean(dim=1) # Average over the N x 5 meta numbers - not good!
+
 class MetaEncoder(nn.Module):
-    def __init__(self, meta_dim=5, hidden_dim=64, out_dim=128):
+    def __init__(self, meta_dim=5, num_images=5, hidden_dim=64, out_dim=128):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(meta_dim, hidden_dim),
+            nn.Linear(meta_dim * num_images, hidden_dim),  # 25 -> 64
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, out_dim),
+            nn.Linear(hidden_dim, out_dim),  # 64 -> 128
             nn.ReLU(inplace=True)
         )
 
     def forward(self, meta):
-        B, N, D = meta.shape
-        meta_flat = meta.view(B * N, D)
-        encoded = self.mlp(meta_flat)
-        encoded = encoded.view(B, N, -1)
-        return encoded.mean(dim=1)
+        B, N, D = meta.shape  # (B, 5, 5)
+        meta_flat = meta.view(B, -1)  # (B, 25)
+        encoded = self.mlp(meta_flat)  # (B, 128)
+        return encoded
 
 
 class FiLMLayer(nn.Module):
@@ -68,6 +86,48 @@ class DoubleConv(nn.Module):
         )
 
 
+class FinalLearnedUpsample(nn.Module):
+    def __init__(self, ch, upsample_factor=4, norm="group", num_groups=8):
+        super().__init__()
+
+        assert upsample_factor >= 1 and (upsample_factor & (upsample_factor - 1)) == 0, \
+            "upsample_factor must be a power of 2"
+
+        num_stages = int(math.log2(upsample_factor))
+
+        layers = []
+        in_ch = ch
+
+        for _ in range(num_stages):
+            out_ch = in_ch // 2
+
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_ch,
+                    out_ch,
+                    kernel_size=2,
+                    stride=2,
+                    bias=False
+                )
+            )
+            layers.append(
+                DoubleConv(
+                    in_ch=out_ch,
+                    out_ch=out_ch,
+                    norm=norm,
+                    num_groups=num_groups
+                )
+            )
+
+            in_ch = out_ch
+
+        self.block = nn.Sequential(*layers)
+        self.out_channels = in_ch
+
+    def forward(self, x):
+        return self.block(x)
+
+
 # class DoubleConv(nn.Module):
 #     def __init__(self, in_ch, out_ch):
 #         super().__init__()
@@ -85,7 +145,7 @@ class DoubleConv(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels=None, out_channels=1, features=(64, 128, 256, 512), 
+    def __init__(self, in_channels=None, out_channels=3, features=(64, 128, 256, 512), 
                  meta_dim=5, meta_hidden=64, meta_out=128, upsample_factor=4, w_range=None, theta_range=None, norm="batch", num_groups=8):
         super().__init__()
         self.upsample_factor = upsample_factor
@@ -99,19 +159,20 @@ class UNet(nn.Module):
             self.pools.append(nn.MaxPool2d(2))
             ch = f
         self.bottleneck_conv = DoubleConv(features[-1], features[-1] * 2, norm=norm, num_groups=num_groups)
-        self.meta_encoder = MetaEncoder(meta_dim=meta_dim, hidden_dim=meta_hidden, out_dim=meta_out)
+        self.meta_encoder = MetaEncoder(meta_dim=meta_dim, num_images=in_channels, hidden_dim=meta_hidden, out_dim=meta_out)
         self.film = FiLMLayer(feature_channels=features[-1] * 2, cond_dim=meta_out)
         self.upconvs = nn.ModuleList()
         self.decs = nn.ModuleList()
         ch = features[-1] * 2
         for f in reversed(features):
-            self.upconvs.append(nn.ConvTranspose2d(ch, f, kernel_size=2, stride=2))
+            self.upconvs.append(nn.ConvTranspose2d(ch, f, kernel_size=2, stride=2, bias=False))
             self.decs.append(DoubleConv(ch, f, norm=norm, num_groups=num_groups))
             ch = f
         self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
-        self.final_upsample = nn.Upsample(scale_factor=upsample_factor, mode='bilinear', align_corners=False)
+        self.final_upsample = FinalLearnedUpsample(out_channels, upsample_factor=upsample_factor, norm=norm, num_groups=num_groups) # allow a learned final upsampling instead of fixed bilinear - this is important for the 4x upsampling to get to the original resolution!
+        # self.final_upsample = nn.Upsample(scale_factor=upsample_factor, mode='bilinear', align_corners=False)
 
-    def forward(self, x, meta, target_size=None):
+    def forward(self, x, meta):
         skips = []
         for enc, pool in zip(self.encs, self.pools):
             x = enc(x)
@@ -127,10 +188,7 @@ class UNet(nn.Module):
             x = torch.cat([skip, x], dim=1)
             x = dec(x)
         x = self.final_conv(x)
-        if target_size is not None:
-            x = F.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
-        else:
-            x = self.final_upsample(x)
+        x = self.final_upsample(x)
 
         # Apply activation functions to constrain outputs to physical ranges
         if self.final_conv.out_channels == 3 and self.w_range is not None and self.theta_range is not None:

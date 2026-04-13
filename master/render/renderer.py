@@ -71,7 +71,7 @@ class Renderer:
         # Flatten normals
         normals_flat = torch.stack([self.dem.nx.flatten(), self.dem.ny.flatten(), self.dem.nz.flatten()], dim=1)
         
-        # Compute incidence and emission angles
+        # Compute cosine of incidence and emission angles
         mu = (normals_flat * view_vectors).sum(dim=1).reshape(self.dem.dem.shape)
         mu0 = (normals_flat * sun_vec).sum(dim=1).reshape(self.dem.dem.shape)
                 
@@ -91,8 +91,18 @@ class Renderer:
         cos_g = torch.clamp(cos_g, -1, 1)
         g_rad = torch.acos(cos_g).reshape(self.dem.dem.shape)
         
+        # compute incidence, emission and psi angles for Hapke model
+        e_rad = torch.acos(torch.clamp(mu, -1, 1)).reshape(self.dem.dem.shape) # shape is (H*W,)
+        i_rad = torch.acos(torch.clamp(mu0, -1, 1)).reshape(self.dem.dem.shape) # shape is (H*W,)
+        
+        # Compute azimuth difference for psi angle
+        sun_az_rad = torch.deg2rad(torch.tensor(sun_az_deg, dtype=torch.float32, device=self.device))
+        cam_az_rad = torch.deg2rad(torch.tensor(camera_az_deg, dtype=torch.float32, device=self.device))
+        psi_rad = torch.abs(sun_az_rad - cam_az_rad)
+        psi_rad_map = psi_rad * torch.ones_like(g_rad)  # Same psi for all pixels, since sun az and camera az are constant over the DEM
+
         # Compute Hapke reflectance
-        R = self.model.radiance_factor(mu0, mu, g_rad)
+        R = self.model.radiance_factor(mu0, mu, g_rad, e_rad, i_rad, psi_rad_map)
         
         # Compute and apply shadow map
         shadow_map = Renderer.compute_shadow_map(

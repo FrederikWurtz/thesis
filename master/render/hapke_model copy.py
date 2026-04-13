@@ -202,34 +202,10 @@ def _check_nan_hapke(tensor, name):
         raise ValueError(msg)
 
 # ============================================================
-#  Roughness correction (Hapke 1994, chapter 12)
+#  Roughness correction (Hapke 1984 / 1986 / 1993)
 # ============================================================
 
-def cot(x):
-    """
-    Compute cotangent, handling both scalars and tensors of any shape.
-    
-    Parameters:
-    x (float or torch.Tensor): Input value(s) in radians.
-    
-    Returns:
-    float or torch.Tensor: cos(x) / sin(x), with special handling for small sin(x).
-    """
-    if not isinstance(x, torch.Tensor):
-        x = torch.tensor(x, dtype=torch.float32)
-    
-    sin_x = torch.sin(x)
-    
-    # Where sin(x) is too small, use a large number; otherwise compute cot normally
-    result = torch.where(
-        torch.abs(sin_x) < 1e-12,
-        torch.full_like(x, 1e12),
-        torch.cos(x) / sin_x
-    )
-    
-    return result
-
-def hapke_roughness(mu0, mu, i, e, psi, theta_bar, debug: bool = False):
+def hapke_roughness(mu0, mu, g, theta_bar, debug: bool = False):
     """
     Hapke macroscopic roughness correction.
     Returns mu0_eff, mu_eff, S.
@@ -238,79 +214,122 @@ def hapke_roughness(mu0, mu, i, e, psi, theta_bar, debug: bool = False):
     # Sørg for tensors & fælles shape
     if not isinstance(mu0, torch.Tensor): mu0 = torch.tensor(mu0)
     if not isinstance(mu, torch.Tensor):  mu  = torch.tensor(mu)
-    if not isinstance(i, torch.Tensor):   i   = torch.tensor(i)
-    if not isinstance(e, torch.Tensor):   e   = torch.tensor(e)
-    if not isinstance(psi, torch.Tensor): psi = torch.tensor(psi)
+    if not isinstance(g, torch.Tensor):   g   = torch.tensor(g)
 
-    mu0, mu, i, e, psi = torch.broadcast_tensors(mu0, mu, i, e, psi)
+    mu0, mu, g = torch.broadcast_tensors(mu0, mu, g)
     mu0 = mu0.to(dtype=torch.float32)
     mu  = mu.to(dtype=torch.float32)
 
     theta_bar = torch.as_tensor(theta_bar, device=mu0.device, dtype=mu0.dtype)
+    theta_bar = torch.clamp(theta_bar, 1e-6, math.radians(45.0))  # safe range
 
     if debug:
         _check_nan_hapke(mu0,       "mu0 (input)")
         _check_nan_hapke(mu,        "mu (input)")
-        _check_nan_hapke(i,         "i (input)")
-        _check_nan_hapke(e,         "e (input)")
-        _check_nan_hapke(psi,       "psi (input)")
+        _check_nan_hapke(g,         "g (input)")
         _check_nan_hapke(theta_bar, "theta_bar (input)")
 
+    # *** VIGTIGT: clamp mu0 og mu til [-1, 1] ***
+    mu0 = torch.clamp(mu0, -1.0, 1.0)
+    mu  = torch.clamp(mu,  -1.0, 1.0)
 
-    # Roughness parameters that are constant over map
-    chi = torch.sqrt(1 + torch.pi*torch.tan(theta_bar)**2)
-    
-    if debug: # print values of roughness parameters and input angles (degrees and radians) for debugging
-        print(f"Input angles (degrees): i={torch.rad2deg(i).item():.2f}, e={torch.rad2deg(e).item():.2f}, psi={torch.rad2deg(psi).item():.2f}")
-        print(f"Input angles (radians): i={i.item():.6f}, e={e.item():.6f}, psi={psi.item():.6f}")
-        print(f"Roughness parameters (constant): chi={chi.item():.6f}")
-        
-    
-    # Roughness parameters that vary over the map
-    E1_e_map = torch.exp(-2 / torch.pi * cot(theta_bar) * cot(e) )
-    E1_i_map = torch.exp(-2 / torch.pi * cot(theta_bar) * cot(i) )
-    E2_e_map = torch.exp(-1 / torch.pi * (cot(theta_bar))**2 * (cot(e))**2 )
-    E2_i_map = torch.exp(-1 / torch.pi * (cot(theta_bar))**2 * (cot(i))**2 )
-    # if psi is 180, then tan(psi/2) is infinite and f_psi should be 0, so clamp psi to just below 180 degrees to avoid NaN
-    psi_clamped = torch.clamp(psi, max=math.pi - 1e-6)
-    f_psi = torch.exp(- 2 * torch.tan(psi_clamped / 2))
-    
-    if debug: # print values of roughness parameters that vary over the map for debugging
-        print(f"Roughness parameters (maps): E1_e_map={E1_e_map.item():.6f}, E1_i_map={E1_i_map.item():.6f}, E2_e_map={E2_e_map.item():.6f}, E2_i_map={E2_i_map.item():.6f}, f_psi={f_psi.item():.6f}")
-    
-    # compute effective cosines for incidence and emission depending on which is largest
-    mu0_eff_i_leq_e = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * (torch.cos(psi) * E2_e_map + torch.sin(psi / 2)**2 * E2_i_map) / (2 - E1_e_map - (psi / torch.pi) * E1_i_map))
-    mu0_eff_i_leq_e_at_0 = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * E2_i_map / (2 - E1_i_map))
-    mu_eff_i_leq_e = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * (E2_e_map - torch.sin(psi / 2)**2 * E2_i_map) / (2 - E1_e_map - (psi / torch.pi) * E1_i_map))
-    mu_eff_i_leq_e_at_0 = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * E2_e_map / (2 - E1_e_map))
-    
-    mu0_eff_e_lt_i = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * (E2_i_map - torch.sin(psi / 2)**2 * E2_e_map) / (2 - E1_i_map - (psi / torch.pi) * E1_e_map))
-    mu0_eff_e_lt_i_at_0 = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * E2_i_map / (2 - E1_i_map))
-    mu_eff_e_lt_i = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * (torch.cos(psi) * E2_i_map + torch.sin(psi / 2)**2 * E2_e_map) / (2 - E1_i_map - (psi / torch.pi) * E1_e_map))
-    mu_eff_e_lt_i_at_0 = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * E2_e_map / (2 - E1_e_map))
+    # Roughness-parametre
+    t = torch.tan(theta_bar)
+    sigma = t * torch.sqrt(torch.tensor(2.0 / math.pi,
+                                        device=mu0.device,
+                                        dtype=mu0.dtype))
 
-    # for each pixel, select the correct effective cosines based on whether i <= e or not
-    mu0_eff = torch.where(i <= e, mu0_eff_i_leq_e, mu0_eff_e_lt_i)
-    mu_eff = torch.where(i <= e, mu_eff_i_leq_e, mu_eff_e_lt_i)
+    if debug:
+        _check_nan_hapke(t,     "t = tan(theta_bar)")
+        _check_nan_hapke(sigma, "sigma")
 
-    # for each pixel, calculate the roughness shadowing factor S
-    S_i_leq_e = mu_eff_i_leq_e / mu_eff_i_leq_e_at_0 * mu0 / mu0_eff_i_leq_e_at_0 * chi / (1 - f_psi + f_psi * chi * (mu0 / mu0_eff_i_leq_e_at_0))
-    S_e_lt_i = mu_eff_e_lt_i / mu_eff_e_lt_i_at_0 * mu0 / mu0_eff_e_lt_i_at_0 * chi / (1 - f_psi + f_psi * chi * (mu / mu_eff_e_lt_i_at_0))
+    # radikanter til sqrt
+    rad0 = 1.0 - mu0**2
+    rad  = 1.0 - mu**2
 
-    S = torch.where(i <= e, S_i_leq_e, S_e_lt_i)
+    # clamp til [0, ∞) for at undgå sqrt(negative)
+    eps = 1e-6 # lille positiv værdi, så vi undgår 0 senere, hvor den er i nævneren
+    rad0_clamped = torch.clamp(rad0, min=eps)
+    rad_clamped  = torch.clamp(rad,  min=eps)
+
+    if debug:
+        _check_nan_hapke(rad0,         "rad0 = 1 - mu0^2 (før clamp)")
+        _check_nan_hapke(rad,          "rad  = 1 - mu^2  (før clamp)")
+        _check_nan_hapke(rad0_clamped, "rad0_clamped")
+        _check_nan_hapke(rad_clamped,  "rad_clamped")
+
+    sqrt0 = torch.sqrt(rad0_clamped)
+    sqrt1 = torch.sqrt(rad_clamped)
+
+    if debug:
+        _check_nan_hapke(sqrt0, "sqrt0 = sqrt(1 - mu0^2)")
+        _check_nan_hapke(sqrt1, "sqrt1 = sqrt(1 - mu^2)")
+
+    # Corrected incidence cosine
+    cos_theta = torch.cos(theta_bar)
+    cos_theta = torch.clamp(cos_theta, min=1e-6)  # undgå 1/0
+
+    factor = (1.0 / cos_theta - 1.0)
+
+    mu0_eff = mu0 * (1.0 + factor * sqrt0)
+    mu0_eff = torch.clamp(mu0_eff, min=0.0, max=1.0)
+
+    # Corrected emission cosine
+    mu_eff = mu * (1.0 + factor * sqrt1)
+    mu_eff = torch.clamp(mu_eff, min=0.0, max=1.0)
+
+    if debug:
+        # Hvis der stadig er NaNs, print lokalt context
+        nan_mask = torch.isnan(mu_eff)
+        if nan_mask.any():
+            idx = torch.nonzero(nan_mask, as_tuple=False)[0]
+            y, x = idx[-2:].tolist() if mu_eff.dim() == 2 else idx[-3:].tolist()[1:]
+            mu_val      = mu[idx]
+            mu0_val     = mu0[idx]
+            theta_val   = theta_bar[idx] if theta_bar.shape == mu.shape else theta_bar
+            rad_val     = rad[idx]
+            rad_cl_val  = rad_clamped[idx]
+            print(
+                "[hapke_roughness DEBUG] NaN i mu_eff ved pixel:\n"
+                f"  index = {idx.tolist()}\n"
+                f"  mu      = {mu_val.item():.6e}\n"
+                f"  mu0     = {mu0_val.item():.6e}\n"
+                f"  theta   = {theta_val.item():.6e} rad\n"
+                f"  rad     = 1 - mu^2 = {rad_val.item():.6e}\n"
+                f"  rad_cl  = {rad_cl_val.item():.6e}\n"
+            )
+            _check_nan_hapke(mu_eff, "mu_eff")
+
+        _check_nan_hapke(mu0_eff, "mu0_eff")
+        _check_nan_hapke(mu_eff,  "mu_eff")
+
+    # Shadowing probability
+    sigma_safe = torch.clamp(sigma, min=1e-6)
+    P0 = 1.0 - torch.exp(- (mu0 / sigma_safe)**2)
+    P  = 1.0 - torch.exp(- (mu  / sigma_safe)**2)
+
+    if debug:
+        _check_nan_hapke(P0, "P0 (shadowing-incidence)")
+        _check_nan_hapke(P,  "P  (shadowing-emission)")
+
+    S = P0 * P + 1e-6
+
+    if debug:
+        _check_nan_hapke(S, "S (shadowing term)")
 
     return mu0_eff, mu_eff, S
 
+
 # ============================================================
-#  Full Hapke Model Class - following the 1994 book
+#  Full Hapke Model Class
 # ============================================================
 
 class FullHapkeModel:
     """
-    Full Hapke model for lunar-surface simulation, following the 1994 book.
+    Full Hapke model for lunar-surface simulation.
     Supports:
       - spatial parameter maps
-      - Opposition effect
+      - SHOE + CBOE
       - 1-term or 2-term HG
       - macroscopic roughness
     """
@@ -320,32 +339,40 @@ class FullHapkeModel:
                  w=0.12,
 
                  # Roughness
-                 theta_bar_rad=math.radians(20),
+                 theta_bar=math.radians(20),
 
-                 # Opposition effect
-                 B0=0.6,
-                 h=0.05,
+                 # SHOE
+                 B0_sh=0.6,
+                 h_sh=0.05,
+
+                 # CBOE
+                 B0_cb=0.2,
+                 h_cb=0.02,
 
                  # Phase function
                  phase_fun="hg2",
-                 xi=0.25,     # only for hg1
-                 b=-0.3,     # for hg2
+                 xi=0.25,     # for hg1
+                 b1=-0.3,     # for hg2
+                 b2=0.2,      # for hg2
                  c=0.7,        # for hg2
 
                  debug: bool = False
                  ):
         
         self.w = w
-        self.theta_bar_rad = theta_bar_rad
+        self.theta_bar = theta_bar
 
-        self.B0 = B0
-        self.h = h
+        self.B0_sh = B0_sh
+        self.h_sh = h_sh
 
+        self.B0_cb = B0_cb
+        self.h_cb = h_cb
 
         self.phase_fun = phase_fun.lower()
         self.xi = xi
 
-        self.b = b
+        self.b1 = b1
+        self.b2 = b2
         self.c = c
 
         self.eps = 1e-12
@@ -387,35 +414,37 @@ class FullHapkeModel:
 
     # ------------------ H-function ------------------
 
-    def _H(self, x, w):
-        x = torch.clamp(x, 0.0, 1.0)
+    def _H(self, mu, w):
+        mu = torch.clamp(mu, 0.0, 1.0)
         w = torch.clamp(w, 1e-6, 1.0-1e-6)
-    
 
-        y = torch.sqrt(1.0 - w) # albedo factor
-        r0 = (1.0 - y) / (1.0 + y) # diffuse reflectance
-        
-        bracket = r0 + (1 - 0.5 * r0 - x * r0) * torch.log((1.0 + x) / x)
-        denom = 1.0 - (1 - y) * x * bracket
-        
+        gamma = torch.sqrt(torch.clamp(1.0 - w, min=1e-6))
+        denom = 1.0 + 2.0 * gamma * mu
         denom = torch.clamp(denom, min=1e-6)
-        return 1 / denom
+        return (1.0 + 2.0 * mu) / denom
 
 
-    # ------------------ Opposition effect ------------------
+    # ------------------ Opposition effects ------------------
 
-    def _B(self, g, B0, h): # g in radians
-        g = torch.clamp(g, 0.0, math.pi - 1e-4)
+    def _B_SH(self, g, B0, h):
+        g = torch.clamp(g, 0.0, math.pi - 1e-3)
         tanh = torch.tan(0.5 * g)
-        h = torch.clamp(h, min=1e-6, max=1.0)
+        h = torch.clamp(h, min=1e-6)
         denom = 1.0 + (1.0 / h) * tanh
         denom = torch.clamp(denom, min=1e-6)
         return B0 / denom
 
+    def _B_CB(self, g, B0, h):
+        g = torch.clamp(g, 0.0, math.pi - 1e-3)
+        tanh = torch.tan(0.5 * g)
+        h = torch.clamp(h, min=1e-6)
+        denom = 1.0 + (tanh / h)**2
+        return B0 / torch.clamp(denom, min=1e-6)
+
 
     # ------------------ Phase functions ------------------
 
-    def _P(self, g, xi=None, b=None, c=None):
+    def _P(self, g, xi=None, b1=None, b2=None, c=None):
         cg = torch.cos(g)
 
         if self.phase_fun == "hg1":
@@ -424,42 +453,11 @@ class FullHapkeModel:
             return (1 - xi**2) / denom**1.5
 
         # 2-term HG
-        denom1 = 1 + 2*b*cg + b**2
-        denom2 = 1 - 2*b*cg + b**2
-        P1 = (1 - b**2) / torch.clamp(denom1, min=1e-6)**1.5
-        P2 = (1 - b**2) / torch.clamp(denom2, min=1e-6)**1.5
-        return (1 - c) * P1 + c * P2
-
-    # compute psi from from i, e, g:
-    
-    def compute_psi_from_g(self, i_rad, e_rad, g_rad):
-        """
-        Compute azimuth difference ψ from i, e, g
-        using Hapke's relation:
-        
-        cos g = cos i cos e + sin i sin e cos ψ
-        """
-        ci = torch.cos(i_rad)
-        ce = torch.cos(e_rad)
-        si = torch.sin(i_rad)
-        se = torch.sin(e_rad)
-
-        # avoid division by zero
-        denom = si * se
-        zero_mask = denom == 0
-
-        # normal case
-        cos_psi = (torch.cos(g_rad) - ci * ce) / denom
-
-        # clamp for numerical safety
-        cos_psi = torch.clamp(cos_psi, -1.0, 1.0)
-
-        psi = torch.acos(cos_psi)
-
-        # if i=0 or e=0, define psi = 0
-        psi = torch.where(zero_mask, torch.zeros_like(psi), psi)
-
-        return psi
+        denom1 = 1 + 2*b1*cg + b1**2
+        denom2 = 1 + 2*b2*cg + b2**2
+        P1 = (1 - b1**2) / torch.clamp(denom1, min=1e-6)**1.5
+        P2 = (1 - b2**2) / torch.clamp(denom2, min=1e-6)**1.5
+        return c * P1 + (1 - c) * P2
 
 
 
@@ -467,44 +465,39 @@ class FullHapkeModel:
     #  Main: Radiance factor I/F
     # ============================================================
 
-    def radiance_factor(self, mu0, mu, g_rad, e_rad, i_rad):
+    def radiance_factor(self, mu0, mu, g):
         # Convert inputs to tensors
         if not isinstance(mu0, torch.Tensor): mu0 = torch.tensor(mu0)
         if not isinstance(mu, torch.Tensor):  mu = torch.tensor(mu)
-        if not isinstance(g_rad, torch.Tensor):   g_rad = torch.tensor(g_rad)
-        if not isinstance(e_rad, torch.Tensor):   e_rad = torch.tensor(e_rad)
-        if not isinstance(i_rad, torch.Tensor):   i_rad = torch.tensor(i_rad)
+        if not isinstance(g, torch.Tensor):   g = torch.tensor(g)
 
-        # Broadcast to common shape
-        mu0, mu, g_rad, e_rad, i_rad = torch.broadcast_tensors(mu0, mu, g_rad, e_rad, i_rad)
-        mu0 = mu0.to(g_rad.device).float()
-        mu  = mu.to(g_rad.device).float()
-        g_rad   = g_rad.to(g_rad.device).float()
-        e_rad   = e_rad.to(g_rad.device).float()
-        i_rad   = i_rad.to(g_rad.device).float()
-
+        mu0, mu, g = torch.broadcast_tensors(mu0, mu, g)
+        mu0 = mu0.to(g.device).float()
+        mu  = mu.to(g.device).float()
 
         if self.debug:
             # --- Debug: check inputs ---
             self._check_nan(mu0, "mu0 (input)")
             self._check_nan(mu,  "mu (input)")
-            self._check_nan(g_rad,   "g_rad (input)")
-            self._check_nan(e_rad,   "e_rad (input)")
-            self._check_nan(i_rad,   "i_rad (input)")
+            self._check_nan(g,   "g (input)")
 
 
         # Map support
         w      = self._to_tensor(self.w, mu0)
-        theta_bar_rad  = self._to_tensor(self.theta_bar_rad, mu0)
-        B0  = self._to_tensor(self.B0, mu0)
-        h   = self._to_tensor(self.h,  mu0)
+        theta  = self._to_tensor(self.theta_bar, mu0)
+        B0_sh  = self._to_tensor(self.B0_sh, mu0)
+        h_sh   = self._to_tensor(self.h_sh,  mu0)
+        B0_cb  = self._to_tensor(self.B0_cb, mu0)
+        h_cb   = self._to_tensor(self.h_cb,  mu0)
 
         if self.debug:
             # Debug parameter maps
             self._check_nan(w,     "w (albedo map)")
-            self._check_nan(theta_bar_rad, "theta_bar_rad (roughness map)")
-            self._check_nan(B0, "B0")
-            self._check_nan(h,  "h")
+            self._check_nan(theta, "theta_bar (roughness map)")
+            self._check_nan(B0_sh, "B0_sh")
+            self._check_nan(h_sh,  "h_sh")
+            self._check_nan(B0_cb, "B0_cb")
+            self._check_nan(h_cb,  "h_cb")
 
 
         # Phase params
@@ -512,13 +505,13 @@ class FullHapkeModel:
             xi = self._to_tensor(self.xi, mu0)
             phase_params = {"xi": xi}
         else:
-            b = self._to_tensor(self.b, mu0)
+            b1 = self._to_tensor(self.b1, mu0)
+            b2 = self._to_tensor(self.b2, mu0)
             c  = self._to_tensor(self.c,  mu0)
-            phase_params = {"b": b, "c": c}
+            phase_params = {"b1": b1, "b2": b2, "c": c}
 
         # ---------------- Roughness ----------------
-        psi_rad = self.compute_psi_from_g(i_rad, e_rad, g_rad)
-        mu0_eff, mu_eff, S = hapke_roughness(mu0, mu, i_rad, e_rad, psi_rad, theta_bar_rad, debug=self.debug)
+        mu0_eff, mu_eff, S = hapke_roughness(mu0, mu, g, theta, debug=self.debug)
 
         if self.debug:
             # Debug efter roughness
@@ -530,26 +523,30 @@ class FullHapkeModel:
         denom = torch.clamp(mu0_eff + mu_eff, min=self.eps)
 
         # Phase + opposition effects
-        P = self._P(g_rad, **phase_params)
-        B = self._B(g_rad, B0, h)
+        P = self._P(g, **phase_params)
+        Bsh = self._B_SH(g, B0_sh, h_sh)
+        Bcb = self._B_CB(g, B0_cb, h_cb)
+        Btot = Bsh + Bcb
 
         if self.debug:
             # Debug efter fase + opposition
             self._check_nan(P,     "P (phase function)")
-            self._check_nan(B,  "B (opposition)")
+            self._check_nan(Bsh,  "B_SH (opposition)")
+            self._check_nan(Bcb,  "B_CB (opposition)")
+            self._check_nan(Btot, "Btot (B_SH + B_CB)")
 
 
-        # H-functions use roughened incident/emission cosines
+        # H-functions use *unroughened* incident/emission
         H0 = self._H(mu0_eff, w)
         H  = self._H(mu_eff,  w)
 
         # --------- Bi-directional reflectance r(i,e,g) ---------
-        r = (w / (4*math.pi)) * (mu0_eff / denom) * ((1 + B)*P + H0*H - 1)
+        r = (w / (4*math.pi)) * (mu0_eff / denom) * ((1 + Btot)*P + H0*H - 1)
 
         # Apply roughness shadowing
         r = S * r
 
-        # Radiance factor I/F = π * r 
+        # Radiance factor I/F = π * r
         R = math.pi * r
         R = torch.clamp(R, min=0.0)
 
