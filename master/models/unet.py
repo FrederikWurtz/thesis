@@ -28,7 +28,7 @@ class MetaEncoder(nn.Module):
     def __init__(self, meta_dim=5, num_images=5, hidden_dim=64, out_dim=128):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(meta_dim * num_images, hidden_dim),  # 25 -> 64
+            nn.Linear(meta_dim * num_images, hidden_dim),  # 5*5=25 -> 64
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, out_dim),  # 64 -> 128
             nn.ReLU(inplace=True)
@@ -50,9 +50,7 @@ class FiLMLayer(nn.Module):
     def forward(self, x, cond):
         gamma = self.gamma_fc(cond).unsqueeze(-1).unsqueeze(-1)
         beta = self.beta_fc(cond).unsqueeze(-1).unsqueeze(-1)
-        return gamma * x + beta
-
-
+        return (1 + gamma) * x + beta
 
 class DoubleConv(nn.Module):
     def __init__(self, in_ch, out_ch, norm="group", num_groups=8):
@@ -84,6 +82,8 @@ class DoubleConv(nn.Module):
             norm_layer2,
             nn.ReLU(inplace=True),
         )
+
+
 
 
 class FinalLearnedUpsample(nn.Module):
@@ -140,8 +140,8 @@ class FinalLearnedUpsample(nn.Module):
 #             nn.ReLU(inplace=True),
 #         )
 
-    def forward(self, x):
-        return self.block(x)
+#     def forward(self, x):
+#         return self.block(x)
 
 
 class UNet(nn.Module):
@@ -207,4 +207,149 @@ class UNet(nn.Module):
         return x
 
 
-__all__ = ['UNet']
+class DoubleConvFiLM(nn.Module):
+    def __init__(self, in_ch, out_ch, norm="group", num_groups=8, cond_dim=None):
+        super().__init__()
+
+        if norm == "batch":
+            norm_layer1 = nn.BatchNorm2d(out_ch)
+            norm_layer2 = nn.BatchNorm2d(out_ch)
+        elif norm == "group":
+            assert out_ch % num_groups == 0
+            norm_layer1 = nn.GroupNorm(num_groups, out_ch)
+            norm_layer2 = nn.GroupNorm(num_groups, out_ch)
+        elif norm == "instance":
+            norm_layer1 = nn.InstanceNorm2d(out_ch, affine=True)
+            norm_layer2 = nn.InstanceNorm2d(out_ch, affine=True)
+        elif norm is None:
+            norm_layer1 = nn.Identity()
+            norm_layer2 = nn.Identity()
+        else:
+            raise ValueError(norm)
+
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.norm1 = norm_layer1
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.norm2 = norm_layer2
+
+        self.film = FiLMLayer(out_ch, cond_dim)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x, cond): # FiLM conditioning on the meta-encoded vector, named "cond" here
+        x = self.relu(self.norm1(self.conv1(x)))
+        x = self.norm2(self.conv2(x))
+        x = self.film(x, cond)
+        x = self.relu(x)
+        return x
+
+
+class UNetFullFiLM(nn.Module):
+    def __init__(self, in_channels=None, out_channels=3, features=(64, 128, 256, 512), 
+                 meta_dim=5, meta_hidden=64, meta_out=128, upsample_factor=4, w_range=None, theta_range=None, norm="batch", num_groups=8):
+        super().__init__()
+        self.upsample_factor = upsample_factor
+        self.w_range = w_range
+        self.theta_range = theta_range
+        self.encs = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        ch = in_channels
+        for f in features:
+            self.encs.append(
+                DoubleConvFiLM(
+                    in_ch=ch,
+                    out_ch=f,
+                    norm=norm,
+                    num_groups=num_groups,
+                    cond_dim=meta_out,
+                )
+            )
+            self.pools.append(nn.MaxPool2d(2))
+            ch = f
+        self.bottleneck_conv = DoubleConvFiLM(
+            features[-1],
+            features[-1] * 2,
+            norm=norm,
+            num_groups=num_groups,
+            cond_dim=meta_out,
+        )
+        self.upconvs = nn.ModuleList()
+        self.decs = nn.ModuleList()
+        self.meta_encoder = MetaEncoder(meta_dim=meta_dim, num_images=in_channels, hidden_dim=meta_hidden, out_dim=meta_out)
+        ch = features[-1] * 2
+        for f in reversed(features):
+            self.upconvs.append(nn.ConvTranspose2d(ch, f, kernel_size=2, stride=2, bias=False))
+            self.decs.append(
+                DoubleConvFiLM(
+                    in_ch=ch,
+                    out_ch=f,
+                    norm=norm,
+                    num_groups=num_groups,
+                    cond_dim=meta_out,
+                )
+            )
+            ch = f
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+        self.final_upsample = FinalLearnedUpsample(out_channels, upsample_factor=upsample_factor, norm=norm, num_groups=num_groups) # allow a learned final upsampling instead of fixed bilinear - this is important for the 4x upsampling to get to the original resolution!
+        # self.final_upsample = nn.Upsample(scale_factor=upsample_factor, mode='bilinear', align_corners=False)
+
+
+def forward(self, x, meta):
+    skips = []
+
+    # Encode metadata ONCE
+    meta_encoded = self.meta_encoder(meta)
+
+    # Encoder (FiLM everywhere)
+    for enc, pool in zip(self.encs, self.pools):
+        x = enc(x, meta_encoded)
+        skips.append(x)
+        x = pool(x)
+
+    # Bottleneck (FiLM)
+    x = self.bottleneck_conv(x, meta_encoded)
+
+    # Decoder (FiLM)
+    for up, dec, skip in zip(self.upconvs, self.decs, reversed(skips)):
+        x = up(x)
+
+        if x.size(-1) != skip.size(-1) or x.size(-2) != skip.size(-2):
+            x = F.interpolate(
+                x,
+                size=skip.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        x = torch.cat([skip, x], dim=1)
+        x = dec(x, meta_encoded)
+
+    # Output
+    x = self.final_conv(x)
+    x = self.final_upsample(x)
+
+    # Physical constraints
+    if (
+        self.final_conv.out_channels == 3
+        and self.w_range is not None
+        and self.theta_range is not None
+    ):
+        dem = x[:, 0:1]
+
+        w = (
+            torch.sigmoid(x[:, 1:2])
+            * (self.w_range[1] - self.w_range[0])
+            + self.w_range[0]
+        )
+
+        theta = (
+            torch.sigmoid(x[:, 2:3])
+            * (self.theta_range[1] - self.theta_range[0])
+            + self.theta_range[0]
+        )
+
+        x = torch.cat([dem, w, theta], dim=1)
+
+    return x
+
+
+__all__ = ['UNet', 'MetaEncoder', 'FiLMLayer', 'DoubleConv', 'FinalLearnedUpsample', 'DoubleConvFiLM', 'UNetFullFiLM']
