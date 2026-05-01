@@ -18,7 +18,7 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import destroy_process_group
-from master.train.trainer_new import Trainer, ddp_setup, load_train_objs, prepare_dataloader, is_main
+from master.train.trainer_new import Trainer_singleGPU, load_train_objs, prepare_dataloader, is_main #, ddp_setup,
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 
 import matplotlib.pyplot as plt
@@ -42,9 +42,8 @@ def plot_output_target(output, target, figsize=(10,5), show_plot=True):
 
 def main(run_dir: str, config_override_file: str = None):
 
-    ddp_setup()
-
-    os.environ['OMP_NUM_THREADS'] = '2'  # Set number of OpenMP threads
+    # ddp_setup()
+    # os.environ['OMP_NUM_THREADS'] = '2'  # Set number of OpenMP threads
     
     sup_dir = "./runs"
     run_path = os.path.join(sup_dir, run_dir)
@@ -78,7 +77,7 @@ def main(run_dir: str, config_override_file: str = None):
                                     prefetch_factor=config["PREFETCH_FACTOR"])
     
 
-    trainer = Trainer(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader)
+    trainer = Trainer_singleGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader)
 
 
     for batch_idx, (images, reflectance_maps, targets, metas) in enumerate(trainer.train_data):

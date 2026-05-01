@@ -168,7 +168,10 @@ def main(argv=None):
             torch.manual_seed(base_seed - 1) # -1 to differ from training seed
             np.random.seed((base_seed - 1) % (2**32 - 1)) # -1 to differ from training seed
             # create validation files
-            print(f"Using alternative val/test parameters for validation: {config['USE_SEPARATE_VALTEST_PARS']}")
+            print(f"Using alternative val/test parameters for validation and test dataset generation: {config['USE_SEPARATE_VALTEST_PARS']}")
+            config['NOW_VAL'] = True # ensure validation parameters are used for val set generation
+            config['NOW_TEST'] = False # ensure test parameters are not used for val set generation
+            print(f"Using validation parameters: {config['NOW_VAL']}",".", f"Using test parameters: {config['NOW_TEST']}")
             generate_and_save_data_pooled_multi_gpu(config, images_dir=val_path, n_dems=config["FLUID_VAL_DEMS"])
             gc.collect() # free up memory
             # also calculate and save mean reflectance map over validation set
@@ -185,6 +188,9 @@ def main(argv=None):
             # also set different seed for test set generation
             torch.manual_seed(base_seed - 10) # -10 to differ from training seed
             np.random.seed((base_seed - 10) % (2**32 - 1)) # -10 to differ from training seed
+            config['NOW_VAL'] = False # ensure validation parameters are not used for test set generation
+            config['NOW_TEST'] = True # ensure test parameters are used for test set generation
+            print(f"Using validation parameters: {config['NOW_VAL']}",".", f"Using test parameters: {config['NOW_TEST']}")
             generate_and_save_data_pooled_multi_gpu(config, images_dir=test_path, n_dems=config["FLUID_TEST_DEMS"])
             gc.collect() # free up memory
             print("Dataset generation complete.\n")
@@ -195,11 +201,13 @@ def main(argv=None):
             # plot LRO sampling distributions for val and test sets
             # ensure "USE_SEPARATE_VALTEST_PARS" is False, as we now want to use training set parameters
             config["USE_SEPARATE_VALTEST_PARS"] = False
-            print(f"Using alternative val/test parameters for training: {config['USE_SEPARATE_VALTEST_PARS']}")
+            config["NOW_VAL"] = False # ensure validation parameters are not used for training set generation
+            config["NOW_TEST"] = False # ensure test parameters are not used for training set generation
+            print(f"Using alternative val/test parameters for training dataset generation: {config['USE_SEPARATE_VALTEST_PARS']}")
             # reset seeds for training data generation - only used to plot LRO sampling distributions
             torch.manual_seed(base_seed) 
             np.random.seed(base_seed % (2**32 - 1))
-            train_path = os.path.join(run_path, 'train_temp')
+            train_path = os.path.join(run_path, 'train')
             os.makedirs(train_path, exist_ok=True)
             generate_and_save_data_pooled_multi_gpu(config, images_dir=train_path, n_dems=config["FLUID_TRAIN_DEMS"])
             gc.collect() # free up memory
@@ -210,7 +218,8 @@ def main(argv=None):
                 "master/validate/plot_lro_sampling.py",
                 run_dir,
                 "val",
-                "train_temp"
+                "train",
+                "test"
             ]
             subprocess.run(cmd, env=env)
 

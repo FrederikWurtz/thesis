@@ -66,14 +66,19 @@ class Renderer:
         
         # Compute view vectors (normalized)
         view_vectors = camera_pos - self.dem.world_points
-        view_vectors = view_vectors / torch.norm(view_vectors, dim=1, keepdim=True)
+        
+        norm = torch.norm(view_vectors, dim=1, keepdim=True).clamp_min(1e-8)
+        view_vectors = view_vectors / norm
         
         # Flatten normals
         normals_flat = torch.stack([self.dem.nx.flatten(), self.dem.ny.flatten(), self.dem.nz.flatten()], dim=1)
         
+        eps = 1e-6
         # Compute cosine of incidence and emission angles
         mu = (normals_flat * view_vectors).sum(dim=1).reshape(self.dem.dem.shape)
+        mu_safe = torch.clamp(mu, -1.0 + eps, 1.0 - eps)
         mu0 = (normals_flat * sun_vec).sum(dim=1).reshape(self.dem.dem.shape)
+        mu0_safe = torch.clamp(mu0, -1.0 + eps, 1.0 - eps)
                 
         # Lambertian model (early return)
         if self.model.name == "lambertian":
@@ -87,22 +92,17 @@ class Renderer:
             raise ValueError("Unknown model. Use 'HapkeModel' or 'FullHapkeModel' or 'LambertianModel'.")
         
         # Hapke model: compute phase angle
+        eps = 1e-6
         cos_g = (view_vectors * sun_vec).sum(dim=1)
-        cos_g = torch.clamp(cos_g, -1, 1)
+        cos_g = torch.clamp(cos_g, -1.0 + eps, 1.0 - eps)
         g_rad = torch.acos(cos_g).reshape(self.dem.dem.shape)
         
         # compute incidence, emission and psi angles for Hapke model
-        e_rad = torch.acos(torch.clamp(mu, -1, 1)).reshape(self.dem.dem.shape) # shape is (H*W,)
-        i_rad = torch.acos(torch.clamp(mu0, -1, 1)).reshape(self.dem.dem.shape) # shape is (H*W,)
-        
-        # Compute azimuth difference for psi angle
-        sun_az_rad = torch.deg2rad(torch.tensor(sun_az_deg, dtype=torch.float32, device=self.device))
-        cam_az_rad = torch.deg2rad(torch.tensor(camera_az_deg, dtype=torch.float32, device=self.device))
-        psi_rad = torch.abs(sun_az_rad - cam_az_rad)
-        psi_rad_map = psi_rad * torch.ones_like(g_rad)  # Same psi for all pixels, since sun az and camera az are constant over the DEM
+        e_rad = torch.acos(mu_safe).reshape(self.dem.dem.shape) # shape is (H*W,)
+        i_rad = torch.acos(mu0_safe).reshape(self.dem.dem.shape) # shape is (H*W,)
 
         # Compute Hapke reflectance
-        R = self.model.radiance_factor(mu0, mu, g_rad, e_rad, i_rad, psi_rad_map)
+        R = self.model.radiance_factor(mu0, mu, g_rad, e_rad, i_rad)
         
         # Compute and apply shadow map
         shadow_map = Renderer.compute_shadow_map(

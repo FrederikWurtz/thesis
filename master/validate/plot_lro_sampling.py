@@ -14,11 +14,10 @@ import rasterio
 from torch.utils.data import Dataset, DataLoader
 
 from master.models.unet import UNet
-from master.train.trainer_core import DEMDataset, FluidDEMDataset
 from master.train.train_utils import normalize_inputs
 from master.train.checkpoints import load_checkpoint, read_file_from_ini
 from master.configs.config_utils import load_config_file
-from master.train.trainer_new import load_train_objs, prepare_dataloader
+from master.train.trainer_core import load_train_objs, prepare_dataloader
 
 def precompute_lowres_DEM(
     input_tif,
@@ -386,9 +385,160 @@ def plot_two_lro_metadata_distributions(data_dir1, data_folder1, data_dir2, data
 
     plt.suptitle(f"LRO Metadata Distributions: {data_folder} vs {second_data_folder}", fontsize=18)
     
-    filename = "lro_meta_distributions_" + data_folder + "_vs_" + second_data_folder + ".pdf"
+    filename = "lro_metadata_distributions_" + data_folder + "_vs_" + second_data_folder + ".pdf"
     os.makedirs(figures_dir, exist_ok=True)
     save_path =  os.path.join(figures_dir, filename)
+    plt.savefig(save_path)
+    print(f"Saved LRO metadata distributions to {save_path}.")
+    plt.close()
+
+
+def plot_three_lro_metadata_distributions(
+    data_dir1,
+    data_folder1,
+    data_dir2,
+    data_folder2,
+    data_dir3,
+    data_folder3,
+    figures_dir,
+):
+    all_lro_meta_1 = None
+    all_lro_meta_2 = None
+    all_lro_meta_3 = None
+
+    for i, data_dir in enumerate([data_dir1, data_dir2, data_dir3]):
+        # check that data directory exists
+        if not os.path.exists(data_dir):
+            raise FileNotFoundError(f"Data directory {data_dir} does not exist.")
+
+        print(f"Loading data from {data_dir}...")
+
+        # Look for .pt files in the test_dems folder
+        candidate_files = sorted(glob.glob(os.path.join(data_dir, '*.pt')))
+        if len(candidate_files) > 0:
+            test_files = candidate_files
+            print(f"Using {len(test_files)} test files from: {data_dir}")
+        else:
+            print(f"Found '{data_dir}' but no .pt files were present. Falling back to history['test_files'].")
+
+        # loop through files and extract lro_meta information
+        all_lro_meta = []
+        for file_path in test_files:
+            data = torch.load(file_path)
+            if 'lro_meta' in data:
+                lro_meta = data['lro_meta'].numpy()
+                all_lro_meta.append(lro_meta)
+            else:
+                raise KeyError(f"'lro_meta' not found in file {file_path}.")
+
+        if i == 0:
+            all_lro_meta_1 = np.array(all_lro_meta)
+        elif i == 1:
+            all_lro_meta_2 = np.array(all_lro_meta)
+        else:
+            all_lro_meta_3 = np.array(all_lro_meta)
+
+    # Create plot like big_ax above - but without the histograms!
+    fig = plt.figure(figsize=(12, 6))
+    ax_big = fig.add_subplot(1, 1, 1)
+    ax_big.set_title('Locations sampled', fontsize=16)
+    ax_big.set_xlabel('Longitude (°)')
+    ax_big.set_ylabel('Latitude (°)')
+
+    # Moon mean radius in meters
+    MOON_RADIUS_M = 1737400.0
+    # Example usage:
+    moon_tif_file = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
+    downsample_factor = 100
+    moon_tif_downsampled = f"master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_downsampled_{downsample_factor}x.tif"
+
+    if not os.path.exists(moon_tif_downsampled):
+        print(f"Generating downsampled DEM with factor {downsample_factor} for fast plotting...")
+        generate_downsampled_DEM(moon_tif_file, moon_tif_downsampled, downsample_factor=downsample_factor)
+    else:
+        print(f"Downsampled DEM exists at {moon_tif_downsampled}")
+
+    try:
+        with rasterio.open(moon_tif_downsampled) as src:
+            moon_img = src.read(1).astype(np.float32)
+            valid = ~np.isnan(moon_img)
+            if np.any(valid):
+                moon_img[valid] -= np.nanmin(moon_img[valid])
+                max_val = np.nanmax(moon_img[valid])
+                if max_val > 0:
+                    moon_img[valid] /= max_val
+                else:
+                    print("Warning: max_val is 0 after normalization.")
+            else:
+                print("Warning: No valid data in DEM!")
+            left, bottom, right, top = src.bounds
+            ax_big.imshow(
+                moon_img,
+                cmap='gray',
+                extent=[left, right, bottom, top],
+                origin='upper',
+                alpha=0.7,
+                zorder=0
+            )
+    except Exception as e:
+        print(f"Could not load background TIFF: {e}")
+
+    import matplotlib.patches as mpatches
+
+    # Plot rectangles for each dataset
+    for all_lro_meta, color, name in zip(
+        [all_lro_meta_1, all_lro_meta_2, all_lro_meta_3],
+        ['red', 'blue', 'green'],
+        [data_folder1, data_folder2, data_folder3],
+    ):
+        for meta in all_lro_meta:
+            lat_c = meta[0]
+            lon_c = meta[1]
+            box_radius_m = meta[2]
+            # Compute box size in degrees
+            dlat_deg = (box_radius_m / MOON_RADIUS_M) * (180.0 / np.pi)
+            cos_lat = np.cos(np.deg2rad(lat_c))
+            if np.abs(cos_lat) < 1e-6:
+                dlon_deg = 0.0
+            else:
+                dlon_deg = (box_radius_m / (MOON_RADIUS_M * cos_lat)) * (180.0 / np.pi)
+            lon_ll = lon_c - dlon_deg
+            lat_ll = lat_c - dlat_deg
+            width = 2 * dlon_deg
+            height = 2 * dlat_deg
+            rect = mpatches.Rectangle(
+                (lon_ll, lat_ll), width, height,
+                linewidth=0, edgecolor='none', facecolor=color, alpha=0.5
+            )
+            ax_big.add_patch(rect)
+
+    ax_big.set_xlim([-180, 180])
+    ax_big.set_ylim([-90, 90])
+
+    # Add legend
+    legend_patches = [
+        mpatches.Patch(color='red', label=data_folder1),
+        mpatches.Patch(color='blue', label=data_folder2),
+        mpatches.Patch(color='green', label=data_folder3),
+    ]
+    ax_big.legend(handles=legend_patches, loc='upper right')
+
+    plt.suptitle(
+        f"LRO Metadata Distributions: {data_folder1} vs {data_folder2} vs {data_folder3}",
+        fontsize=18,
+    )
+
+    filename = (
+        "lro_meta_distributions_"
+        + data_folder1
+        + "_vs_"
+        + data_folder2
+        + "_vs_"
+        + data_folder3
+        + ".pdf"
+    )
+    os.makedirs(figures_dir, exist_ok=True)
+    save_path = os.path.join(figures_dir, filename)
     plt.savefig(save_path)
     print(f"Saved LRO metadata distributions to {save_path}.")
     plt.close()
@@ -404,6 +554,8 @@ if __name__ == "__main__":
                       help='Directory containing data to analyze.')
     args.add_argument('second_data_folder', nargs="?" , type=str,
                       help='Second directory containing data to analyze.')
+    args.add_argument('third_data_folder', nargs="?" , type=str,
+                      help='Third directory containing data to analyze.')
     args.add_argument('--variant', type=str, default='first',
                       help="Variant for selecting test sets: 'first' or 'random'.")
     args.add_argument('--use_train_set', action='store_true',
@@ -423,7 +575,14 @@ if __name__ == "__main__":
     # Call the function with parsed arguments
     if not args.second_data_folder:
         plot_lro_metadata_distributions(data_dir, data_folder, figures_dir)
-    else:
+    elif args.second_data_folder and not args.third_data_folder:
         second_data_folder = args.second_data_folder
         data_dir2 = os.path.join("runs", run_dir, second_data_folder)
         plot_two_lro_metadata_distributions(data_dir, data_folder, data_dir2, second_data_folder, figures_dir)
+    else:        
+        second_data_folder = args.second_data_folder
+        data_dir2 = os.path.join("runs", run_dir, second_data_folder) 
+        third_data_folder = args.third_data_folder
+        data_dir3 = os.path.join("runs", run_dir, third_data_folder)
+        plot_three_lro_metadata_distributions(data_dir, data_folder, data_dir2, second_data_folder, data_dir3, third_data_folder, figures_dir)
+    

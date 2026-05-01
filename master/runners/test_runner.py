@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.
 
 from torch.distributed import destroy_process_group
 from master.train.trainer_new import Trainer_multiGPU, Trainer_multiGPU_multi_band, Trainer_singleGPU
-from master.train.trainer_core import ddp_setup, load_train_objs, prepare_dataloader, is_main
+from master.train.trainer_core import ddp_setup, prepare_dataloader, is_main, load_train_objs
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 from master.configs.config_utils import load_config_file
 
@@ -51,7 +51,7 @@ def main(run_dir: str, test_on_separate_data: bool):
     train_mean = torch.tensor(float(input_stats["MEAN"]))
     train_std = torch.tensor([float(input_stats["STD"])])   
 
-    train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path)
+    train_set, val_set, test_set, model, optimizer, scheduler = load_train_objs(config, run_path)
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
                                     num_workers=config["NUM_WORKERS_DATALOADER"], 
                                     prefetch_factor=config["PREFETCH_FACTOR"],
@@ -110,9 +110,9 @@ def main(run_dir: str, test_on_separate_data: bool):
             if test_on_separate_data:
                 test_loss_dir = os.path.join(run_path, 'stats', 'alt_test_results.ini')
             save_file_as_ini({'TEST_LOSS': float(global_test_loss), 
-                              'DEM_AME': float(dem_ame), 
-                              'W_AME': float(w_ame), 
-                              'THETA_AME': float(theta_ame)}, test_loss_dir)
+                              'TEST_DEM_AME': float(dem_ame), 
+                              'TEST_W_AME': float(w_ame), 
+                              'TEST_THETA_AME': float(theta_ame)}, test_loss_dir)
             print("Test results saved.")
             print("Cleaning up...")
     else:

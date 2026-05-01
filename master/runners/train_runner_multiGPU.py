@@ -66,6 +66,12 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
                 if is_main():
                     print(f"Cleared checkpoint directory: {checkpoint_dir}")
 
+    checkpoint_dir = os.path.join(run_path, 'checkpoints')
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+        if is_main():
+            print(f"Created checkpoint directory: {checkpoint_dir}")
+
     snapshot_path = os.path.join(run_path, 'checkpoints', 'snapshot.pt')
     mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
     input_stats = read_file_from_ini(mean_std_path)
@@ -127,13 +133,12 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
 
     print("Training complete.")
     print("Testing on test dataset...")
-    global_test_loss, global_ame = trainer.test()
+    global_test_loss, (global_dem_ame, global_w_ame, global_theta_ame) = trainer.test()
     
     test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
-    save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_AME': float(global_ame)}, test_loss_dir)
-    print(f"Test Loss: {global_test_loss:.6f}, Test AME: {global_ame:.6f}")
+    save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_DEM_AME': float(global_dem_ame), 'TEST_W_AME': float(global_w_ame), 'TEST_THETA_AME': float(global_theta_ame)}, test_loss_dir)
+    print(f"Test Loss: {global_test_loss:.6f}, Test DEM AME: {global_dem_ame:.6f}, Test W AME: {global_w_ame:.6f}, Test Theta AME: {global_theta_ame:.6f}")
     print("Test results saved.")
-
     run_plot(run_dir)
 
     t1_main = time.time()

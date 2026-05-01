@@ -36,7 +36,7 @@ def _render_shading_batched(dem_tensor_flat, meta_flat, camera, hapke_model_or_p
         if is_spatial:
             w_map = hapke_model_or_params['w'][i]  # [H, W]
             theta_map = hapke_model_or_params['theta_bar'][i]  # [H, W]
-            hapke_model = FullHapkeModel(w=w_map, theta_bar=theta_map, debug=debug)
+            hapke_model = FullHapkeModel(w=w_map, theta_bar_rad=theta_map, debug=debug)
         else:
             hapke_model = hapke_model_or_params  # Reuse shared model
         
@@ -53,8 +53,7 @@ def _render_shading_batched(dem_tensor_flat, meta_flat, camera, hapke_model_or_p
             sun_el_deg=sun_el,
             camera_az_deg=cam_az,
             camera_el_deg=cam_el,
-            camera_distance_from_center=cam_dist,
-            model="hapke"
+            camera_distance_from_center=cam_dist
         )
         
         refl_map = renderer.reflectance_map
@@ -65,7 +64,7 @@ def _render_shading_batched(dem_tensor_flat, meta_flat, camera, hapke_model_or_p
     return reflectance_flat
 
 
-def compute_reflectance_map_from_dem(dem_tensor, meta, device, camera_params, hapke_params):
+def compute_reflectance_map_from_dem(dem_tensor, meta, device, camera_params, hapke_params, debug=False):
     """
     Compute reflectance map from a DEM tensor using physics-based rendering.
     GPU-OPTIMIZED: Batched processing to maximize parallelization and GPU utilization.
@@ -116,7 +115,7 @@ def compute_reflectance_map_from_dem(dem_tensor, meta, device, camera_params, ha
     meta_expanded = meta.reshape(B * 5, 5)  # [B*5, 5]
     
     # Render all B*5 (dem, viewpoint) pairs in batch using shared Camera/HapkeModel
-    reflectance_flat = _render_shading_batched(dem_expanded, meta_expanded, camera, hapke_model, device)
+    reflectance_flat = _render_shading_batched(dem_expanded, meta_expanded, camera, hapke_model, device, debug=debug)  # [B*5, H, W]
     
     # Reshape back to [B, 5, H, W]
     reflectance_maps = reflectance_flat.reshape(B, 5, H, W)
@@ -155,19 +154,76 @@ def compute_reflectance_map_from_dem_multi_band(dem_tensor, meta, device, camera
     return reflectance_maps
 
 
-def compute_gradients(tensor):
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                            dtype=tensor.dtype, device=tensor.device).view(1, 1, 3, 3)
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                            dtype=tensor.dtype, device=tensor.device).view(1, 1, 3, 3)
-    
-    grad_x = F.conv2d(tensor, sobel_x, padding=1)
-    grad_y = F.conv2d(tensor, sobel_y, padding=1)
-    grad_magnitude = torch.sqrt(grad_x**2 + grad_y**2 + 1e-8)
-    return grad_magnitude
+def compute_gradients(tensor: torch.Tensor, spacing=(1.0, 1.0)) -> torch.Tensor:
+    """
+    Compute per-pixel gradient magnitude using torch.gradient.
+
+    Accepts input shaped either [B, 1, H, W] or [B, H, W].
+    Returns the gradient magnitude with the same batch/channel layout
+    (i.e., [B, 1, H, W] for [B,1,H,W] input).
+    Args:
+        tensor: input DEM tensor
+        spacing: tuple (dy, dx) specifying grid spacing (default: 1.0, 1.0)
+    """
+    # Normalize shapes to [B, H, W]
+    if tensor.ndim == 4 and tensor.shape[1] == 1:
+        vals = tensor[:, 0]
+        keep_channel = True
+    elif tensor.ndim == 3:
+        vals = tensor
+        keep_channel = False
+    else:
+        raise ValueError(
+            f"compute_gradients: expected shape [B,1,H,W] or [B,H,W], got {tuple(tensor.shape)}"
+        )
+
+    # Compute derivatives along (rows, cols) -> (dy, dx)
+    dy, dx = torch.gradient(vals, spacing=spacing, dim=(-2, -1))
+
+    # Magnitude with small epsilon for numerical stability
+    grad_mag = torch.sqrt(dx * dx + dy * dy + 1e-8)
+
+    # Restore channel dimension if input had one
+    if keep_channel:
+        grad_mag = grad_mag.unsqueeze(1)
+
+    return grad_mag
+
+def compute_spatial_gradients(tensor: torch.Tensor, spacing=(1.0, 1.0)) -> torch.Tensor:
+    """
+    Compute per-pixel gradient magnitude using torch.gradient.
+
+    Accepts input shaped either [B, 1, H, W] or [B, H, W].
+    Returns the gradient magnitude with the same batch/channel layout
+    (i.e., [B, 1, H, W] for [B,1,H,W] input).
+    Args:
+        tensor: input DEM tensor
+        spacing: tuple (dy, dx) specifying grid spacing (default: 1.0, 1.0)
+    """
+    # Normalize shapes to [B, H, W]
+    if tensor.ndim == 4 and tensor.shape[1] == 1:
+        vals = tensor[:, 0]
+        keep_channel = True
+    elif tensor.ndim == 3:
+        vals = tensor
+        keep_channel = False
+    else:
+        raise ValueError(
+            f"compute_spatial_gradients: expected shape [B,1,H,W] or [B,H,W], got {tuple(tensor.shape)}"
+        )
+
+    # Compute derivatives along (rows, cols) -> (dy, dx)
+    dy, dx = torch.gradient(vals, spacing=spacing, dim=(-2, -1))
+
+    # Restore channel dimension if input had one
+    if keep_channel:
+        dx = dx.unsqueeze(1)
+        dy = dy.unsqueeze(1)
+
+    return dx, dy
 
 def calculate_total_loss(outputs, targets, target_reflectance_maps, meta, hapke_params=None, device=None,
-                        camera_params=None, w_mse=1.0, w_grad=1.0, w_refl=1.0, height_norm=None, return_components=False):
+                        camera_params=None, w_mse=1.0, w_grad=1.0, w_refl=1.0, height_norm=None, return_components=False, debug=False):
     """
     Calculate total loss combining MSE, gradient loss, and reflectance map loss.
     
@@ -199,7 +255,7 @@ def calculate_total_loss(outputs, targets, target_reflectance_maps, meta, hapke_
     
     # 3. Reflectance Map Loss - physics-based constraint
     # Compute reflectance maps from predicted DEM (WITH GRADIENTS for backprop)
-    predicted_reflectance_maps = compute_reflectance_map_from_dem(outputs, meta, device, camera_params, hapke_params)
+    predicted_reflectance_maps = compute_reflectance_map_from_dem(outputs, meta, device, camera_params, hapke_params, debug=debug)
     
     loss_refl = F.mse_loss(predicted_reflectance_maps, target_reflectance_maps, reduction='mean')
     
@@ -211,7 +267,7 @@ def calculate_total_loss(outputs, targets, target_reflectance_maps, meta, hapke_
     else:
         return total_loss
 def calculate_total_loss_multi_band(dem_outputs, dem_targets, reflectance_map_targets, metas, w_outputs, w_targets, theta_outputs, theta_targets, device=None,
-                        config=None, return_components=False, debug = False):
+                        config=None, return_components=False, debug=False):
     """
     Calculate total loss combining MSE, gradient loss, and reflectance map loss.
     
@@ -249,8 +305,8 @@ def calculate_total_loss_multi_band(dem_outputs, dem_targets, reflectance_map_ta
         print(f"🔍 W range: [{config['W_MIN']}, {config['W_MAX']}], Theta range: [{config['THETA_BAR_MIN']}, {config['THETA_BAR_MAX']}]")
     
     # Normalize DEMs
-    dem_outputs_norm = dem_outputs / config["HEIGHT_NORMALIZATION"] + config["HEIGHT_NORMALIZATION_PM"]
-    dem_targets_norm = dem_targets / config["HEIGHT_NORMALIZATION"] + config["HEIGHT_NORMALIZATION_PM"]
+    dem_outputs_norm = dem_outputs #/ config["HEIGHT_NORMALIZATION"] + config["HEIGHT_NORMALIZATION_PM"]
+    dem_targets_norm = dem_targets #/ config["HEIGHT_NORMALIZATION"] + config["HEIGHT_NORMALIZATION_PM"]
     
     if debug:
         print(f"🔍 After DEM norm - outputs has_nan: {torch.isnan(dem_outputs_norm).any()}, targets has_nan: {torch.isnan(dem_targets_norm).any()}")
@@ -271,39 +327,103 @@ def calculate_total_loss_multi_band(dem_outputs, dem_targets, reflectance_map_ta
         print(f"🔍 After W norm - outputs: min={w_outputs_norm.min():.6f}, max={w_outputs_norm.max():.6f}, has_nan: {torch.isnan(w_outputs_norm).any()}")
         print(f"🔍 After Theta norm - outputs: min={theta_outputs_norm.min():.6f}, max={theta_outputs_norm.max():.6f}, has_nan: {torch.isnan(theta_outputs_norm).any()}")
 
+
     # 1. MSE Loss - basic elevation accuracy
-    loss_mse = F.mse_loss(dem_outputs_norm, dem_targets_norm, reduction='mean')
+    # loss_mse = F.mse_loss(dem_outputs_norm, dem_targets_norm, reduction='mean')
+    loss_mse = F.l1_loss(dem_outputs_norm, dem_targets_norm, reduction='mean')
     if debug:
         print(f"🔍 loss_mse: {loss_mse.item():.6f}, has_nan: {torch.isnan(loss_mse).any()}")
     
     # 2. Gradient Loss - captures steep slopes and terrain features
-    out_grad_mag = compute_gradients(dem_outputs_norm)
-    tgt_grad_mag = compute_gradients(dem_targets_norm)
-    if debug:
-        print(f"🔍 Gradients - out_grad has_nan: {torch.isnan(out_grad_mag).any()}, tgt_grad has_nan: {torch.isnan(tgt_grad_mag).any()}")
+    # out_grad_mag = compute_gradients(dem_outputs_norm)
+    # tgt_grad_mag = compute_gradients(dem_targets_norm)
+    # normalize by looking at tgt gradient magnitude - not output, to avoid collapse
+    # grad_scale = torch.linalg.vector_norm(
+    #                                     tgt_grad_mag,
+    #                                     ord=2,
+    #                                     dim=(1, 2, 3),
+    #                                     keepdim=True,
+    #                                 ).clamp(min=1e-8)    
+    # out_grad_mag_norm = out_grad_mag # / grad_scale
+    # tgt_grad_mag_norm = tgt_grad_mag #/ grad_scale
     
-    loss_grad = F.mse_loss(out_grad_mag, tgt_grad_mag, reduction='mean')
-    if debug:
-        print(f"🔍 loss_grad: {loss_grad.item():.6f}, has_nan: {torch.isnan(loss_grad).any()}")
+    # if debug:
+    #     print(f"🔍 Gradients - out_grad has_nan: {torch.isnan(out_grad_mag_norm).any()}, tgt_grad has_nan: {torch.isnan(tgt_grad_mag_norm).any()}")
     
-    # 3. Reflectance Map Loss - physics-based constraint
-    predicted_reflectance_maps = compute_reflectance_map_from_dem_multi_band(dem_outputs, metas, device, config["CAMERA_PARAMS"], w_band=w_outputs, theta_band=theta_outputs, debug=debug)
-    if debug:
-        print(f"🔍 Predicted reflectance - min: {predicted_reflectance_maps.min():.6f}, max: {predicted_reflectance_maps.max():.6f}, has_nan: {torch.isnan(predicted_reflectance_maps).any()}, has_inf: {torch.isinf(predicted_reflectance_maps).any()}")
-        print(f"🔍 Target reflectance - min: {reflectance_map_targets.min():.6f}, max: {reflectance_map_targets.max():.6f}, has_nan: {torch.isnan(reflectance_map_targets).any()}")
+    # if debug:
+    #     print(f"🔍 loss_grad: {loss_grad.item():.6f}, has_nan: {torch.isnan(loss_grad).any()}")
+    # loss_grad = F.l1_loss(out_grad_mag_norm, tgt_grad_mag_norm, reduction='mean')
     
-    loss_refl = F.mse_loss(predicted_reflectance_maps, reflectance_map_targets, reduction='mean')
-    if debug:
-        print(f"🔍 loss_refl: {loss_refl.item():.6f}, has_nan: {torch.isnan(loss_refl).any()}")
+    
+    dx_out, dy_out = compute_spatial_gradients(dem_outputs_norm)
+    dx_tgt, dy_tgt = compute_spatial_gradients(dem_targets_norm)
+    loss_grad = F.l1_loss(dx_out, dx_tgt, reduction='mean') + F.l1_loss(dy_out, dy_tgt, reduction='mean')
+    
+    
+    # # Try without reflectance to see how much time it takes
+    # # 3. Reflectance Map Loss - physics-based constraint
+    predicted_reflectance_maps = compute_reflectance_map_from_dem_multi_band(dem_outputs.detach(), # stop reflectance gradients affecting the DEM 
+                                                                             metas, 
+                                                                             device, 
+                                                                             config["CAMERA_PARAMS"], 
+                                                                             w_band=w_outputs, 
+                                                                             theta_band=theta_outputs, 
+                                                                             debug=debug
+                                                                             )
+    
+    
+    eps = 1e-6
+    scale = reflectance_map_targets.abs().mean(dim=(1,2,3), keepdim=True).clamp(min=eps)
 
-    # 4. w_band Loss - albedo consistency
-    loss_w = F.mse_loss(w_outputs_norm, w_targets_norm, reduction='mean')
-    if debug:
-        print(f"🔍 loss_w: {loss_w.item():.6f}, has_nan: {torch.isnan(loss_w).any()}")
-    # 5. theta_band Loss - phase function consistency
-    loss_theta = F.mse_loss(theta_outputs_norm, theta_targets_norm, reduction='mean')
-    if debug:
-        print(f"🔍 loss_theta: {loss_theta.item():.6f}, has_nan: {torch.isnan(loss_theta).any()}")
+    # subsample to speed up reflectance loss calculation - this is a bit hacky but it works and is much faster than using the full resolution maps for loss
+    # consider only calculating refl every 4 steps
+    # if step % 4 == 0:
+    #     loss_refl = ...
+    # else:
+    #     loss_refl = 0
+
+
+    pred_norm = predicted_reflectance_maps / scale
+    tgt_norm  = reflectance_map_targets / scale
+    
+    loss_refl = F.l1_loss(pred_norm, tgt_norm, reduction="mean")
+
+    # # 4. w_band Loss - albedo consistency
+    # loss_w = F.mse_loss(w_outputs_norm, w_targets_norm, reduction='mean')
+    # if debug:
+    #     print(f"🔍 loss_w: {loss_w.item():.6f}, has_nan: {torch.isnan(loss_w).any()}")
+    # # 5. theta_band Loss - phase function consistency
+    # loss_theta = F.mse_loss(theta_outputs_norm, theta_targets_norm, reduction='mean')
+    # if debug:
+    #     print(f"🔍 loss_theta: {loss_theta.item():.6f}, has_nan: {torch.isnan(loss_theta).any()}")
+    
+    loss_w = torch.tensor(0.0, device=device)
+    loss_theta = torch.tensor(0.0, device=device)
+    
+    # # Only residual reflectance that geometry cannot explain should be explained by w and theta - this is a bit hacky but it encourages the model to use w and theta to explain things that DEM cannot, rather than using them as a crutch to explain everything and not learning good geometry
+    # refl_geom = compute_reflectance(
+    #     dem_outputs.detach(),
+    #     metas,
+    #     w_band=w_outputs.detach(),     # or mean(w), see note below
+    #     theta_band=None                # or fixed theta
+    # )
+
+    # # Full reflectance
+    # refl_full = compute_reflectance(
+    #     dem_outputs.detach(),
+    #     metas,
+    #     w_band=w_outputs.detach(),
+    #     theta_band=theta_outputs
+    # )
+
+    # # Residual that geometry cannot explain
+    # refl_residual = reflectance_targets - refl_geom
+
+    # # Theta only explains residual
+    # loss_theta_refl = L1(
+    #     normalize(refl_full - refl_geom),
+    #     normalize(refl_residual)
+    # )
         
     # Combine losses
     total_loss = config["W_MSE"] * loss_mse + config["W_GRAD"] * loss_grad + config["W_REFL"] * loss_refl + config["W_W"] * loss_w + config["W_THETA"] * loss_theta 
@@ -317,6 +437,9 @@ def calculate_total_loss_multi_band(dem_outputs, dem_targets, reflectance_map_ta
         return returned_components
     else:
         return total_loss
+
+
+
 
 
 
@@ -379,15 +502,6 @@ def calculate_total_loss_multi_band(dem_outputs, dem_targets, reflectance_map_ta
 
 #     return total_loss
 
-# def _compute_gradients(tensor):
-#     sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-#                             dtype=tensor.dtype, device=tensor.device).view(1, 1, 3, 3)
-#     sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-#                             dtype=tensor.dtype, device=tensor.device).view(1, 1, 3, 3)
-#     grad_x = F.conv2d(tensor, sobel_x, padding=1)
-#     grad_y = F.conv2d(tensor, sobel_y, padding=1)
-#     grad_magnitude = torch.sqrt(grad_x**2 + grad_y**2 + 1e-8)
-#     return grad_magnitude
 
 
 __all__ = ['compute_reflectance_map_from_dem', 'calculate_total_loss']

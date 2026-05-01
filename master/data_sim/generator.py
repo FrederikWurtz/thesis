@@ -599,7 +599,7 @@ def generate_and_save_data_pooled_multi_gpu(config: dict = None,
         if torch.backends.mps.is_available():
             if verbose:
                 print("MPS detected: Forcing single-threaded data generation due to MPS multiprocessing/threading incompatibility.")
-            for dem_idx in range(n_dems):
+            for dem_idx in tqdm(range(n_dems), desc="Generating DEMs (MPS)", dynamic_ncols=True):
                 # Call the single-threaded data generation function directly
                 if config["USE_LRO_DEMS"]:
                     if config["USE_MULTI_BAND"]:

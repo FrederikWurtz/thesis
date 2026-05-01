@@ -15,7 +15,8 @@ warnings.filterwarnings('ignore', message='.*Profiler function.*will be ignored.
 
 import torch
 
-from master.train.trainer_new import Trainer_singleGPU, load_train_objs, prepare_dataloader
+from master.train.trainer_new import Trainer_singleGPU
+from master.train.trainer_core import load_train_objs, prepare_dataloader
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 from master.configs.config_utils import load_config_file
 
@@ -59,21 +60,32 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
                     os.remove(file_path)
             print(f"Cleared checkpoint directory: {checkpoint_dir}")
 
+    checkpoint_dir = os.path.join(run_path, 'checkpoints')
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+        print(f"Created checkpoint directory: {checkpoint_dir}")
+        
+    
     snapshot_path = os.path.join(run_path, 'checkpoints', 'snapshot.pt')
     mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
     input_stats = read_file_from_ini(mean_std_path)
-    train_mean = torch.tensor([float(input_stats['MEAN'][i]) for i in range(len(input_stats['MEAN']))])
-    train_std = torch.tensor([float(input_stats['STD'][i]) for i in range(len(input_stats['STD']))])
+    train_mean = torch.tensor(input_stats['MEAN'])
+    train_std = torch.tensor(input_stats['STD'])
 
     # value for each process to share current epoch - otherwise the deterministic randomness will not be set correctly!
     EPOCH_SHARED = multiprocessing.Value('i', 0)  # 'i' means integer
 
-    train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path, epoch_shared=EPOCH_SHARED)
+    train_set, val_set, test_set, model, optimizer, scheduler = load_train_objs(config, run_path, epoch_shared=EPOCH_SHARED)
+    
+    if config["USE_STATIC"] is True:
+        use_shuffle = True
+    else:
+        use_shuffle = False
     
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
                                       num_workers=config["NUM_WORKERS_DATALOADER"], 
                                       prefetch_factor=config["PREFETCH_FACTOR"],
-                                      use_shuffle=False,
+                                      use_shuffle=use_shuffle,
                                       persistent_workers=True,
                                       multi_gpu=False)
                                       
@@ -81,7 +93,7 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     val_loader = prepare_dataloader(val_set, config["BATCH_SIZE"], 
                                     num_workers=config["NUM_WORKERS_DATALOADER"], 
                                     prefetch_factor=config["PREFETCH_FACTOR"],
-                                    use_shuffle=False,
+                                    use_shuffle=use_shuffle,
                                     persistent_workers=True,
                                     multi_gpu=False)
     
@@ -92,7 +104,16 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
                                      persistent_workers=True,
                                      multi_gpu=False)
     
-    trainer = Trainer_singleGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
+    trainer = Trainer_singleGPU(model = model, 
+                                train_loader = train_loader, 
+                                optimizer = optimizer, 
+                                config = config, 
+                                snapshot_path = snapshot_path, 
+                                train_mean = train_mean, 
+                                train_std = train_std, 
+                                val_loader = val_loader, 
+                                test_loader = test_loader, 
+                                scheduler = scheduler)
 
     number_of_gpus = 1 if torch.backends.mps.is_available() else 0
     equipment_info_path = os.path.join(run_path, 'stats', 'equipment_info.ini')
@@ -108,13 +129,12 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
 
     print("Training complete.")
     print("Testing on test dataset...")
-    global_test_loss, global_ame = trainer.test()
+    global_test_loss, (global_dem_ame, global_w_ame, global_theta_ame) = trainer.test()
     
     test_loss_dir = os.path.join(run_path, 'stats', 'test_results.ini')
-    save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_AME': float(global_ame)}, test_loss_dir)
-    print(f"Test Loss: {global_test_loss:.6f}, Test AME: {global_ame:.6f}")
+    save_file_as_ini({'TEST_LOSS': float(global_test_loss), 'TEST_DEM_AME': float(global_dem_ame), 'TEST_W_AME': float(global_w_ame), 'TEST_THETA_AME': float(global_theta_ame)}, test_loss_dir)
+    print(f"Test Loss: {global_test_loss:.6f}, Test DEM AME: {global_dem_ame:.6f}, Test W AME: {global_w_ame:.6f}, Test Theta AME: {global_theta_ame:.6f}")
     print("Test results saved.")
-
     run_plot(run_dir)
 
     t1_main = time.time()
@@ -124,6 +144,7 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     save_file_as_ini({'TOTAL_TIME_MINUTES': [str(total_time/60)], 
                                        'TOTAL_TIME_SECONDS': [str(total_time)], 
                                        'TOTAL_TIME_HRS': [str(total_time/3600)]}, total_time_path)
+
 
 
     print("Cleaning up...")

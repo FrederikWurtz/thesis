@@ -8,6 +8,8 @@ Provides:
 """
 
 import os
+import subprocess
+import sys
 import numpy as np
 import torch
 import h5py
@@ -26,43 +28,49 @@ from torch.distributed import init_process_group, destroy_process_group
 
 
 def load_train_objs(config, run_path: str, epoch_shared=None):
+    if is_main():
+        assert sum([config["USE_STATIC"], config["USE_SEMIFLUID"], config["USE_FLUID"]]) == 1, "Exactly one of USE_STATIC, USE_SEMIFLUID, or USE_FLUID must be True."
+    if config["USE_STATIC"]:
+        if is_main():
+            print("Using static DEM dataset for training.")
+        train_set = DEMDataset(list_pt_files(os.path.join(run_path, 'train')), config=config) # load your dataset
     if config["USE_SEMIFLUID"]:
         if is_main():
-            print(f"Semifluid training detected - using {os.path.join(run_path, 'train_temp')} directory for data...")
-        train_files = list_pt_files(os.path.join(run_path, 'train_temp'))
-        train_set = DEMDataset(train_files, config=config) # load your dataset
-    else:
-        print("Using standard FluidDEMDataset for training...")
+            print("Using SemiFluidDEMDataset for training.")
+        train_set = SemiFluidDEMDataset(config, epoch_shared=epoch_shared) # load your dataset
+    if config["USE_FLUID"]:
+        if is_main():
+            print("Using FluidDEMDataset for training.")
         train_set = FluidDEMDataset(config, epoch_shared=epoch_shared) # load your dataset
     val_path = os.path.join(run_path, 'val') # load validation dataset
     val_files = list_pt_files(val_path)
     val_set = DEMDataset(val_files, config=config)
-    test_files = list_pt_files(os.path.join(run_path, 'test'))  # load test dataset
-    test_set = DEMDataset(test_files, config=config)
+    test_set = list_pt_files(os.path.join(run_path, 'test'))  # load test dataset
+    test_set = DEMDataset(test_set, config=config)
+    upsample_factor = config["DEM_SIZE"] // config["IMAGE_H"]  # Calculate upsample factor based on config
+    # assert that upsample factor is a power of 2, since our UNet architecture upsamples by a factor of 2 at each layer
+    assert upsample_factor in [1, 2, 4, 8, 16], f"Upsample factor must be 1, 2, 4, or 8. Got {upsample_factor}."
     if config["USE_MULTI_BAND"]:
         out_channels = 3 # DEM, w band and theta_bar band
         model = UNet(in_channels=config["IMAGES_PER_DEM"], 
-                     out_channels=out_channels, 
-                     features=config["UNET_FEATURES"],
-                     meta_dim=config["META_DIM"],
-                     meta_hidden=config["META_HIDDEN"],
-                     meta_out=config["META_OUT"],
-                     norm=config["UNET_NORM"],
-                     num_groups=config["UNET_NUM_GROUPS"],
-                     w_range=(config["W_MIN"], config["W_MAX"]), 
-                     theta_range=(config["THETA_BAR_MIN"], config["THETA_BAR_MAX"]))  # load your model
+                             out_channels=out_channels, 
+                             w_range=(config["W_MIN"], 
+                                      config["W_MAX"]), 
+                             theta_range=(config["THETA_BAR_MIN"], 
+                                          config["THETA_BAR_MAX"]), 
+                             upsample_factor=upsample_factor,
+                             norm=config["UNET_NORM"],
+                             num_groups=config["UNET_NUM_GROUPS"])  # load your model
     else:
         out_channels = 1
         model = UNet(in_channels=config["IMAGES_PER_DEM"], 
-                    out_channels=out_channels, 
-                    features=config["UNET_FEATURES"],
-                    meta_dim=config["META_DIM"],
-                    meta_hidden=config["META_HIDDEN"],
-                    meta_out=config["META_OUT"],
-                    norm=config["UNET_NORM"],
-                    num_groups=config["UNET_NUM_GROUPS"])  # load your model
+                             out_channels=out_channels, 
+                             upsample_factor=upsample_factor,
+                             norm=config["UNET_NORM"],
+                             num_groups=config["UNET_NUM_GROUPS"])  # load your model
     optimizer = torch.optim.Adam(model.parameters(), lr=config["LR"], weight_decay=config["WEIGHT_DECAY"])
-    return train_set, val_set, test_set, model, optimizer
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=config["LR_PATIENCE"])
+    return train_set, val_set, test_set, model, optimizer, scheduler
 
 def load_test_objs(config, test_path: str):
     test_set = list_pt_files(test_path)  # load test dataset
@@ -97,6 +105,20 @@ def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, 
 def set_global_epoch(epoch):
     global GLOBAL_EPOCH
     GLOBAL_EPOCH = epoch
+
+
+
+def generate_fluid_data(run_name: str, epoch: int):
+    print(f"[Rank0] Generating fluid data for epoch {epoch}...", flush=True)
+    cmd = [
+        sys.executable,
+        "generate_fluid_data.py",
+        "--run", run_name,
+        "--epoch", str(epoch),
+    ]
+    print(f"[Rank0] Spawning generator process: {' '.join(cmd)}", flush=True)
+    result = subprocess.run(cmd, check=True)
+    print(f"[Rank0] Generator finished with code {result.returncode}", flush=True)
 
 
 def is_main():
@@ -253,7 +275,7 @@ class SemiFluidDEMDataset(Dataset):
         self.epoch_shared = epoch_shared if epoch_shared is not None else 0
 
         # hvor vi gemmer midlertidig data
-        self.temporary_dir = os.path.join("runs", config["RUN_DIR"], "train_temp")
+        self.temporary_dir = os.path.join("runs", config["RUN_DIR"], "train")
         # first run of data has been done in initialize.py            
         self.files = []    
         self._refresh_file_list()

@@ -31,7 +31,7 @@ class DEM:
         _build_world_points():
             Constructs a (height*width, 3) array of 3D world coordinates (x, y, z) for each grid cell.
     """
-    def __init__(self, dem, cellsize, x0, y0, y_down=False):
+    def __init__(self, dem, cellsize, x0, y0, y_down=False, debug=False):
         """
         Initializes the DEM object with elevation data and spatial parameters.
         Computes surface normals and builds world coordinates for each grid cell.
@@ -43,6 +43,7 @@ class DEM:
             y0 (float): Y-coordinate of the origin (upper-left corner).
         """
         self.y_down = y_down
+        self.debug = debug
         # Convert to torch tensor if numpy array
         if isinstance(dem, np.ndarray):
             self.dem = torch.from_numpy(dem).float()
@@ -65,30 +66,45 @@ class DEM:
         Computes the surface normal vectors for each grid cell using the DEM gradients.
         Uses self.y_down to determine if y-gradient should be inverted.
         """
-        # Compute gradients in y and x directions using PyTorch
-        # Add batch and channel dimensions for gradient computation
-        dem_4d = self.dem.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-        
-        # Sobel-like gradients for y and x
-        # Create gradient kernels
-        ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0) / (8 * self.cellsize)
-        kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0) / (8 * self.cellsize)
-        
-        # Apply convolution for gradients
-        dz_dy_raw = torch.nn.functional.conv2d(dem_4d, ky, padding=1).squeeze()
-        dz_dx = torch.nn.functional.conv2d(dem_4d, kx, padding=1).squeeze()
-        
-        # Optionally invert y-gradient for image coordinate systems
-        dz_dy = -dz_dy_raw if self.y_down else dz_dy_raw
-        # Surface normal components
+        dem = self.dem
+
+        if self.debug:
+            if torch.isnan(dem).any() or torch.isinf(dem).any():
+                raise ValueError(
+                    f"DEM contains NaN/Inf before normal computation: "
+                    f"min={dem.min().item():.6e}, max={dem.max().item():.6e}"
+                )
+
+        # torch.gradient returns derivatives along each dimension:
+        # dim 0 -> y/rows, dim 1 -> x/cols
+        dz_dy, dz_dx = torch.gradient(dem, spacing=(self.cellsize, self.cellsize))
+
+        if self.y_down:
+            dz_dy = -dz_dy
+
         nx = -dz_dx
         ny = -dz_dy
-        nz = torch.ones_like(self.dem, device=self.device)
-        # Normalize the normal vectors
-        norm = torch.sqrt(nx*nx + ny*ny + nz*nz) + 1e-12
+        nz = torch.ones_like(dem, device=self.device)
+
+        norm = torch.sqrt(nx * nx + ny * ny + nz * nz).clamp_min(1e-12)
+
         self.nx = nx / norm
         self.ny = ny / norm
         self.nz = nz / norm
+
+        if self.debug:
+            for name, tensor in [
+                ("dz_dx", dz_dx),
+                ("dz_dy", dz_dy),
+                ("nx", self.nx),
+                ("ny", self.ny),
+                ("nz", self.nz),
+            ]:
+                if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                    raise ValueError(
+                        f"{name} contains NaN/Inf after normal computation: "
+                        f"min={tensor.min().item():.6e}, max={tensor.max().item():.6e}"
+                    )
 
     def _build_world_points(self):
         """

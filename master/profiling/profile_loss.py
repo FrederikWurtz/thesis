@@ -47,16 +47,40 @@ def profile_loss_components(outputs, targets, reflectance_maps, metas, device, c
     print(f"  Value: {loss_mse.item():.6f}")
     
     # 2. Gradient Loss
-    def compute_gradients(tensor):
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                               dtype=tensor.dtype, device=tensor.device).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                               dtype=tensor.dtype, device=tensor.device).view(1, 1, 3, 3)
-        
-        grad_x = F.conv2d(tensor, sobel_x, padding=1)
-        grad_y = F.conv2d(tensor, sobel_y, padding=1)
-        grad_magnitude = torch.sqrt(grad_x**2 + grad_y**2 + 1e-8)
-        return grad_magnitude
+    def compute_gradients(tensor: torch.Tensor, spacing=(1.0, 1.0)) -> torch.Tensor:
+        """
+        Compute per-pixel gradient magnitude using torch.gradient.
+
+        Accepts input shaped either [B, 1, H, W] or [B, H, W].
+        Returns the gradient magnitude with the same batch/channel layout
+        (i.e., [B, 1, H, W] for [B,1,H,W] input).
+        Args:
+            tensor: input DEM tensor
+            spacing: tuple (dy, dx) specifying grid spacing (default: 1.0, 1.0)
+        """
+        # Normalize shapes to [B, H, W]
+        if tensor.ndim == 4 and tensor.shape[1] == 1:
+            vals = tensor[:, 0]
+            keep_channel = True
+        elif tensor.ndim == 3:
+            vals = tensor
+            keep_channel = False
+        else:
+            raise ValueError(
+                f"compute_gradients: expected shape [B,1,H,W] or [B,H,W], got {tuple(tensor.shape)}"
+            )
+
+        # Compute derivatives along (rows, cols) -> (dy, dx)
+        dy, dx = torch.gradient(vals, spacing=spacing, dim=(-2, -1))
+
+        # Magnitude with small epsilon for numerical stability
+        grad_mag = torch.sqrt(dx * dx + dy * dy + 1e-8)
+
+        # Restore channel dimension if input had one
+        if keep_channel:
+            grad_mag = grad_mag.unsqueeze(1)
+
+        return grad_mag
     
     grad_times = []
     for _ in range(num_runs):

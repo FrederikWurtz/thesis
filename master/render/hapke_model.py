@@ -261,41 +261,52 @@ def hapke_roughness(mu0, mu, i, e, psi, theta_bar, debug: bool = False):
     chi = torch.sqrt(1 + torch.pi*torch.tan(theta_bar)**2)
     
     if debug: # print values of roughness parameters and input angles (degrees and radians) for debugging
-        print(f"Input angles (degrees): i={torch.rad2deg(i).item():.2f}, e={torch.rad2deg(e).item():.2f}, psi={torch.rad2deg(psi).item():.2f}")
-        print(f"Input angles (radians): i={i.item():.6f}, e={e.item():.6f}, psi={psi.item():.6f}")
-        print(f"Roughness parameters (constant): chi={chi.item():.6f}")
+        # These are maps, so just print stats
+        print(f"Input angles (degrees): i={torch.rad2deg(i).min().item():.2f} to {torch.rad2deg(i).max().item():.2f}, e={torch.rad2deg(e).min().item():.2f} to {torch.rad2deg(e).max().item():.2f}, psi={torch.rad2deg(psi).min().item():.2f} to {torch.rad2deg(psi).max().item():.2f}")
+        print(f"Roughness parameter (constant): chi={chi.mean().item():.6f}, theta_bar={torch.rad2deg(theta_bar).mean().item():.2f} degrees")
         
+    eps = 1e-6
+    i_safe = torch.clamp(i, min=0.0, max=math.pi / 2 - eps)
+    e_safe = torch.clamp(e, min=0.0, max=math.pi / 2 - eps)
     
     # Roughness parameters that vary over the map
-    E1_e_map = torch.exp(-2 / torch.pi * cot(theta_bar) * cot(e) )
-    E1_i_map = torch.exp(-2 / torch.pi * cot(theta_bar) * cot(i) )
-    E2_e_map = torch.exp(-1 / torch.pi * (cot(theta_bar))**2 * (cot(e))**2 )
-    E2_i_map = torch.exp(-1 / torch.pi * (cot(theta_bar))**2 * (cot(i))**2 )
+    E1_e_map = torch.exp(-2 / torch.pi * cot(theta_bar) * cot(e_safe) )
+    E1_i_map = torch.exp(-2 / torch.pi * cot(theta_bar) * cot(i_safe) )
+    E2_e_map = torch.exp(-1 / torch.pi * (cot(theta_bar))**2 * (cot(e_safe))**2 )
+    E2_i_map = torch.exp(-1 / torch.pi * (cot(theta_bar))**2 * (cot(i_safe))**2 )
     # if psi is 180, then tan(psi/2) is infinite and f_psi should be 0, so clamp psi to just below 180 degrees to avoid NaN
     psi_clamped = torch.clamp(psi, max=math.pi - 1e-6)
     f_psi = torch.exp(- 2 * torch.tan(psi_clamped / 2))
     
     if debug: # print values of roughness parameters that vary over the map for debugging
-        print(f"Roughness parameters (maps): E1_e_map={E1_e_map.item():.6f}, E1_i_map={E1_i_map.item():.6f}, E2_e_map={E2_e_map.item():.6f}, E2_i_map={E2_i_map.item():.6f}, f_psi={f_psi.item():.6f}")
+        print(f"Roughness parameters (maps): E1_e_map={E1_e_map.mean().item():.6f}, E1_i_map={E1_i_map.mean().item():.6f}, E2_e_map={E2_e_map.mean().item():.6f}, E2_i_map={E2_i_map.mean().item():.6f}, f_psi={f_psi.mean().item():.6f}")
     
     # compute effective cosines for incidence and emission depending on which is largest
-    mu0_eff_i_leq_e = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * (torch.cos(psi) * E2_e_map + torch.sin(psi / 2)**2 * E2_i_map) / (2 - E1_e_map - (psi / torch.pi) * E1_i_map))
-    mu0_eff_i_leq_e_at_0 = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * E2_i_map / (2 - E1_i_map))
-    mu_eff_i_leq_e = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * (E2_e_map - torch.sin(psi / 2)**2 * E2_i_map) / (2 - E1_e_map - (psi / torch.pi) * E1_i_map))
-    mu_eff_i_leq_e_at_0 = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * E2_e_map / (2 - E1_e_map))
+    eps = 1e-6
+    denom_ie = torch.clamp(2 - E1_e_map - (psi / torch.pi) * E1_i_map, min=eps)
+    mu0_eff_i_leq_e = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * (torch.cos(psi) * E2_e_map + torch.sin(psi / 2)**2 * E2_i_map) / denom_ie)
     
-    mu0_eff_e_lt_i = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * (E2_i_map - torch.sin(psi / 2)**2 * E2_e_map) / (2 - E1_i_map - (psi / torch.pi) * E1_e_map))
-    mu0_eff_e_lt_i_at_0 = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * E2_i_map / (2 - E1_i_map))
-    mu_eff_e_lt_i = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * (torch.cos(psi) * E2_i_map + torch.sin(psi / 2)**2 * E2_e_map) / (2 - E1_i_map - (psi / torch.pi) * E1_e_map))
-    mu_eff_e_lt_i_at_0 = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * E2_e_map / (2 - E1_e_map))
+    denom_i0 = torch.clamp(2 - E1_i_map, min=eps)
+    mu0_eff_i_leq_e_at_0 = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * E2_i_map / denom_i0)
+    
+    mu_eff_i_leq_e = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * (E2_e_map - torch.sin(psi / 2)**2 * E2_i_map) / denom_ie)
+    
+    denom_e0 = torch.clamp(2 - E1_e_map, min=eps)
+    mu_eff_i_leq_e_at_0 = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * E2_e_map / denom_e0)
+    
+    denom_ei = torch.clamp(2 - E1_i_map - (psi / torch.pi) * E1_e_map, min=eps)
+    mu0_eff_e_lt_i = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * (E2_i_map - torch.sin(psi / 2)**2 * E2_e_map) / denom_ei)
+    mu0_eff_e_lt_i_at_0 = chi * (torch.cos(i) + torch.sin(i) * torch.tan(theta_bar) * E2_i_map / denom_i0)
+    mu_eff_e_lt_i = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * (torch.cos(psi) * E2_i_map + torch.sin(psi / 2)**2 * E2_e_map) / denom_ei)
+    mu_eff_e_lt_i_at_0 = chi * (torch.cos(e) + torch.sin(e) * torch.tan(theta_bar) * E2_e_map / denom_e0)
 
     # for each pixel, select the correct effective cosines based on whether i <= e or not
     mu0_eff = torch.where(i <= e, mu0_eff_i_leq_e, mu0_eff_e_lt_i)
     mu_eff = torch.where(i <= e, mu_eff_i_leq_e, mu_eff_e_lt_i)
 
-    # for each pixel, calculate the roughness shadowing factor S
-    S_i_leq_e = mu_eff_i_leq_e / mu_eff_i_leq_e_at_0 * mu0 / mu0_eff_i_leq_e_at_0 * chi / (1 - f_psi + f_psi * chi * (mu0 / mu0_eff_i_leq_e_at_0))
-    S_e_lt_i = mu_eff_e_lt_i / mu_eff_e_lt_i_at_0 * mu0 / mu0_eff_e_lt_i_at_0 * chi / (1 - f_psi + f_psi * chi * (mu / mu_eff_e_lt_i_at_0))
+    # for each pixel, calculate the roughness shadowing factor S - clamping denominators to avoid NaN
+    S_i_leq_e = mu_eff_i_leq_e / torch.clamp(mu_eff_i_leq_e_at_0, min=eps) * mu0 / torch.clamp(mu0_eff_i_leq_e_at_0, min=eps) * chi / torch.clamp(1 - f_psi + f_psi * chi * (mu0 / torch.clamp(mu0_eff_i_leq_e_at_0, min=eps)), min=eps)
+    S_e_lt_i = mu_eff_e_lt_i / torch.clamp(mu_eff_e_lt_i_at_0, min=eps) * mu0 / torch.clamp(mu0_eff_e_lt_i_at_0, min=eps) * chi / torch.clamp(1 - f_psi + f_psi * chi * (mu / torch.clamp(mu_eff_e_lt_i_at_0, min=eps)), min=eps)
 
     S = torch.where(i <= e, S_i_leq_e, S_e_lt_i)
 
@@ -332,7 +343,8 @@ class FullHapkeModel:
                  b=-0.3,     # for hg2
                  c=0.7,        # for hg2
 
-                 debug: bool = False
+                 debug: bool = False,
+                 smooth_transition: bool = False # whether to apply a smooth transition at the shadow boundary to avoid killing gradients (should only be used during training, not for image rendering)
                  ):
         
         self.w = w
@@ -352,6 +364,17 @@ class FullHapkeModel:
 
         self.debug = debug
         self.name = "fullhapke"
+        
+        self.smooth_transition = smooth_transition
+        self.training = False
+        self.k = 30  # steepness of sigmoid transition, adjust as needed
+
+    def train(self, mode=True):
+        self.training = mode
+        return self
+
+    def eval(self):
+        return self.train(False)
 
 
     # ------------------ helper ------------------
@@ -388,7 +411,8 @@ class FullHapkeModel:
     # ------------------ H-function ------------------
 
     def _H(self, x, w):
-        x = torch.clamp(x, 0.0, 1.0)
+        
+        x = torch.clamp(x, min=1e-6, max=1.0)
         w = torch.clamp(w, 1e-6, 1.0-1e-6)
     
 
@@ -444,20 +468,24 @@ class FullHapkeModel:
         si = torch.sin(i_rad)
         se = torch.sin(e_rad)
 
+
         # avoid division by zero
+        eps = 1e-6
         denom = si * se
-        zero_mask = denom == 0
+        small = denom.abs() < eps
+        denom_safe = torch.where(small, torch.ones_like(denom), denom)
 
         # normal case
-        cos_psi = (torch.cos(g_rad) - ci * ce) / denom
+        cos_psi = (torch.cos(g_rad) - ci * ce) / denom_safe
 
         # clamp for numerical safety
-        cos_psi = torch.clamp(cos_psi, -1.0, 1.0)
+        cos_psi = torch.where(small, torch.ones_like(cos_psi), cos_psi)  # psi=0 later
+        cos_psi = torch.clamp(cos_psi, -1.0 + eps, 1.0 - eps)
 
         psi = torch.acos(cos_psi)
 
         # if i=0 or e=0, define psi = 0
-        psi = torch.where(zero_mask, torch.zeros_like(psi), psi)
+        psi = torch.where(small, torch.zeros_like(psi), psi)
 
         return psi
 
@@ -555,6 +583,12 @@ class FullHapkeModel:
 
         # Apply physical visibility mask
         mask = (mu0 > 0) & (mu > 0)
-        R = torch.where(mask, R, torch.zeros_like(R))
+        
+        # Smooth transition to not kill gradients at the sahdow boundary. Should only be used during training, not for image rendering.
+        if self.smooth_transition:
+            vis = torch.sigmoid(self.k * mu0) * torch.sigmoid(self.k * mu)
+            R = vis * R
+        else:
+            R = torch.where(mask, R, torch.zeros_like(R))
         
         return R

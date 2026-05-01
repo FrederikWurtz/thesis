@@ -56,7 +56,8 @@ def generate_and_return_lro_data_multi_band(config: dict = None, device: str = "
 
 
         dem_obj = DEM(dem_tensor, cellsize=1, x0=0, y0=0)
-        hapke = FullHapkeModel(w=w_tensor, theta_bar=theta_bar_tensor)
+        hapke = FullHapkeModel(w=w_tensor, theta_bar_rad=theta_bar_tensor)
+        hapke.eval()  # Set to evaluation mode to disable smooth transition at shadow boundaries for rendering
         camera = Camera(image_width=config["IMAGE_W"],
                         image_height=config["IMAGE_H"],
                         focal_length=config["FOCAL_LENGTH"],
@@ -95,19 +96,6 @@ def generate_and_return_dem(config: dict = None, device: str = "cpu"):
     dem_path = "master/lro_data_sim/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
 
     lat, lon, box_radius, height_norm = get_lat_lon_radius_height(config)   
-
-    # all_bands_array, metadata = extract_local_subset_all_bands(
-    #                                                 dem_path=dem_path,
-    #                                                 center_lat_deg=lat,
-    #                                                 center_lon_deg=lon,
-    #                                                 box_radius_m=box_radius,
-    #                                                 res_m=config['SAMPLE_RES_M'],
-    #                                                 local_proj_type="stere",
-    #                                                 verbose = False
-    #                                             )
-    # dem_array = all_bands_array[0, :, :]  # First band is DEM
-    # w_array = all_bands_array[1, :, :]    # Second band is albedo (w)
-    # theta_bar_array = all_bands_array[2, :, :]  # Third band is theta_bar (for roughness)
 
     dem_array, metadata = extract_local_dem_subset(
                                                 dem_path=dem_path,
@@ -176,14 +164,27 @@ def get_lat_lon_radius_height(config: dict):
     else:
         # use separate val/test parameters, including stochasticity if enabled
         # print("Using separate val/test parameters for LRO DEM generation")
-        center_lat_deg = config['CENTER_LAT_DEG_VALTEST']
-        center_lon_deg = config['CENTER_LON_DEG_VALTEST']
-        box_radius_m = config['BOX_RADIUS_M_VALTEST']
-        height_normalization = config['HEIGHT_NORMALIZATION_VALTEST']
-        lat_deg_pm = config['CENTER_LAT_DEG_PM_VALTEST']
-        lon_deg_pm = config['CENTER_LON_DEG_PM_VALTEST']
-        box_radius_m_pm = config['BOX_RADIUS_M_PM_VALTEST']
-        height_normalization_pm = config['HEIGHT_NORMALIZATION_PM_VALTEST']
+        if config["NOW_VAL"] == True:
+            assert config["NOW_TEST"] == False, "NOW_VAL and NOW_TEST cannot both be True"
+            center_lat_deg = config['CENTER_LAT_DEG_VAL']
+            center_lon_deg = config['CENTER_LON_DEG_VAL']
+            box_radius_m = config['BOX_RADIUS_M_VAL']
+            height_normalization = config['HEIGHT_NORMALIZATION_VAL']
+            lat_deg_pm = config['CENTER_LAT_DEG_PM_VAL']
+            lon_deg_pm = config['CENTER_LON_DEG_PM_VAL']
+            box_radius_m_pm = config['BOX_RADIUS_M_PM_VAL']
+            height_normalization_pm = config['HEIGHT_NORMALIZATION_PM_VAL']
+            
+        if config["NOW_TEST"] == True:
+            assert config["NOW_VAL"] == False, "NOW_VAL and NOW_TEST cannot both be True"
+            center_lat_deg = config['CENTER_LAT_DEG_TEST']
+            center_lon_deg = config['CENTER_LON_DEG_TEST']
+            box_radius_m = config['BOX_RADIUS_M_TEST']
+            height_normalization = config['HEIGHT_NORMALIZATION_TEST']
+            lat_deg_pm = config['CENTER_LAT_DEG_PM_TEST']
+            lon_deg_pm = config['CENTER_LON_DEG_PM_TEST']
+            box_radius_m_pm = config['BOX_RADIUS_M_PM_TEST']
+            height_normalization_pm = config['HEIGHT_NORMALIZATION_PM_TEST']
 
         if config["STOCHASTIC"]:
             center_lat_deg += np.random.uniform(-lat_deg_pm, lat_deg_pm)
@@ -194,7 +195,7 @@ def get_lat_lon_radius_height(config: dict):
     # Clamp latitude to valid range
     center_lat_deg = np.clip(center_lat_deg, -90.0, 90.0)
 
-    # Wrap longituded using modulus, such that -180 < lon <= 180
+    # Wrap longitude using modulus, such that -180 < lon <= 180
     center_lon_deg = ((center_lon_deg + 180) % 360) - 180
 
     return center_lat_deg, center_lon_deg, box_radius_m, height_normalization

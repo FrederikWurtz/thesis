@@ -11,11 +11,10 @@ import shutil
 from torch.utils.data import Dataset, DataLoader
 
 from master.models.unet import UNet
-from master.train.trainer_core import DEMDataset, FluidDEMDataset
 from master.train.train_utils import normalize_inputs
 from master.train.checkpoints import load_checkpoint, read_file_from_ini
 from master.configs.config_utils import load_config_file
-from master.train.trainer_new import load_train_objs, prepare_dataloader
+from master.train.trainer_core import load_train_objs, prepare_dataloader, DEMDataset, FluidDEMDataset
 import glob
 
 
@@ -540,23 +539,33 @@ def plot_comprehensive_multi_band(
         if os.path.exists(test_results_path):
             test_results = read_file_from_ini(test_results_path, ftype=dict)
         else:
-            raise FileNotFoundError(f"Found training snapshot, but no test results file found at '{test_results_path}'. Please run testing first.")
+            #run test
+            print(f"Test results file not found at '{test_results_path}'. Running testing script...")
+            cmd = [
+            "python", "master/entry/test.py",
+            run_dir
+            ]
+            result = subprocess.run(cmd)
+            if result.returncode != 0:                
+                print("Error running test script:")
+                print(result.stderr)
+                raise RuntimeError("Testing script failed. See error message above.")
         equipment_info = read_file_from_ini(equipment_info_path, ftype=dict)
         n_gpus = int(equipment_info.get('NUM_GPUS', ['1'])[0])
     else:
-        test_results = {"TEST_LOSS": 0.0, "TEST_AME": 0.0}
+        test_results = {"TEST_LOSS": 0.0, "TEST_DEM_AME": 0.0, "TEST_W_AME": 0.0, "TEST_THETA_AME": 0.0}
         avg_train_time_per_epoch = 0.0
         avg_val_time_per_epoch = 0.0
         n_gpus = 1
-
+    
     total_time_logged = False
     total_time_path = os.path.join(sup_dir, run_dir, 'stats', 'total_time.ini')
     if os.path.exists(total_time_path):
         total_time_logged = True
         timing_info = read_file_from_ini(total_time_path, ftype=dict)
-        total_time_seconds = float(timing_info["TOTAL_TIME_SECONDS"])
-        total_time_hours = float(timing_info["TOTAL_TIME_HRS"])
-        total_time_minutes = float(timing_info["TOTAL_TIME_MINUTES"])
+        total_time_seconds = float(timing_info["TOTAL_TIME_SECONDS"][0])
+        total_time_hours = float(timing_info["TOTAL_TIME_HRS"][0])
+        total_time_minutes = float(timing_info["TOTAL_TIME_MINUTES"][0])
 
     print(f"Use train set: {use_train_set}")
     print(f"Use separate test data: {test_on_separate_data}")
@@ -582,12 +591,8 @@ def plot_comprehensive_multi_band(
             raise FileNotFoundError(f"No .pt files found in alternate test directory '{alt_test_dir}'.")
         test_dataset = DEMDataset(candidate_files, config=config)
 
-    model = UNet(
-        in_channels=config["IMAGES_PER_DEM"],
-        out_channels=3,
-        w_range=(config["W_MIN"], config["W_MAX"]),
-        theta_range=(config["THETA_BAR_MIN"], config["THETA_BAR_MAX"]),
-    )
+    run_path = os.path.join(sup_dir, run_dir)
+    train_set, val_set, test_set, model, optimizer, scheduler = load_train_objs(config, run_path, epoch_shared=train_epochs[-1]) 
     model.load_state_dict(checkpoint['MODEL_STATE'])
     model.eval()
 
@@ -656,7 +661,7 @@ def plot_comprehensive_multi_band(
         meta_batch = meta_tensor.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            outputs = model(images_norm.to(device), meta_batch, target_size=target_tensor.shape[-2:])
+            outputs = model(images_norm.to(device), meta_batch)
 
         outputs_np = outputs.squeeze(0).cpu().numpy()
         dem_pred = outputs_np[0]
@@ -729,11 +734,12 @@ def plot_comprehensive_multi_band(
     infobox_entries = [
         (
             "Multi-band UNet\n"
+            f"Number of parameters: {sum(p.numel() for p in model.parameters()):.2e}\n"
             f"Epochs trained: {int(checkpoint.get('EPOCHS_RUN', 'N/A'))}\n"
             f"Test Loss: {float(test_results['TEST_LOSS']):.3f}\n"
-            f"Test DEM AME: {float(test_results['DEM_AME']):.3f}\n"
-            f"Test W AME: {float(test_results['W_AME']):.3f}\n"
-            f"Test Theta AME: {float(test_results['THETA_AME']):.3f}\n"
+            f"Test DEM AME: {float(test_results['TEST_DEM_AME']):.3f}\n"
+            f"Test W AME: {float(test_results['TEST_W_AME']):.3f}\n"
+            f"Test Theta AME: {float(test_results['TEST_THETA_AME']):.3f}\n"
             f"LR: {float(config['LR']):.2e}",
             dict(boxstyle='round', facecolor='lightblue', alpha=0.3),
         ),
@@ -750,11 +756,11 @@ def plot_comprehensive_multi_band(
             "Multi-band Config\n"
             f"Albedo:\n"
             f"w: {float(config['W_MIN']):.3f}–{float(config['W_MAX']):.3f}\n"
-            f"w blobs: r={config['W_BLOB_RADIUS_PX']} px, ρ={float(config['W_BLOB_DENSITY']):.2f}\n"
+            f"w blobs: r={config['W_BLOB_RADIUS_PX']} px, $\\rho$={float(config['W_BLOB_DENSITY']):.2f}\n"
             f"Macroscopic Roughness:\n"
             rf"$\bar{{\theta}}$: {theta_min_rad:.1f}–{theta_max_rad:.1f} rad" "\n"
             rf"$\bar{{\theta}}$: {theta_min_deg:.1f}–{theta_max_deg:.1f}°" "\n"
-            rf"$\bar{{\theta}}$ blobs: r={config['THETA_BAR_BLOB_RADIUS_PX']} px, ρ={float(config['THETA_BAR_BLOB_DENSITY']):.2f}",
+            rf"$\bar{{\theta}}$ blobs: r={config['THETA_BAR_BLOB_RADIUS_PX']} px, $\rho$={float(config['THETA_BAR_BLOB_DENSITY']):.2f}",
             dict(boxstyle='round', facecolor='lavender', alpha=0.3),
         ),
     ]
@@ -2083,6 +2089,8 @@ if __name__ == "__main__":
                       help="Test on a separate dataset if available.")
     args.add_argument('--diff', action='store_true',
                       help="Include difference images in the plot.")
+    args.add_argument('--plot_data_vis', action='store_true',
+                      help="Plot data visualizations.")
     args = args.parse_args()
     
     # Support both positional and flag-based arguments
@@ -2092,9 +2100,13 @@ if __name__ == "__main__":
 
     config = load_config_file(os.path.join("runs", run_dir, 'stats', 'config.ini'))
 
-    if not os.path.exists(os.path.join("runs", run_dir, 'checkpoints', 'snapshot.pt')):
+    if not os.path.exists(os.path.join("runs", run_dir, 'checkpoints', 'snapshot.pt')) or args.plot_data_vis:
         #no training exists, only plot data
-        print("No training snapshot found, plotting data only...")
+        if not os.path.exists(os.path.join("runs", run_dir, 'checkpoints', 'snapshot.pt')):
+            print("No training snapshot found, plotting data only...")
+        elif args.plot_data_vis:
+            print("Plotting data visualizations...")
+            
         if config["USE_MULTI_BAND"]:
             print("Detected multi-band model, plotting multi-band data...")
             plot_data_multi_band(run_dir=os.path.join("runs", run_dir),
@@ -2115,6 +2127,8 @@ if __name__ == "__main__":
                             use_train_set = args.use_train_set)
     else:
         filename = "comprehensive"
+        if config["USE_MULTI_BAND"]:
+            filename += "_multiband"
         if not args.use_train_set:
             filename += "_testset"
         if args.use_train_set:
@@ -2140,7 +2154,8 @@ if __name__ == "__main__":
                                 same_scale=False,
                                 save_fig=True,
                                 return_fig=False,
-                                use_train_set=args.use_train_set)
+                                use_train_set=args.use_train_set,
+                                filename=filename)
             else:
                 print("Detected multi-band model, plotting multi-band predictions...")
                 plot_comprehensive_multi_band(run_dir=run_dir,
@@ -2149,7 +2164,8 @@ if __name__ == "__main__":
                                             same_scale=False,
                                             save_fig=True,
                                             return_fig=False,
-                                            use_train_set=args.use_train_set)
+                                            use_train_set=args.use_train_set,
+                                            filename=filename)
         else:
             print("Detected single-band model, plotting single-band predictions...")
             plot_comprehensive_pt(run_dir=run_dir,
@@ -2159,4 +2175,5 @@ if __name__ == "__main__":
                                   figsize=(15, 10),
                                   save_fig=True,
                                   return_fig=False,
-                                  use_train_set=args.use_train_set)
+                                  use_train_set=args.use_train_set,
+                                  filename=filename)
