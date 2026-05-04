@@ -30,20 +30,20 @@ class Trainer_multiGPU:
     def __init__(
         self,
         model: torch.nn.Module,
-        train_data: DataLoader,
+        train_loader: DataLoader,
         optimizer: torch.optim.Optimizer,
         config: dict,
         snapshot_path: str,
         train_mean: torch.Tensor = None,
         train_std: torch.Tensor = None,
-        val_data: DataLoader = None,
-        test_data: DataLoader = None,
+        val_loader: DataLoader = None,
+        test_loader: DataLoader = None,
     ) -> None:
         self.gpu_id = int(os.environ["LOCAL_RANK"])
         self.model = model.to(self.gpu_id)
-        self.train_data = train_data
-        self.val_data = val_data
-        self.test_data = test_data
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
         self.optimizer = optimizer
         # Setup ReduceLROnPlateau scheduler using config defaults
         try:
@@ -185,12 +185,12 @@ class Trainer_multiGPU:
             compute_time = 0.0
 
         # Set epoch for distributed sampler and dataset randomness, for reproducibility
-        self.train_data.sampler.set_epoch(epoch)
+        self.train_loader.sampler.set_epoch(epoch)
 
         # Also set epoch in dataset to ensure deterministic data generation
-        self.train_data.dataset.set_epoch(epoch)
+        self.train_loader.dataset.set_epoch(epoch)
 
-        for batch_idx, (images, reflectance_maps, targets, metas) in enumerate(self.train_data):
+        for batch_idx, (images, reflectance_maps, targets, metas) in enumerate(self.train_loader):
             if use_profiler and is_main():
                 batch_start = time.time()
             
@@ -332,7 +332,7 @@ class Trainer_multiGPU:
     @torch.no_grad()
     def _validate(self, epoch):
         """Run validation and return average loss"""
-        if self.val_data is None:
+        if self.val_loader is None:
             return None
             
         t0 = time.time()
@@ -343,7 +343,7 @@ class Trainer_multiGPU:
         val_loss = 0.0
         total_samples = 0
         
-        for images, reflectance_maps, targets, metas in self.val_data:
+        for images, reflectance_maps, targets, metas in self.val_loader:
             images = images.to(self.gpu_id)
             metas = metas.to(self.gpu_id)
             reflectance_maps = reflectance_maps.to(self.gpu_id)
@@ -400,13 +400,13 @@ class Trainer_multiGPU:
     @torch.no_grad()
     def test(self, data_loader: DataLoader = None):
         """Run testing and return average loss and AME"""
-        if self.test_data is None:
+        if self.test_loader is None:
             if is_main():
                 print("No test data provided. Skipping testing.")
             return None, None
         
         # Allow custom data loader for testing
-        data_loader = self.test_data if data_loader is None else data_loader
+        data_loader = self.test_loader if data_loader is None else data_loader
 
         t0 = time.time()
         epoch = self.epochs_run
@@ -482,24 +482,24 @@ class Trainer_multiGPU_multi_band:
     def __init__(
         self,
         model: torch.nn.Module = None,
-        train_data: DataLoader = None,
+        train_loader: DataLoader = None,
         optimizer: torch.optim.Optimizer = None,
         config: dict = None,
         snapshot_path: str = None,
         train_mean: torch.Tensor = None,
         train_std: torch.Tensor = None,
-        val_data: DataLoader = None,
-        test_data: DataLoader = None,
+        val_loader: DataLoader = None,
+        test_loader: DataLoader = None,
         scheduler: torch.optim.lr_scheduler._LRScheduler = None,
     ) -> None:
-        if any(param is None for param in [model, train_data, optimizer, config, snapshot_path, train_mean, train_std]):
-            raise ValueError("Model, train_data, optimizer, config, snapshot_path, train_mean, and train_std must all be provided for Trainer_multiGPU_multi_band.")
+        if any(param is None for param in [model, train_loader, optimizer, config, snapshot_path, train_mean, train_std]):
+            raise ValueError("Model, train_loader, optimizer, config, snapshot_path, train_mean, and train_std must all be provided for Trainer_multiGPU_multi_band.")
         
         self.gpu_id = int(os.environ["LOCAL_RANK"])
         self.model = model.to(self.gpu_id)
-        self.train_data = train_data
-        self.val_data = val_data
-        self.test_data = test_data
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.save_every = config["SAVE_EVERY"]
@@ -513,7 +513,7 @@ class Trainer_multiGPU_multi_band:
         self.train_std = train_std.to(self.gpu_id)
         self.model = DDP(self.model, device_ids=[self.gpu_id]) # First wrap model in DDP
         if torch.distributed.get_world_size() == 1:
-            print("🔥 About to compile model with torch.compile() on single GPU...")
+            print("🔥 Compiling model with torch.compile() on single GPU. Will take some time...")
             self.model = torch.compile(self.model, mode='reduce-overhead')
         else:
             if is_main():
@@ -524,6 +524,10 @@ class Trainer_multiGPU_multi_band:
         self.snapshot_path = snapshot_path # Path to save/load snapshots
         self.last_snapshot_path = snapshot_path
         self.best_snapshot_path = snapshot_path.replace("snapshot.pt", "snapshot_best.pt")
+        # Keep a copy of last known LRs to detect changes
+        self._last_lrs = [pg.get('lr', None) for pg in self.optimizer.param_groups]
+        # Path to record LR-change epochs
+        self.lr_changes_ini = os.path.join(os.path.dirname(self.snapshot_path), 'lr_changes.ini')
         self.best_val_loss = float("inf")
         if os.path.exists(snapshot_path): 
             if is_main():
@@ -536,6 +540,7 @@ class Trainer_multiGPU_multi_band:
         snapshot = {
             "MODEL_STATE": self.model.module.state_dict(),
             "OPTIMIZER_STATE": self.optimizer.state_dict(),  # Save optimizer state
+            "SCHEDULER_STATE": self.scheduler.state_dict() if hasattr(self, 'scheduler') and self.scheduler is not None else None,
             "EPOCHS_RUN": epoch,
             "TRAIN_LOSS_HISTORY": self.train_loss_history,  # Save loss history
             "VAL_LOSS_HISTORY": self.val_loss_history,  # Save validation loss history
@@ -598,6 +603,14 @@ class Trainer_multiGPU_multi_band:
                     state[k] = v.to(self.gpu_id)
 
         self.optimizer.load_state_dict(optimizer_state)  # Load optimizer state
+        # restore scheduler state if present
+        if hasattr(self, 'scheduler') and self.scheduler is not None and "SCHEDULER_STATE" in snapshot and snapshot["SCHEDULER_STATE"] is not None:
+            try:
+                self.scheduler.load_state_dict(snapshot["SCHEDULER_STATE"])
+                if is_main() and self.debug:
+                    print("Loaded scheduler state from snapshot")
+            except Exception as e:
+                print(f"Warning: Failed to load scheduler state: {e}")
 
         # Load scaler state if it exists and we're using AMP
         if self.scaler is not None and "SCALER_STATE" in snapshot:
@@ -615,6 +628,31 @@ class Trainer_multiGPU_multi_band:
             print(f"Resuming model from snapshot at Epoch {self.epochs_run}")
         self.best_val_loss = snapshot["BEST_VAL_LOSS"]
         self.model.train()  # Set back to training mode
+
+    def _record_lr_change(self, epoch, new_lrs):
+        """Append (epoch, new_lrs) to the LR changes INI file as a list entry.
+
+        Each entry is stored as a tuple: (epoch, (lr1, lr2, ...)).
+        """
+        try:
+            existing = read_file_from_ini(self.lr_changes_ini, ftype=list)
+        except FileNotFoundError:
+            existing = []
+
+        # Normalize values to basic Python types
+        try:
+            lr_tuple = tuple(float(x) for x in new_lrs)
+        except Exception:
+            # fallback: stringify
+            lr_tuple = tuple(str(x) for x in new_lrs)
+
+        entry = (int(epoch), lr_tuple)
+        existing.append(entry)
+
+        # save back to INI (save_file_as_ini handles lists)
+        save_file_as_ini(existing, self.lr_changes_ini)
+        print(f"Epoch {epoch} | LR change detected. Recorded new LRs: {lr_tuple} in {self.lr_changes_ini}")
+
 
     def _run_epoch(self, epoch, return_val=False):
         t0 = time.time()
@@ -640,12 +678,12 @@ class Trainer_multiGPU_multi_band:
         # self.model.eval()
         
         # Set epoch for distributed sampler and dataset randomness, for reproducibility
-        self.train_data.sampler.set_epoch(epoch)
+        self.train_loader.sampler.set_epoch(epoch)
 
         # Also set epoch in dataset to ensure deterministic data generation
-        self.train_data.dataset.set_epoch(epoch)
+        self.train_loader.dataset.set_epoch(epoch)
 
-        for batch_idx, (images, reflectance_map_targets, dem_targets, metas, w_targets, theta_targets, lro_metas) in enumerate(self.train_data):
+        for batch_idx, (images, reflectance_map_targets, dem_targets, metas, w_targets, theta_targets, lro_metas) in enumerate(self.train_loader):
             if use_profiler and is_main():
                 batch_start = time.time()
             
@@ -828,7 +866,27 @@ class Trainer_multiGPU_multi_band:
             # Validate on ALL GPUs at checkpoint intervals
             if epoch % self.save_every == 0:
                 val_loss = self._validate(epoch)
-                
+                # Step scheduler on validation loss if available
+                if hasattr(self, 'scheduler') and self.scheduler is not None and val_loss is not None:
+                    try:
+                        self.scheduler.step(val_loss)
+                        # detect LR reduction (compare first param-group lr by default)
+                        new_lrs = [group.get('lr', None) for group in self.optimizer.param_groups]
+                        # consider change if any lr strictly decreased
+                        decreased = any((nl is not None and ll is not None and nl < ll - 1e-12) for nl, ll in zip(new_lrs, self._last_lrs))
+                        if decreased:
+                            try:
+                                self._record_lr_change(epoch, new_lrs)
+                            except Exception as e:
+                                print(f"Warning: failed to record lr change: {e}")
+                        # update last lr snapshot
+                        self._last_lrs = new_lrs
+                        if is_main() and self.debug:
+                            # log current LR(s)
+                            lrs = [group.get('lr', None) for group in self.optimizer.param_groups]
+                            print(f"Scheduler stepped. Current LRs: {lrs}")
+                    except Exception as e:
+                        print(f"Warning: scheduler step failed: {e}")
                 # But only GPU 0 saves the snapshot
                 if self.gpu_id == 0:
                     self._save_snapshot(epoch, val_loss=val_loss)
@@ -841,7 +899,7 @@ class Trainer_multiGPU_multi_band:
     @torch.no_grad()
     def _validate(self, epoch):
         """Run validation and return average loss"""
-        if self.val_data is None:
+        if self.val_loader is None:
             return None
             
         t0 = time.time()
@@ -852,7 +910,7 @@ class Trainer_multiGPU_multi_band:
         val_loss = 0.0
         total_samples = 0
         
-        for images, reflectance_map_targets, dem_targets, metas, w_targets, theta_targets, lro_metas in self.val_data:
+        for images, reflectance_map_targets, dem_targets, metas, w_targets, theta_targets, lro_metas in self.val_loader:
             images = images.to(self.gpu_id)
             metas = metas.to(self.gpu_id)
             reflectance_map_targets = reflectance_map_targets.to(self.gpu_id)
@@ -918,13 +976,13 @@ class Trainer_multiGPU_multi_band:
     @torch.no_grad()
     def test(self, data_loader: DataLoader = None):
         """Run testing and return average loss and AME"""
-        if self.test_data is None:
+        if self.test_loader is None:
             if is_main():
                 print("No test data provided. Skipping testing.")
             return None, None
         
         # Allow custom data loader for testing
-        data_loader = self.test_data if data_loader is None else data_loader
+        data_loader = self.test_loader if data_loader is None else data_loader
 
         t0 = time.time()
         epoch = self.epochs_run

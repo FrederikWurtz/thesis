@@ -81,31 +81,47 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     # value for each process to share current epoch - otherwise the deterministic randomness will not be set correctly!
     EPOCH_SHARED = multiprocessing.Value('i', 0)  # 'i' means integer
 
-    train_set, val_set, test_set, model, optimizer = load_train_objs(config, run_path, epoch_shared=EPOCH_SHARED) 
+    train_set, val_set, test_set, model, optimizer, scheduler = load_train_objs(config, run_path, epoch_shared=EPOCH_SHARED) 
     
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
                                       num_workers=config["NUM_WORKERS_DATALOADER"], 
                                       prefetch_factor=config["PREFETCH_FACTOR"],
-                                      use_shuffle=True
-                                      )
+                                      use_shuffle=True,
+                                      persistent_workers=True,
+                                      multi_gpu=True)
                                       
     
     val_loader = prepare_dataloader(val_set, config["BATCH_SIZE"], 
                                     num_workers=config["NUM_WORKERS_DATALOADER"], 
                                     prefetch_factor=config["PREFETCH_FACTOR"],
-                                    use_shuffle=False)
+                                    use_shuffle=False,
+                                    persistent_workers=True,
+                                    multi_gpu=True)
     
     test_loader = prepare_dataloader(test_set, config["BATCH_SIZE"], 
                                      num_workers=config["NUM_WORKERS_DATALOADER"], 
                                      prefetch_factor=config["PREFETCH_FACTOR"],
-                                     use_shuffle=False)
+                                     use_shuffle=False,
+                                     persistent_workers=True,
+                                     multi_gpu=True)
 
     if config["USE_MULTI_BAND"]:
         if is_main():
             print("Using multi-band model for training...")
-        trainer = Trainer_multiGPU_multi_band(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
+            trainer = Trainer_multiGPU_multi_band(model = model, 
+                                                    train_loader = train_loader, 
+                                                    optimizer = optimizer, 
+                                                    config = config, 
+                                                    snapshot_path = snapshot_path, 
+                                                    train_mean = train_mean, 
+                                                    train_std = train_std, 
+                                                    val_loader = val_loader, 
+                                                    test_loader = test_loader, 
+                                                    scheduler = scheduler)
     else:
-        trainer = Trainer_multiGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
+        # no longer updated
+        raise RuntimeError("MultiGPU non MB no longer updated.")
+        # trainer = Trainer_multiGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_data=val_loader, test_data=test_loader)
 
     if is_main():
         number_of_gpus = torch.cuda.device_count()
