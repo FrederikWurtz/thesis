@@ -65,7 +65,7 @@ def main(run_dir: str, test_on_separate_data: bool):
                                         num_workers=config["NUM_WORKERS_DATALOADER"], 
                                         prefetch_factor=config["PREFETCH_FACTOR"],
                                         multi_gpu=use_multiGPU)
-    else: # testing on separate data
+    elif test_on_separate_data: # testing on separate data
         alt_test_dir = os.path.join(run_path, 'train')
         print(f"Testing on separate data in directory: {alt_test_dir}")
         # check for existence, else generate data
@@ -98,7 +98,16 @@ def main(run_dir: str, test_on_separate_data: bool):
         if is_main():
             print("Starting testing...")
     else:
-        trainer = Trainer_singleGPU(model, train_loader, optimizer, config, snapshot_path, train_mean, train_std, val_loader, test_loader)
+        trainer = Trainer_singleGPU(model = model,
+                                    train_loader = train_loader,
+                                    optimizer = optimizer,
+                                    config = config,
+                                    snapshot_path = snapshot_path,
+                                    train_mean = train_mean,
+                                    train_std = train_std,
+                                    val_loader = val_loader,
+                                    test_loader = test_loader,
+                                    scheduler = scheduler)
         print("Starting testing...")
 
     global_test_loss, global_ame = trainer.test()

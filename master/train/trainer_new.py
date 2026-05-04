@@ -481,22 +481,27 @@ class Trainer_multiGPU:
 class Trainer_multiGPU_multi_band:
     def __init__(
         self,
-        model: torch.nn.Module,
-        train_data: DataLoader,
-        optimizer: torch.optim.Optimizer,
-        config: dict,
-        snapshot_path: str,
+        model: torch.nn.Module = None,
+        train_data: DataLoader = None,
+        optimizer: torch.optim.Optimizer = None,
+        config: dict = None,
+        snapshot_path: str = None,
         train_mean: torch.Tensor = None,
         train_std: torch.Tensor = None,
         val_data: DataLoader = None,
         test_data: DataLoader = None,
+        scheduler: torch.optim.lr_scheduler._LRScheduler = None,
     ) -> None:
+        if any(param is None for param in [model, train_data, optimizer, config, snapshot_path, train_mean, train_std]):
+            raise ValueError("Model, train_data, optimizer, config, snapshot_path, train_mean, and train_std must all be provided for Trainer_multiGPU_multi_band.")
+        
         self.gpu_id = int(os.environ["LOCAL_RANK"])
         self.model = model.to(self.gpu_id)
         self.train_data = train_data
         self.val_data = val_data
         self.test_data = test_data
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.save_every = config["SAVE_EVERY"]
         self.epochs_run = 0
         self.train_loss_history = []  # Track losses
@@ -1033,6 +1038,9 @@ class Trainer_singleGPU:
         scheduler: torch.optim.lr_scheduler._LRScheduler = None,
     ) -> None:
         # Select device: prefer MPS, then CPU
+        if any(param is None for param in [model, train_loader, optimizer, config, snapshot_path, train_mean, train_std]):
+            raise ValueError("Model, train_loader, optimizer, config, snapshot_path, train_mean, and train_std must all be provided for Trainer_singleGPU.")
+        
         if torch.backends.mps.is_available():
             self.device = torch.device('mps')
             print("Using MPS device for training.")

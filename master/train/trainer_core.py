@@ -33,7 +33,9 @@ def load_train_objs(config, run_path: str, epoch_shared=None):
     if config["USE_STATIC"]:
         if is_main():
             print("Using static DEM dataset for training.")
-        train_set = DEMDataset(list_pt_files(os.path.join(run_path, 'train')), config=config) # load your dataset
+        train_path = os.path.join(run_path, 'train') # load training dataset
+        train_files = list_pt_files(train_path)
+        train_set = DEMDataset(train_files, config=config) # load your dataset
     if config["USE_SEMIFLUID"]:
         if is_main():
             print("Using SemiFluidDEMDataset for training.")
@@ -45,8 +47,8 @@ def load_train_objs(config, run_path: str, epoch_shared=None):
     val_path = os.path.join(run_path, 'val') # load validation dataset
     val_files = list_pt_files(val_path)
     val_set = DEMDataset(val_files, config=config)
-    test_set = list_pt_files(os.path.join(run_path, 'test'))  # load test dataset
-    test_set = DEMDataset(test_set, config=config)
+    test_files = list_pt_files(os.path.join(run_path, 'test'))  # load test dataset
+    test_set = DEMDataset(test_files, config=config)
     upsample_factor = config["DEM_SIZE"] // config["IMAGE_H"]  # Calculate upsample factor based on config
     # assert that upsample factor is a power of 2, since our UNet architecture upsamples by a factor of 2 at each layer
     assert upsample_factor in [1, 2, 4, 8, 16], f"Upsample factor must be 1, 2, 4, or 8. Got {upsample_factor}."
