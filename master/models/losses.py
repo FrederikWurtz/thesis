@@ -36,7 +36,8 @@ def _render_shading_batched(dem_tensor_flat, meta_flat, camera, hapke_model_or_p
         if is_spatial:
             w_map = hapke_model_or_params['w'][i]  # [H, W]
             theta_map = hapke_model_or_params['theta_bar'][i]  # [H, W]
-            hapke_model = FullHapkeModel(w=w_map, theta_bar_rad=theta_map, debug=debug)
+            #hapke_model = FullHapkeModel(w=w_map, theta_bar_rad=theta_map, debug=debug)
+            hapke_model = FullHapkeModel(w=w_map, b=theta_map, debug=debug)
         else:
             hapke_model = hapke_model_or_params  # Reuse shared model
         
@@ -242,6 +243,7 @@ def calculate_total_loss(outputs, targets, target_reflectance_maps, meta, hapke_
     Returns:
         total_loss: Weighted sum of all loss components
     """
+    print("Using Single band")
     outputs_norm = outputs / height_norm if height_norm is not None else outputs
     targets_norm = targets / height_norm if height_norm is not None else targets
 
@@ -268,6 +270,7 @@ def calculate_total_loss(outputs, targets, target_reflectance_maps, meta, hapke_
         return total_loss
 def calculate_total_loss_multi_band(dem_outputs, dem_targets, reflectance_map_targets, metas, w_outputs, w_targets, theta_outputs, theta_targets, device=None,
                         config=None, return_components=False, debug=False):
+    
     """
     Calculate total loss combining MSE, gradient loss, and reflectance map loss.
     
@@ -362,7 +365,7 @@ def calculate_total_loss_multi_band(dem_outputs, dem_targets, reflectance_map_ta
     
     # # Try without reflectance to see how much time it takes
     # # 3. Reflectance Map Loss - physics-based constraint
-    predicted_reflectance_maps = compute_reflectance_map_from_dem_multi_band(dem_outputs.detach(), # stop reflectance gradients affecting the DEM 
+    predicted_reflectance_maps = compute_reflectance_map_from_dem_multi_band(dem_outputs,
                                                                              metas, 
                                                                              device, 
                                                                              config["CAMERA_PARAMS"], 
@@ -370,6 +373,14 @@ def calculate_total_loss_multi_band(dem_outputs, dem_targets, reflectance_map_ta
                                                                              theta_band=theta_outputs, 
                                                                              debug=debug
                                                                              )
+ #   predicted_reflectance_maps = compute_reflectance_map_from_dem_multi_band(dem_outputs.detach(), # stop reflectance gradients affecting the DEM 
+ #                                                                            metas, 
+ #                                                                            device, 
+ #                                                                            config["CAMERA_PARAMS"], 
+ #                                                                            w_band=w_outputs, 
+ #                                                                            theta_band=theta_outputs, 
+ #                                                                            debug=debug
+ #                                                                            )
     
     
     eps = 1e-6

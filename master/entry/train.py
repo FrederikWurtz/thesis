@@ -1,7 +1,7 @@
 import subprocess
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
 import torch
 import argparse
@@ -41,9 +41,9 @@ def cleanup():
 def run_train(run_dir, new_run=False):
     if torch.cuda.is_available():
 
-        n_proc_per_node = torch.cuda.device_count()
+        n_proc_per_node = 1
         # Limit to 3 GPUs to avoid race condition issues with 4th GPU
-        n_proc_per_node = min(n_proc_per_node, 3)
+        #n_proc_per_node = min(n_proc_per_node, 4)
         print(f"Starting training with {n_proc_per_node} GPUs...")
         cmd = [
             "torchrun",
@@ -57,7 +57,7 @@ def run_train(run_dir, new_run=False):
         env = os.environ.copy()
         env["OMP_NUM_THREADS"] = "2"
         env["GDAL_NUM_THREADS"] = "2"
-        env["CUDA_VISIBLE_DEVICES"] = "0,1,2"
+        # env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
         signal.signal(signal.SIGINT, handle_sigint)
         signal.signal(signal.SIGTERM, handle_sigint)

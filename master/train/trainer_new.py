@@ -18,6 +18,7 @@ from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 from torch.amp import autocast, GradScaler
 import torch
 from torch.profiler import profile, record_function, ProfilerActivity
+import torch.distributed as dist
 
 # 🔥 Suppress torch.compile() warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
@@ -485,18 +486,25 @@ class Trainer_multiGPU_multi_band:
         train_loader: DataLoader = None,
         optimizer: torch.optim.Optimizer = None,
         config: dict = None,
-        snapshot_path: str = None,
+        checkpoints_path: str = None,
         train_mean: torch.Tensor = None,
         train_std: torch.Tensor = None,
         val_loader: DataLoader = None,
         test_loader: DataLoader = None,
         scheduler: torch.optim.lr_scheduler._LRScheduler = None,
     ) -> None:
-        if any(param is None for param in [model, train_loader, optimizer, config, snapshot_path, train_mean, train_std]):
+        if any(param is None for param in [model, train_loader, optimizer, config, checkpoints_path, train_mean, train_std]):
             raise ValueError("Model, train_loader, optimizer, config, snapshot_path, train_mean, and train_std must all be provided for Trainer_multiGPU_multi_band.")
         
-        self.gpu_id = int(os.environ["LOCAL_RANK"])
-        self.model = model.to(self.gpu_id)
+        self.device = torch.cuda.current_device()
+        self.model = model.to(self.device)
+        self.train_mean = train_mean.to(self.device)
+        self.train_std = train_std.to(self.device)
+        self.model = DDP(
+            self.model,
+            device_ids=[self.device],
+            output_device=self.device
+        )
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
@@ -509,9 +517,6 @@ class Trainer_multiGPU_multi_band:
         self.train_timings = []
         self.val_timings = []
         self.config = config
-        self.train_mean = train_mean.to(self.gpu_id)
-        self.train_std = train_std.to(self.gpu_id)
-        self.model = DDP(self.model, device_ids=[self.gpu_id]) # First wrap model in DDP
         if torch.distributed.get_world_size() == 1:
             print("🔥 Compiling model with torch.compile() on single GPU. Will take some time...")
             self.model = torch.compile(self.model, mode='reduce-overhead')
@@ -521,18 +526,18 @@ class Trainer_multiGPU_multi_band:
         self.dtype = torch.bfloat16 if self.config["USE_BF16"] else torch.float16
         self.use_amp = self.config["USE_AMP"]
         self.scaler = GradScaler('cuda') if (self.use_amp and self.dtype == torch.float16) else None
-        self.snapshot_path = snapshot_path # Path to save/load snapshots
-        self.last_snapshot_path = snapshot_path
-        self.best_snapshot_path = snapshot_path.replace("snapshot.pt", "snapshot_best.pt")
+        
+        self.snapshot_path = os.path.join(checkpoints_path, "snapshot.pt")
+        self.best_snapshot_path = os.path.join(checkpoints_path, "snapshot_best.pt")
         # Keep a copy of last known LRs to detect changes
         self._last_lrs = [pg.get('lr', None) for pg in self.optimizer.param_groups]
         # Path to record LR-change epochs
         self.lr_changes_ini = os.path.join(os.path.dirname(self.snapshot_path), 'lr_changes.ini')
         self.best_val_loss = float("inf")
-        if os.path.exists(snapshot_path): 
+        if os.path.exists(self.snapshot_path): 
             if is_main():
-                print("Loading snapshot")
-            self._load_snapshot(snapshot_path) # Then, after DDP wrapping, load snapshot if it exists
+                print("Loading last snapshot")
+            self._load_snapshot(self.snapshot_path) # Then, after DDP wrapping, load snapshot if it exists
             
         self.debug = self.config["DEBUG"]
 
@@ -588,7 +593,7 @@ class Trainer_multiGPU_multi_band:
 
                 
     def _load_snapshot(self, snapshot_path):
-        loc = f"cuda:{self.gpu_id}"
+        loc = f"cuda:{self.device}"
         snapshot = torch.load(snapshot_path, map_location=loc)
 
         self.model.module.load_state_dict(snapshot["MODEL_STATE"])
@@ -600,14 +605,14 @@ class Trainer_multiGPU_multi_band:
         for state in optimizer_state['state'].values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
-                    state[k] = v.to(self.gpu_id)
+                    state[k] = v.to(self.device)
 
         self.optimizer.load_state_dict(optimizer_state)  # Load optimizer state
         # restore scheduler state if present
         if hasattr(self, 'scheduler') and self.scheduler is not None and "SCHEDULER_STATE" in snapshot and snapshot["SCHEDULER_STATE"] is not None:
             try:
                 self.scheduler.load_state_dict(snapshot["SCHEDULER_STATE"])
-                if is_main() and self.debug:
+                if is_main():
                     print("Loaded scheduler state from snapshot")
             except Exception as e:
                 print(f"Warning: Failed to load scheduler state: {e}")
@@ -628,6 +633,30 @@ class Trainer_multiGPU_multi_band:
             print(f"Resuming model from snapshot at Epoch {self.epochs_run}")
         self.best_val_loss = snapshot["BEST_VAL_LOSS"]
         self.model.train()  # Set back to training mode
+        # --- Load LR change history ---
+        self.lr_changes_ini = os.path.join(os.path.dirname(snapshot_path), 'lr_changes.ini')
+
+        # Restore last known LR from file (if it exists)
+        self.lr_changes_ini = os.path.join(os.path.dirname(snapshot_path), 'lr_changes.ini')
+
+        current_lrs = [pg.get('lr', None) for pg in self.optimizer.param_groups]
+
+        if os.path.exists(self.lr_changes_ini):
+            try:
+                existing = read_file_from_ini(self.lr_changes_ini, ftype=list)
+
+                if len(existing) > 0:
+                    _, last_lrs = existing[-1]
+                    self._last_lrs = list(last_lrs)
+                else:
+                    self._last_lrs = current_lrs
+
+            except Exception as e:
+                print(f"Warning: Failed to load lr_changes.ini: {e}")
+                self._last_lrs = current_lrs
+        else:
+            self._last_lrs = current_lrs
+
 
     def _record_lr_change(self, epoch, new_lrs):
         """Append (epoch, new_lrs) to the LR changes INI file as a list entry.
@@ -639,19 +668,22 @@ class Trainer_multiGPU_multi_band:
         except FileNotFoundError:
             existing = []
 
-        # Normalize values to basic Python types
         try:
             lr_tuple = tuple(float(x) for x in new_lrs)
         except Exception:
-            # fallback: stringify
             lr_tuple = tuple(str(x) for x in new_lrs)
+
+        # ✅ Skip if same as last recorded LR
+        if len(existing) > 0:
+            _, last_lrs = existing[-1]
+            if tuple(last_lrs) == lr_tuple:
+                return
 
         entry = (int(epoch), lr_tuple)
         existing.append(entry)
 
-        # save back to INI (save_file_as_ini handles lists)
         save_file_as_ini(existing, self.lr_changes_ini)
-        print(f"Epoch {epoch} | LR change detected. Recorded new LRs: {lr_tuple} in {self.lr_changes_ini}")
+        print(f"Epoch {epoch} | LR change recorded: {lr_tuple}")
 
 
     def _run_epoch(self, epoch, return_val=False):
@@ -665,7 +697,7 @@ class Trainer_multiGPU_multi_band:
             print("Running epoch {}".format(epoch))
 
         # 🔥 Accumulate on GPU instead of CPU
-        epoch_loss = torch.zeros(1, dtype=torch.float32, device=f'cuda:{self.gpu_id}')
+        epoch_loss = torch.zeros(1, dtype=torch.float32, device=f'cuda:{self.device}')
         total_samples = 0
 
         # Add detailed timing if profiling
@@ -682,18 +714,19 @@ class Trainer_multiGPU_multi_band:
 
         # Also set epoch in dataset to ensure deterministic data generation
         self.train_loader.dataset.set_epoch(epoch)
+        
 
         for batch_idx, (images, reflectance_map_targets, dem_targets, metas, w_targets, theta_targets, lro_metas) in enumerate(self.train_loader):
             if use_profiler and is_main():
                 batch_start = time.time()
             
-            images = images.to(self.gpu_id)
-            metas = metas.to(self.gpu_id)
-            reflectance_map_targets = reflectance_map_targets.to(self.gpu_id)
+            images = images.to(self.device)
+            metas = metas.to(self.device)
+            reflectance_map_targets = reflectance_map_targets.to(self.device)
             images = normalize_inputs(images, self.train_mean, self.train_std)
-            w_targets = w_targets.to(self.gpu_id)
-            theta_targets = theta_targets.to(self.gpu_id)
-            dem_targets = dem_targets.to(self.gpu_id)
+            w_targets = w_targets.to(self.device)
+            theta_targets = theta_targets.to(self.device)
+            dem_targets = dem_targets.to(self.device)
 
             source = images, metas
             targets = dem_targets, reflectance_map_targets, w_targets, theta_targets
@@ -721,8 +754,8 @@ class Trainer_multiGPU_multi_band:
         epoch_loss_value = epoch_loss.item()
 
         # Gather total loss sums (not averages) from all GPUs
-        epoch_loss_tensor = torch.tensor([epoch_loss_value], dtype=torch.float32, device=f'cuda:{self.gpu_id}')
-        total_samples_tensor = torch.tensor([total_samples], dtype=torch.int64, device=f'cuda:{self.gpu_id}')
+        epoch_loss_tensor = torch.tensor([epoch_loss_value], dtype=torch.float32, device=f'cuda:{self.device}')
+        total_samples_tensor = torch.tensor([total_samples], dtype=torch.int64, device=f'cuda:{self.device}')
         
         torch.distributed.all_reduce(epoch_loss_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of losses across GPUs
         torch.distributed.all_reduce(total_samples_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of samples across GPUs
@@ -739,7 +772,7 @@ class Trainer_multiGPU_multi_band:
             self.train_loss_history.append(global_avg_loss)
             total_time = time.time() - t0
             self.train_timings.append(total_time)
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {global_avg_loss:.2e} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s | Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"[GPU{self.device}] Epoch {epoch} | Loss: {global_avg_loss:.2e} | Samples: {total_samples_tensor.item()} | Time: {total_time:.2f}s | Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         if return_val:
             return global_avg_loss
@@ -888,7 +921,7 @@ class Trainer_multiGPU_multi_band:
                     except Exception as e:
                         print(f"Warning: scheduler step failed: {e}")
                 # But only GPU 0 saves the snapshot
-                if self.gpu_id == 0:
+                if is_main():
                     self._save_snapshot(epoch, val_loss=val_loss)
 
         if use_profiler and is_main():
@@ -911,12 +944,12 @@ class Trainer_multiGPU_multi_band:
         total_samples = 0
         
         for images, reflectance_map_targets, dem_targets, metas, w_targets, theta_targets, lro_metas in self.val_loader:
-            images = images.to(self.gpu_id)
-            metas = metas.to(self.gpu_id)
-            reflectance_map_targets = reflectance_map_targets.to(self.gpu_id)
-            dem_targets = dem_targets.to(self.gpu_id)
-            w_targets = w_targets.to(self.gpu_id)
-            theta_targets = theta_targets.to(self.gpu_id)
+            images = images.to(self.device)
+            metas = metas.to(self.device)
+            reflectance_map_targets = reflectance_map_targets.to(self.device)
+            dem_targets = dem_targets.to(self.device)
+            w_targets = w_targets.to(self.device)
+            theta_targets = theta_targets.to(self.device)
             images = normalize_inputs(images, self.train_mean, self.train_std)
             batch_size = images.size(0)
             
@@ -935,7 +968,7 @@ class Trainer_multiGPU_multi_band:
 
                 total_loss = calculate_total_loss_multi_band(
                     dem_outputs, dem_targets, reflectance_map_targets, metas, w_outputs, w_targets, theta_outputs, theta_targets,
-                    device=self.gpu_id,
+                    device=self.device,
                     config=self.config,
                     return_components=False,
                     debug=self.debug
@@ -946,8 +979,8 @@ class Trainer_multiGPU_multi_band:
         
         
         # Gather losses and sample counts from all GPUs
-        val_loss_tensor = torch.tensor([val_loss], device=self.gpu_id)
-        total_samples_tensor = torch.tensor([total_samples], device=self.gpu_id)
+        val_loss_tensor = torch.tensor([val_loss], device=self.device)
+        total_samples_tensor = torch.tensor([total_samples], device=self.device)
         
         torch.distributed.all_reduce(val_loss_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of validation losses across GPUs
         torch.distributed.all_reduce(total_samples_tensor, op=torch.distributed.ReduceOp.SUM) # Sum of validation samples across GPUs
@@ -968,7 +1001,7 @@ class Trainer_multiGPU_multi_band:
             self.val_loss_history.append(global_avg_val_loss)
             val_time = time.time() - t0
             self.val_timings.append(val_time)
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Val Loss: {global_avg_val_loss:.2e} | Samples: {global_total_samples} | Time: {val_time:.2f}s | Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"[GPU{self.device}] Epoch {epoch} | Val Loss: {global_avg_val_loss:.2e} | Samples: {global_total_samples} | Time: {val_time:.2f}s | Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         self.model.train()  # Set back to training mode
         return global_avg_val_loss
@@ -997,12 +1030,12 @@ class Trainer_multiGPU_multi_band:
         total_samples = 0
         
         for images, reflectance_map_targets, dem_targets, metas, w_targets, theta_targets, lro_metas in data_loader:
-            images = images.to(self.gpu_id)
-            metas = metas.to(self.gpu_id)
-            reflectance_map_targets = reflectance_map_targets.to(self.gpu_id)
-            dem_targets = dem_targets.to(self.gpu_id)
-            w_targets = w_targets.to(self.gpu_id)
-            theta_targets = theta_targets.to(self.gpu_id)
+            images = images.to(self.device)
+            metas = metas.to(self.device)
+            reflectance_map_targets = reflectance_map_targets.to(self.device)
+            dem_targets = dem_targets.to(self.device)
+            w_targets = w_targets.to(self.device)
+            theta_targets = theta_targets.to(self.device)
             images = normalize_inputs(images, self.train_mean, self.train_std)
             
             batch_size = images.size(0)
@@ -1015,7 +1048,7 @@ class Trainer_multiGPU_multi_band:
                 # Calculate loss
                 total_loss = calculate_total_loss_multi_band(
                     dem_outputs, dem_targets, reflectance_map_targets, metas, w_outputs, w_targets, theta_outputs, theta_targets,
-                    device=self.gpu_id,
+                    device=self.device,
                     config=self.config,
                     return_components=False,
                     debug=self.debug
@@ -1035,11 +1068,11 @@ class Trainer_multiGPU_multi_band:
         
         
         # Gather losses, AMEs, and sample counts from all GPUs
-        test_loss_tensor = torch.tensor([test_loss], device=self.gpu_id)
-        dem_ame_tensor = torch.tensor([dem_total_ame], device=self.gpu_id)
-        w_ame_tensor = torch.tensor([w_total_ame], device=self.gpu_id)
-        theta_ame_tensor = torch.tensor([theta_total_ame], device=self.gpu_id)
-        total_samples_tensor = torch.tensor([total_samples], device=self.gpu_id)
+        test_loss_tensor = torch.tensor([test_loss], device=self.device)
+        dem_ame_tensor = torch.tensor([dem_total_ame], device=self.device)
+        w_ame_tensor = torch.tensor([w_total_ame], device=self.device)
+        theta_ame_tensor = torch.tensor([theta_total_ame], device=self.device)
+        total_samples_tensor = torch.tensor([total_samples], device=self.device)
         
         torch.distributed.all_reduce(test_loss_tensor, op=torch.distributed.ReduceOp.SUM)
         torch.distributed.all_reduce(dem_ame_tensor, op=torch.distributed.ReduceOp.SUM)
@@ -1062,7 +1095,7 @@ class Trainer_multiGPU_multi_band:
         
         if is_main():
             test_time = time.time() - t0
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Test Loss: {global_test_loss:.2e} | DEM AME: {global_dem_ame:.6f} | W AME: {global_w_ame:.6f} | Theta AME: {global_theta_ame:.6f} | Samples: {global_total_samples} | Time: {test_time:.2f}s")
+            print(f"[GPU{self.device}] Epoch {epoch} | Test Loss: {global_test_loss:.2e} | DEM AME: {global_dem_ame:.6f} | W AME: {global_w_ame:.6f} | Theta AME: {global_theta_ame:.6f} | Samples: {global_total_samples} | Time: {test_time:.2f}s")
         
         # print(f"Debug: test_loss_tensor={test_loss_tensor.item():.10f}, total_samples_tensor={total_samples_tensor.item()}")
         self.model.train()  # Set back to training mode
@@ -1159,7 +1192,9 @@ class Trainer_singleGPU:
         if val_loss is not None and val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
             snapshot["BEST_VAL_LOSS"] = self.best_val_loss
-            torch.save(snapshot, self.best_snapshot_path)
+            tmp_path = self.best_snapshot_path + ".tmp"
+            torch.save(snapshot, tmp_path)
+            os.replace(tmp_path, self.best_snapshot_path)
             print(f"Epoch {epoch} | New best val loss {val_loss:.3e} | Best snapshot saved at {self.best_snapshot_path}")
         
         # Also save loss history separately as CSV for easy plotting
@@ -1202,7 +1237,7 @@ class Trainer_singleGPU:
         if hasattr(self, 'scheduler') and self.scheduler is not None and "SCHEDULER_STATE" in snapshot and snapshot["SCHEDULER_STATE"] is not None:
             try:
                 self.scheduler.load_state_dict(snapshot["SCHEDULER_STATE"])
-                if is_main() and self.debug:
+                if is_main():
                     print("Loaded scheduler state from snapshot")
             except Exception as e:
                 print(f"Warning: Failed to load scheduler state: {e}")

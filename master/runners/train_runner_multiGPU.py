@@ -20,6 +20,7 @@ from master.train.trainer_new import Trainer_multiGPU, Trainer_multiGPU_multi_ba
 from master.train.trainer_core import ddp_setup, load_train_objs, prepare_dataloader, is_main
 from master.train.checkpoints import save_file_as_ini, read_file_from_ini
 from master.configs.config_utils import load_config_file
+import torch.distributed as dist
 
 torch.multiprocessing.set_start_method('spawn', force=True)
 
@@ -72,17 +73,23 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
         if is_main():
             print(f"Created checkpoint directory: {checkpoint_dir}")
 
-    snapshot_path = os.path.join(run_path, 'checkpoints', 'snapshot.pt')
+    checkpoints_path = os.path.join(run_path, 'checkpoints')
     mean_std_path = os.path.join(run_path, 'stats', 'input_stats.ini')
     input_stats = read_file_from_ini(mean_std_path)
     train_mean = torch.tensor(input_stats['MEAN'])
     train_std = torch.tensor(input_stats['STD'])
 
-    # value for each process to share current epoch - otherwise the deterministic randomness will not be set correctly!
-    EPOCH_SHARED = multiprocessing.Value('i', 0)  # 'i' means integer
 
-    train_set, val_set, test_set, model, optimizer, scheduler = load_train_objs(config, run_path, epoch_shared=EPOCH_SHARED) 
-    
+
+
+    train_set, val_set, test_set, model, optimizer, scheduler = load_train_objs(config, run_path) 
+    print(
+        f"[rank {torch.distributed.get_rank()}] "
+        f"after load_train_objs: "
+        f"model param device = {next(model.parameters()).device}"
+    )
+
+
     train_loader = prepare_dataloader(train_set, config["BATCH_SIZE"], 
                                       num_workers=config["NUM_WORKERS_DATALOADER"], 
                                       prefetch_factor=config["PREFETCH_FACTOR"],
@@ -108,16 +115,16 @@ def main(run_dir: str, config_override_file: str = None, new_run: bool = False):
     if config["USE_MULTI_BAND"]:
         if is_main():
             print("Using multi-band model for training...")
-            trainer = Trainer_multiGPU_multi_band(model = model, 
-                                                    train_loader = train_loader, 
-                                                    optimizer = optimizer, 
-                                                    config = config, 
-                                                    snapshot_path = snapshot_path, 
-                                                    train_mean = train_mean, 
-                                                    train_std = train_std, 
-                                                    val_loader = val_loader, 
-                                                    test_loader = test_loader, 
-                                                    scheduler = scheduler)
+        trainer = Trainer_multiGPU_multi_band(model = model, 
+                                                train_loader = train_loader, 
+                                                optimizer = optimizer, 
+                                                config = config, 
+                                                checkpoints_path = checkpoints_path, 
+                                                train_mean = train_mean, 
+                                                train_std = train_std, 
+                                                val_loader = val_loader, 
+                                                test_loader = test_loader, 
+                                                scheduler = scheduler)
     else:
         # no longer updated
         raise RuntimeError("MultiGPU non MB no longer updated.")

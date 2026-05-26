@@ -25,6 +25,7 @@ from master.models.losses import calculate_total_loss
 from master.models.unet import UNet
 from master.train.train_utils import normalize_inputs
 from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
 
 
 def load_train_objs(config, run_path: str, epoch_shared=None):
@@ -104,9 +105,9 @@ def prepare_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 2, 
             persistent_workers=persistent_workers,  # 🔥 Keep workers alive between epochs
         )
 
-def set_global_epoch(epoch):
-    global GLOBAL_EPOCH
-    GLOBAL_EPOCH = epoch
+#def set_global_epoch(epoch):
+#    global GLOBAL_EPOCH
+#   GLOBAL_EPOCH = epoch
 
 
 
@@ -123,27 +124,44 @@ def generate_fluid_data(run_name: str, epoch: int):
     print(f"[Rank0] Generator finished with code {result.returncode}", flush=True)
 
 
+
 def is_main():
-    return int(os.environ["LOCAL_RANK"]) == 0 if "LOCAL_RANK" in os.environ else True
+    return not dist.is_initialized() or dist.get_rank() == 0
+
 
 def ddp_setup():
     try:
         local_rank = int(os.environ["LOCAL_RANK"])
+
+        # ✅ Bind this process to its GPU
         torch.cuda.set_device(local_rank)
-        init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
-        # 🔥 Enable cuDNN autotuner for convolution optimization
+
+        # ✅ DO NOT pass device_id here
+        init_process_group(backend="nccl")
+
+        # 🔥 cuDNN autotuner
         torch.backends.cudnn.benchmark = True
-        print(f"DDP setup complete on GPU {local_rank}")
-        # Optional: Enable TF32 for Ampere GPUs (A100, RTX 3090, etc.)
-        if torch.cuda.get_device_capability()[0] >= 8:
+
+        # 🔥 TF32 on Ampere+
+        if torch.cuda.get_device_capability(local_rank)[0] >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-        
-        # 🔥 Use TensorFloat32 for faster matmul on Ampere+ GPUs
-        torch.set_float32_matmul_precision('high')  # or 'medium' for even more speed
-        
+
+        # 🔥 Faster matmul heuristics
+        torch.set_float32_matmul_precision("high")
+
+        #print(
+        #    f"DDP setup complete | "
+        #    f"rank={torch.distributed.get_rank()} | "
+        #    f"local_rank={local_rank} | "
+        #    f"device=cuda:{torch.cuda.current_device()}"
+        #)
+
     except KeyError:
-        raise RuntimeError("LOCAL_RANK not found in environment variables. Please run this script using torch.distributed.launch or torchrun for multi-GPU training.")
+        raise RuntimeError(
+            "LOCAL_RANK not found. "
+            "Run with torchrun --nproc_per_node=N ..."
+        )
 
 class DEMDataset(Dataset):
     def __init__(self, files, config=None):
@@ -192,12 +210,12 @@ class FluidDEMDataset(Dataset):
         self.epoch_shared = epoch_shared if epoch_shared is not None else 0
         self.base_seed = config["BASE_SEED"] if "BASE_SEED" in config else 42
 
-    def set_epoch(self, epoch):
+    def set_epoch(self, epoch: int):
         """Set epoch for deterministic data generation."""
 
-        # print(f"FluidDEMDataset: Old epoch: {self.epoch_shared.value}")
-        self.epoch_shared.value = epoch
-        # print(f"FluidDEMDataset: New epoch set to {self.epoch_shared.value} in shared memory.")
+        #print(f"FluidDEMDataset: Old epoch: {self.epoch_shared}")
+        self.epoch_shared = epoch
+        #print(f"FluidDEMDataset: New epoch set to {self.epoch_shared} in shared memory.")
         # self.epoch = epoch
         # print(f"FluidDEMDataset: New epoch {self.epoch}")
 
@@ -207,15 +225,15 @@ class FluidDEMDataset(Dataset):
     def __getitem__(self, idx):
         # Set seed for reproducibility
         
-        current_epoch = self.epoch_shared.value if hasattr(self.epoch_shared, 'value') else self.epoch_shared
+        current_epoch = self.epoch_shared
         epoch_seed = self.base_seed + current_epoch * len(self) + idx
 
-        # if idx == 0:
-        #     print(f"FluidDEMDataset: Generating item idx {idx} for epoch {self.epoch_shared.value}, with seed {epoch_seed}")
+        #if idx == 0:
+        #    print(f"FluidDEMDataset: Generating item idx {idx} for epoch {self.epoch_shared}, with seed {epoch_seed}")
         
 
-        torch.manual_seed(epoch_seed)
-        np.random.seed(epoch_seed % (2**32 - 1))
+        #torch.manual_seed(epoch_seed)
+        #np.random.seed(epoch_seed % (2**32 - 1))
 
         if self.config["USE_LRO_DEMS"]:
             if self.config["USE_MULTI_BAND"]:

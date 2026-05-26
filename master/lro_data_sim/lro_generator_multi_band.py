@@ -56,7 +56,8 @@ def generate_and_return_lro_data_multi_band(config: dict = None, device: str = "
 
 
         dem_obj = DEM(dem_tensor, cellsize=1, x0=0, y0=0)
-        hapke = FullHapkeModel(w=w_tensor, theta_bar_rad=theta_bar_tensor)
+        #hapke = FullHapkeModel(w=w_tensor, theta_bar_rad=theta_bar_tensor)
+        hapke = FullHapkeModel(w=w_tensor, b=theta_bar_tensor)
         hapke.eval()  # Set to evaluation mode to disable smooth transition at shadow boundaries for rendering
         camera = Camera(image_width=config["IMAGE_W"],
                         image_height=config["IMAGE_H"],

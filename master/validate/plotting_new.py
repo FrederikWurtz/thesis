@@ -108,7 +108,7 @@ def plot_comprehensive_pt(
     # Load config to find paths
     sup_dir = "runs/"
     config = load_config_file(os.path.join(sup_dir, run_dir, 'stats', 'config.ini'))
-    snapshot_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'snapshot.pt')
+    snapshot_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'snapshot_best.pt')
     train_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'train_losses.csv')
     val_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'val_losses.csv')
     input_stats_path = os.path.join(sup_dir, run_dir, 'stats', 'input_stats.ini')
@@ -484,12 +484,14 @@ def plot_comprehensive_multi_band(
     filename=None,
     test_on_separate_data=False
 ):
+    labelsize = 15
+    fontsize = 18
     sup_dir = "runs/"
     config = load_config_file(os.path.join(sup_dir, run_dir, 'stats', 'config.ini'))
     if not config.get("USE_MULTI_BAND"):
         raise ValueError("plot_comprehensive_multi_band requires a multi-band run directory.")
 
-    snapshot_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'snapshot.pt')
+    snapshot_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'snapshot_best.pt')
     train_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'train_losses.csv')
     val_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'val_losses.csv')
     input_stats_path = os.path.join(sup_dir, run_dir, 'stats', 'input_stats.ini')
@@ -537,6 +539,8 @@ def plot_comprehensive_multi_band(
         avg_train_time_per_epoch = np.mean(train_timings_data[:, 1])
         avg_val_time_per_epoch = np.mean(val_timings_data[:, 1])
         if os.path.exists(test_results_path):
+            print(f"Test results found at {test_results_path}.")
+            print("Plotting...")
             test_results = read_file_from_ini(test_results_path, ftype=dict)
         else:
             #run test
@@ -552,6 +556,9 @@ def plot_comprehensive_multi_band(
                 raise RuntimeError("Testing script failed. See error message above.")
         equipment_info = read_file_from_ini(equipment_info_path, ftype=dict)
         n_gpus = int(equipment_info.get('NUM_GPUS', ['1'])[0])
+        if not os.path.exists(test_results_path):
+            raise ValueError(f"Finished training, but still no test results exist at {test_results_path}")
+        test_results = read_file_from_ini(test_results_path, ftype=dict)
     else:
         test_results = {"TEST_LOSS": 0.0, "TEST_DEM_AME": 0.0, "TEST_W_AME": 0.0, "TEST_THETA_AME": 0.0}
         avg_train_time_per_epoch = 0.0
@@ -710,73 +717,149 @@ def plot_comprehensive_multi_band(
     ax_loss.plot(train_epochs, train_losses, label='Training Loss', linewidth=2)
     ax_loss.plot(val_epochs, val_losses, label='Validation Loss', linewidth=2)
     ax_loss.set_yscale('log')
-    ax_loss.set_xlabel('Epoch', fontsize=12)
-    ax_loss.set_ylabel('Loss', fontsize=12)
-    ax_loss.set_title('Training and Validation Loss', fontsize=14, pad=14)
-    ax_loss.legend(fontsize=10, loc='lower left')
-    ax_loss.grid(True, alpha=0.3)
+    ax_loss.set_xlabel('Epoch', fontsize=fontsize)
+    ax_loss.set_ylabel('Loss', fontsize=fontsize)
+    ax_loss.set_title('Training and Validation Loss', fontsize=fontsize+4, pad=14)
+    #ax_loss.grid(True, alpha=0.5)
 
     from matplotlib.ticker import MaxNLocator
     ax_loss.xaxis.set_major_locator(MaxNLocator(integer=True))
 
+    lr_changes_path = os.path.join(run_path, 'checkpoints', 'lr_changes.ini')
+    if os.path.exists(lr_changes_path):
+        lr_changes = read_file_from_ini(lr_changes_path, ftype=dict)
+        n_changes = len(lr_changes)
+        print(f"Found {n_changes} change(s) to the learning rate!")        
+        # plot one slim vertical dashed line in ax_loss for each lr_change at the correct epoch (x-axis)
+        first = True
+        for k, v in lr_changes.items():
+            epoch = v[0]  # first element is epoch
+
+            ax_loss.axvline(
+                x=epoch,
+                linestyle='--',
+                linewidth=1,
+                ymin=0.0,
+                ymax=0.6,   # stops at 80% of axis height
+                color='gray',
+                alpha=0.6,
+                label='LR halving' if first else None
+            )
+
+            first = False
+
+
+    ax_loss.legend(
+        fontsize=fontsize,
+        loc='upper right',
+        facecolor='none',
+        edgecolor='black'
+    )
+
     info_width = 0.12
     info_height = 0.25
-    info_gap_h = 0.0001
-    info_start_x = loss_start_x + loss_width + 0.005
+    info_gap_h = 0.1
+    info_start_x = loss_start_x + loss_width + 0.03
     info_start_y = loss_start_y
-    fontsize_textbox = 16
+    fontsize_textbox = 35
     
     theta_min_rad = float(config["THETA_BAR_MIN"])
     theta_max_rad = float(config["THETA_BAR_MAX"])
-    theta_min_deg = np.degrees(theta_min_rad)
-    theta_max_deg = np.degrees(theta_max_rad)
 
-    infobox_entries = [
-        (
-            "Multi-band UNet\n"
-            f"Number of parameters: {sum(p.numel() for p in model.parameters()):.2e}\n"
-            f"Epochs trained: {int(checkpoint.get('EPOCHS_RUN', 'N/A'))}\n"
-            f"Test Loss: {float(test_results['TEST_LOSS']):.3f}\n"
-            f"Test DEM AME: {float(test_results['TEST_DEM_AME']):.3f}\n"
-            f"Test W AME: {float(test_results['TEST_W_AME']):.3f}\n"
-            f"Test Theta AME: {float(test_results['TEST_THETA_AME']):.3f}\n"
-            f"LR: {float(config['LR']):.2e}",
-            dict(boxstyle='round', facecolor='lightblue', alpha=0.3),
-        ),
-        (
-            f"Total Epochs: {checkpoint.get('EPOCHS_RUN', 'N/A')}\n"
-            f"Train Time Avg.: \n"
-            f"{avg_train_time_per_epoch:.2f} s/epoch\n"
-            f"Val Time Avg.: \n"
-            f"{avg_val_time_per_epoch:.2f} s/epoch\n"
-            f"Number GPUs: {n_gpus}",
-            dict(boxstyle='round', facecolor='lightgreen', alpha=0.3),
-        ),
-        (
-            "Multi-band Config\n"
-            f"Albedo:\n"
-            f"w: {float(config['W_MIN']):.3f}–{float(config['W_MAX']):.3f}\n"
-            f"w blobs: r={config['W_BLOB_RADIUS_PX']} px, $\\rho$={float(config['W_BLOB_DENSITY']):.2f}\n"
-            f"Macroscopic Roughness:\n"
-            rf"$\bar{{\theta}}$: {theta_min_rad:.1f}–{theta_max_rad:.1f} rad" "\n"
-            rf"$\bar{{\theta}}$: {theta_min_deg:.1f}–{theta_max_deg:.1f}°" "\n"
-            rf"$\bar{{\theta}}$ blobs: r={config['THETA_BAR_BLOB_RADIUS_PX']} px, $\rho$={float(config['THETA_BAR_BLOB_DENSITY']):.2f}",
-            dict(boxstyle='round', facecolor='lavender', alpha=0.3),
-        ),
-    ]
+    if "USE_B" not in config:
+        config["USE_B"] = False
 
-        
-    if not config["USE_SEMIFLUID"]: 
-        infobox_entries.append(
+    if not config["USE_B"]:
+        theta_min_deg = np.degrees(theta_min_rad)
+        theta_max_deg = np.degrees(theta_max_rad)
+    else:
+        theta_min_deg = theta_min_rad
+        theta_max_deg = theta_max_rad
+
+
+    if not config["USE_B"]:
+        infobox_entries = [
             (
-            "Training Config\n"
-            f"Batch Size: {config['BATCH_SIZE']}\n"
-            f"Save every: {config['SAVE_EVERY']} epochs\n"
-            f"Use semifluid: {config['USE_SEMIFLUID']}\n",
-            dict(boxstyle='round', facecolor='lightyellow', alpha=0.3)
-            )
-    )
-    else:  
+                f"Multi-band FiLMed UNet\n"
+                f"Number of parameters:\n"
+                f"{sum(p.numel() for p in model.parameters()):.2e}\n"
+                f"Results for test data:\n"
+                f"Loss: {float(test_results['TEST_LOSS']):.2f}\n"
+                f"Surface AME: {float(test_results['TEST_DEM_AME']):.2f}\n"
+                f"w AME: {float(test_results['TEST_W_AME']):.2f}\n"
+                "$\\bar{\\theta}$ AME:" f"{float(test_results['TEST_THETA_AME']):.2f}",
+                dict(boxstyle='round', facecolor='lightblue', alpha=0.3),
+            ),
+            (
+                f"Total Epochs: {checkpoint.get('EPOCHS_RUN', 'N/A')}\n"
+                f"Train Time Avg.: \n"
+                f"{avg_train_time_per_epoch:.2f} s/epoch\n"
+                f"Val Time Avg.: \n"
+                f"{avg_val_time_per_epoch:.2f} s/epoch\n"
+                f"Number GPUs: {n_gpus}",
+                dict(boxstyle='round', facecolor='lightgreen', alpha=0.3),
+            ),
+            #(
+            #    f"Multi-band Config\n"
+            #    f"Albedo:\n"
+            #    f"w: {float(config['W_MIN']):.3f}–{float(config['W_MAX']):.3f}\n"
+            #    f"w blobs: r={config['W_BLOB_RADIUS_PX']} px, $\\rho$={float(config['W_BLOB_DENSITY']):.2f}\n"
+            #    f"Macroscopic Roughness:\n"
+            #    rf"$\bar{{\theta}}$: {theta_min_rad:.1f}–{theta_max_rad:.1f} rad" "\n"
+            #    rf"$\bar{{\theta}}$: {theta_min_deg:.1f}–{theta_max_deg:.1f}°" "\n"
+            #    rf"$\bar{{\theta}}$ blobs: r={config['THETA_BAR_BLOB_RADIUS_PX']} px, $\rho$={float(config['THETA_BAR_BLOB_DENSITY']):.2f}",
+            #    dict(boxstyle='round', facecolor='lavender', alpha=0.3),
+            #),
+        ]
+    else:
+        infobox_entries = [
+            (
+                f"Multi-band FiLMed UNet\n"
+                f"Number of parameters:\n"
+                f"{sum(p.numel() for p in model.parameters()):.2e}\n"
+                f"Results for test data:\n"
+                f"Loss: {float(test_results['TEST_LOSS']):.2f}\n"
+                f"Surface AME: {float(test_results['TEST_DEM_AME']):.2f}\n"
+                f"w AME: {float(test_results['TEST_W_AME']):.2f}\n"
+                #"$\\bar{\\theta}$ AME:" f"{float(test_results['TEST_THETA_AME']):.2f}",
+                "$b$ AME:" f"{float(test_results['TEST_THETA_AME']):.2f}",
+                dict(boxstyle='round', facecolor='lightblue', alpha=0.3),
+            ),
+            (
+                f"Total Epochs: {checkpoint.get('EPOCHS_RUN', 'N/A')}\n"
+                f"Train Time Avg.: \n"
+                f"{avg_train_time_per_epoch:.2f} s/epoch\n"
+                f"Val Time Avg.: \n"
+                f"{avg_val_time_per_epoch:.2f} s/epoch\n"
+                f"Number GPUs: {n_gpus}",
+                dict(boxstyle='round', facecolor='lightgreen', alpha=0.3),
+            ),
+            #(
+            #    f"Multi-band Config\n"
+            #    f"Albedo:\n"
+            #    f"w: {float(config['W_MIN']):.3f}–{float(config['W_MAX']):.3f}\n"
+            #    f"w blobs: r={config['W_BLOB_RADIUS_PX']} px, $\\rho$={float(config['W_BLOB_DENSITY']):.2f}\n"
+            #    f"Macroscopic Roughness:\n"
+            #    rf"$\bar{{\theta}}$: {theta_min_rad:.1f}–{theta_max_rad:.1f} rad" "\n"
+            #    rf"$\bar{{\theta}}$: {theta_min_deg:.1f}–{theta_max_deg:.1f}°" "\n"
+            #    rf"$\bar{{\theta}}$ blobs: r={config['THETA_BAR_BLOB_RADIUS_PX']} px, $\rho$={float(config['THETA_BAR_BLOB_DENSITY']):.2f}",
+            #    dict(boxstyle='round', facecolor='lavender', alpha=0.3),
+            #),
+        ]
+        
+    #if not config["USE_SEMIFLUID"]: 
+    #    infobox_entries.append(
+    #        (
+    #        f"Training Config\n"
+    #        f"Batch Size: {config['BATCH_SIZE']}\n"
+    #        f"Save Every: {config['SAVE_EVERY']} epochs\n"
+    #        f"Use Semifluid: {config['USE_SEMIFLUID']}\n"
+    #        f"LR: {float(config['LR']):.1e}"
+    #        f"LR Patience: {int(config['LR_PATIENCE'])}",
+    #        dict(boxstyle='round', facecolor='lightyellow', alpha=0.3)
+    #        )
+    #)
+    if config["USE_SEMIFLUID"]:  
         infobox_entries.append(
             (
                 f"Training Config\n"
@@ -784,7 +867,7 @@ def plot_comprehensive_multi_band(
                 f"Save every: {config['SAVE_EVERY']} epochs\n"
                 f"Use semifluid: {config['USE_SEMIFLUID']}\n"
                 f"New data every: {config['NEW_FLUID_DATA_EVERY']} epochs\n",
-                dict(boxstyle='round', facecolor='lightyellow', alpha=0.3)
+                dict(boxstyle='round', facecolor='lightyellow', alpha=0.3),
             )
         )
         
@@ -815,15 +898,15 @@ def plot_comprehensive_multi_band(
     # Data rows layout (5 datasets by default)
     row_height = 0.13
     row_spacing = 0.012
-    start_y = 0.83
+    start_y = 0.82
 
     band_width = 0.075
     band_gap = 0.002
     images_width = 0.070
-    images_gap = 0.005
+    images_gap = 0.002
     start_x = 0.06
     
-    color_bar_extra_space = 0.03
+    color_bar_extra_space = 0.04
     space_before_color_bar = 0.009
 
     band_positions = []
@@ -833,7 +916,7 @@ def plot_comprehensive_multi_band(
         current_x += band_width + band_gap
         if _ in [1, 3, 5]:  # After predicted w and predicted theta
             current_x += color_bar_extra_space
-    current_x += 0.005 # Extra gap before images
+    current_x += 0.00 # Extra gap before images
 
     image_positions = []
     for _ in range(5):
@@ -864,43 +947,46 @@ def plot_comprehensive_multi_band(
         ax_gt_w.set_xticks([])
         ax_gt_w.set_yticks([])
         if row_idx == 0:
-            ax_gt_w.set_title('GT w', fontsize=12, pad=5)
-        ax_gt_w.set_ylabel(f'Set {index_labels[row_idx]}', fontsize=11, rotation=90, labelpad=5)
+            ax_gt_w.set_title('Ground truth w', fontsize=fontsize, pad=5)
+        ax_gt_w.set_ylabel(f'Dataset {index_labels[row_idx]+1}', fontsize=fontsize, rotation=90, labelpad=5)
 
         ax_pred_w = fig.add_axes([band_positions[1], y_pos, band_width, row_height])
         last_w_im = ax_pred_w.imshow(w_pred, cmap='viridis', origin='lower', vmin=global_w_min, vmax=global_w_max)
         ax_pred_w.set_xticks([])
         ax_pred_w.set_yticks([])
         if row_idx == 0:
-            ax_pred_w.set_title('Pred w', fontsize=12, pad=5)
+            ax_pred_w.set_title('Predicted w', fontsize=fontsize, pad=5)
 
         ax_gt_theta = fig.add_axes([band_positions[2], y_pos, band_width, row_height])
         ax_gt_theta.imshow(theta_target, cmap='plasma', origin='lower', vmin=global_theta_min, vmax=global_theta_max)
         ax_gt_theta.set_xticks([])
         ax_gt_theta.set_yticks([])
         if row_idx == 0:
-            ax_gt_theta.set_title('GT theta', fontsize=12, pad=5)
+            ax_gt_theta.set_title('Ground Truth $\\bar{\\theta}$', fontsize=fontsize, pad=5)
 
         ax_pred_theta = fig.add_axes([band_positions[3], y_pos, band_width, row_height])
         last_theta_im = ax_pred_theta.imshow(theta_pred, cmap='plasma', origin='lower', vmin=global_theta_min, vmax=global_theta_max)
         ax_pred_theta.set_xticks([])
         ax_pred_theta.set_yticks([])
         if row_idx == 0:
-            ax_pred_theta.set_title('Pred theta', fontsize=12, pad=5)
+            if not config["USE_B"]:
+                ax_pred_theta.set_title('Predicted $\\bar{\\theta}$', fontsize=fontsize, pad=5)
+            else:
+                ax_pred_theta.set_title('Predicted $b$', fontsize=fontsize, pad=5)
 
         ax_gt_dem = fig.add_axes([band_positions[4], y_pos, band_width, row_height])
         ax_gt_dem.imshow(dem_target, cmap='terrain', origin='lower', vmin=global_dem_min, vmax=global_dem_max)
         ax_gt_dem.set_xticks([])
         ax_gt_dem.set_yticks([])
         if row_idx == 0:
-            ax_gt_dem.set_title('GT DEM', fontsize=12, pad=5)
+            ax_gt_dem.set_title('Gr. Truth Surface', fontsize=fontsize, pad=5)
 
         ax_pred_dem = fig.add_axes([band_positions[5], y_pos, band_width, row_height])
         last_dem_im = ax_pred_dem.imshow(dem_pred, cmap='terrain', origin='lower', vmin=global_dem_min, vmax=global_dem_max)
         ax_pred_dem.set_xticks([])
         ax_pred_dem.set_yticks([])
         if row_idx == 0:
-            ax_pred_dem.set_title('Pred DEM', fontsize=12, pad=5)
+            ax_pred_dem.set_title('Predicted Surface', fontsize=fontsize, pad=5)
 
         for img_idx, img_x in enumerate(image_positions):
             ax_img = fig.add_axes([img_x, y_pos, images_width, row_height])
@@ -915,7 +1001,7 @@ def plot_comprehensive_multi_band(
             ax_img.set_xticks([])
             ax_img.set_yticks([])
             if row_idx == 0:
-                ax_img.set_title(f'Img {img_idx+1}', fontsize=12, pad=5)
+                ax_img.set_title(f'Image {img_idx+1}', fontsize=fontsize, pad=5)
 
     n_rows = len(selected_indices)
     total_height = n_rows * row_height + max(0, (n_rows - 1)) * row_spacing
@@ -924,26 +1010,37 @@ def plot_comprehensive_multi_band(
     if last_w_im is not None:
         cbar_w_ax = fig.add_axes([band_positions[1] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
         cbar_w = plt.colorbar(last_w_im, cax=cbar_w_ax)
-        cbar_w.ax.tick_params(labelsize=10)
-        cbar_w.set_label('w', fontsize=10)
+        cbar_w.ax.tick_params(labelsize=labelsize)
+        cbar_w.set_label('w [unitless]', fontsize=fontsize)
 
     if last_theta_im is not None:
         cbar_theta_ax = fig.add_axes([band_positions[3] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
         cbar_theta = plt.colorbar(last_theta_im, cax=cbar_theta_ax)
-        cbar_theta.ax.tick_params(labelsize=10)
-        cbar_theta.set_label('theta (rad)', fontsize=10)
+        cbar_theta.ax.tick_params(labelsize=labelsize)
+        if not config["USE_B"]:
+            cbar_theta.set_label('$\\bar{\\theta}$ [rad]', fontsize=fontsize)
+        else: 
+            cbar_theta.set_label('$b$ [unitless]', fontsize=fontsize)
 
     if last_dem_im is not None:
         cbar_dem_ax = fig.add_axes([band_positions[5] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
         cbar_dem = plt.colorbar(last_dem_im, cax=cbar_dem_ax)
-        cbar_dem.ax.tick_params(labelsize=10)
-        cbar_dem.set_label('DEM (m)', fontsize=10)
+        cbar_dem.ax.tick_params(labelsize=labelsize)
+        cbar_dem.set_label('Elevation [m]', fontsize=fontsize)
+
 
     if save_fig:
         figures_dir = os.path.join(sup_dir, run_dir, 'figures')
         os.makedirs(figures_dir, exist_ok=True)
         output_path = os.path.join(figures_dir, filename if filename is not None else 'comprehensive_plot_multi_band.pdf')
-        fig.savefig(output_path, format='pdf', bbox_inches='tight', dpi=150)
+        fig.savefig(output_path, 
+        format='pdf', 
+        bbox_inches='tight', 
+        dpi=300,
+        transparent = True,
+        facecolor = "none",
+        edgecolor = "none"
+         )
         print(f"Figure saved to: {output_path}")
 
     if return_fig:
@@ -967,7 +1064,7 @@ def plot_comprehensive_multi_band_with_dif(
     if not config.get("USE_MULTI_BAND"):
         raise ValueError("plot_comprehensive_multi_band_with_dif requires a multi-band run directory.")
 
-    snapshot_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'snapshot.pt')
+    snapshot_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'snapshot_best.pt')
     train_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'train_losses.csv')
     val_losses_path = os.path.join(sup_dir, run_dir, 'checkpoints', 'val_losses.csv')
     input_stats_path = os.path.join(sup_dir, run_dir, 'stats', 'input_stats.ini')
@@ -1036,7 +1133,7 @@ def plot_comprehensive_multi_band_with_dif(
         total_time_minutes = float(timing_info["TOTAL_TIME_MINUTES"])
 
     print(f"Use train set: {use_train_set}")
-    print(f"Use separate test data: {test_on_separate_data}")
+    print(f"Use separate specified datasates (not train): {test_on_separate_data}")
     if use_train_set and test_on_separate_data:
         raise ValueError("Cannot use both training set and separate test data simultaneously.")
 
@@ -1044,6 +1141,7 @@ def plot_comprehensive_multi_band_with_dif(
         test_dir = os.path.join(sup_dir, run_dir, 'test')
         if not os.path.isdir(test_dir):
             raise FileNotFoundError(f"No test directory found at '{test_dir}'")
+        print(f"Gathering datasets from {test_dir}")
         candidate_files = sorted(glob.glob(os.path.join(test_dir, '*.pt')))
         if len(candidate_files) == 0:
             raise FileNotFoundError(f"Found '{test_dir}' but no .pt files were present.")
@@ -1052,12 +1150,14 @@ def plot_comprehensive_multi_band_with_dif(
         run_path = os.path.join(sup_dir, run_dir)
         train_set = FluidDEMDataset(config=config)
         test_dataset = train_set
+        print(f"Using training datasets")
     else:
         alt_test_dir = os.path.join(sup_dir, run_dir, 'alt_test')
         candidate_files = sorted(glob.glob(os.path.join(alt_test_dir, '*.pt')))
         if len(candidate_files) == 0:
             raise FileNotFoundError(f"No .pt files found in alternate test directory '{alt_test_dir}'.")
         test_dataset = DEMDataset(candidate_files, config=config)
+        print(f"Using datasets from {alt_test_dir}")
 
     model = UNet(
         in_channels=config["IMAGES_PER_DEM"],
@@ -1461,7 +1561,7 @@ def plot_comprehensive_multi_band_with_dif(
         cbar_dem_ax = fig.add_axes([band_positions[7] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
         cbar_dem = plt.colorbar(last_dem_im, cax=cbar_dem_ax)
         cbar_dem.ax.tick_params(labelsize=10)
-        cbar_dem.set_label('DEM (m)', fontsize=10)
+        cbar_dem.set_label('DEM', fontsize=10)
 
     # Colorbars for differences
     if last_w_dif_im is not None:
@@ -1480,7 +1580,7 @@ def plot_comprehensive_multi_band_with_dif(
         cbar_dem_dif_ax = fig.add_axes([band_positions[8] + band_width - 0.004 + space_before_color_bar, bottom_y, 0.006, total_height])
         cbar_dem_dif = plt.colorbar(last_dem_dif_im, cax=cbar_dem_dif_ax)
         cbar_dem_dif.ax.tick_params(labelsize=10)
-        cbar_dem_dif.set_label('ΔDEM (m)', fontsize=10)
+        cbar_dem_dif.set_label('ΔDEM', fontsize=10)
 
     if save_fig:
         figures_dir = os.path.join(sup_dir, run_dir, 'figures')
@@ -1834,7 +1934,10 @@ def plot_data_multi_band(run_dir, n_sets=5, n_images=5, save_fig=True, return_fi
         ax_theta.set_xticks([])
         ax_theta.set_yticks([])
         if i == 0:
-            ax_theta.set_title('Theta Band', fontsize=12, pad=5)
+            if not config["USE_B"]:
+                ax_theta.set_title('Theta Band', fontsize=12, pad=5)
+            else:
+                ax_theta.set_title('b Band', fontsize=12, pad=5)
         last_theta_im = im_theta
         
         # Column 2: DEM
@@ -2100,9 +2203,9 @@ if __name__ == "__main__":
 
     config = load_config_file(os.path.join("runs", run_dir, 'stats', 'config.ini'))
 
-    if not os.path.exists(os.path.join("runs", run_dir, 'checkpoints', 'snapshot.pt')) or args.plot_data_vis:
+    if not os.path.exists(os.path.join("runs", run_dir, 'checkpoints', 'snapshot_best.pt')) or args.plot_data_vis:
         #no training exists, only plot data
-        if not os.path.exists(os.path.join("runs", run_dir, 'checkpoints', 'snapshot.pt')):
+        if not os.path.exists(os.path.join("runs", run_dir, 'checkpoints', 'snapshot_best.pt')):
             print("No training snapshot found, plotting data only...")
         elif args.plot_data_vis:
             print("Plotting data visualizations...")

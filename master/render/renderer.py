@@ -76,8 +76,24 @@ class Renderer:
         eps = 1e-6
         # Compute cosine of incidence and emission angles
         mu = (normals_flat * view_vectors).sum(dim=1).reshape(self.dem.dem.shape)
+
+        mu = torch.nan_to_num(
+            mu,
+            nan=1.0,          # default to normal incidence
+            posinf=1.0,
+            neginf=-1.0
+        )
+
         mu_safe = torch.clamp(mu, -1.0 + eps, 1.0 - eps)
         mu0 = (normals_flat * sun_vec).sum(dim=1).reshape(self.dem.dem.shape)
+
+        mu0 = torch.nan_to_num(
+            mu0,
+            nan=1.0,
+            posinf=1.0,
+            neginf=-1.0
+        )
+
         mu0_safe = torch.clamp(mu0, -1.0 + eps, 1.0 - eps)
                 
         # Lambertian model (early return)
@@ -298,6 +314,26 @@ class Renderer:
         theta_mat_inv = torch.tensor([[[cos_az, sin_az, 0.0], 
                                         [-sin_az, cos_az, 0.0]]], 
                                     dtype=torch.float32, device=device)
+
+        if torch.isnan(theta_mat_inv).any():
+            print("NaNs in theta!")
+            print("theta range:",
+                theta_mat_inv.min().item(),
+                theta_mat_inv.max().item())
+
+            print("theta shape:", theta_mat_inv.shape)
+            print("grid size:", dem_b.size())
+
+        if torch.isinf(theta_mat_inv).any():
+            print("Infs in theta!")
+
+            print("theta range:",
+                theta_mat_inv.min().item(),
+                theta_mat_inv.max().item())
+
+            print("theta shape:", theta_mat_inv.shape)
+            print("grid size:", dem_b.size())
+
         grid_inv = F.affine_grid(theta_mat_inv, dem_b.size(), align_corners=True)
         
         # Rotate shadow map and mask back to original orientation
